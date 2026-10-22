@@ -12,9 +12,10 @@ Telegram tools for turning links, documents and recordings into podcast episodes
 - **Visible execution:** configured RSS/TTS jobs can show stage, elapsed time, measured counts, checkpoint reuse and contact health in Telegram. Progress is not a fabricated percentage or ETA; terminal results and provider receipts remain authoritative.
 - **Podcast delivery:** episodes have stable identities and retained media/artifacts, served through RSS feeds and an HTTP edge with HEAD and byte-range support.
 
-Example episode pages: pending publication review. Three links under
-`https://github.com/aaronkunaseelan/_assets/tree/main/rss-episodes/<slug>`
-will be added after the example artifacts and rights are approved.
+Example episode pages (show notes and manifest as published; audio omitted):
+[a Telegram-uploaded talk](https://github.com/aaronkunaseelan/_assets/tree/main/rss-episodes/undated-mp3-telegram-dde7ab17210a),
+[an Axios Show episode](https://github.com/aaronkunaseelan/_assets/tree/main/rss-episodes/2026-10-03-axios-trump's-treasury-ai-0e12c0b1b99d) and
+[a Joe Lonsdale interview](https://github.com/aaronkunaseelan/_assets/tree/main/rss-episodes/2026-10-02-joe-lonsdale-anthropic-researchers-how-ai-radically-better-2030s-6c2847111bb6).
 
 ## How it works
 
