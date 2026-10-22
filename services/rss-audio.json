@@ -1,0 +1,48 @@
+{
+  "service": "rss-audio",
+  "botIdentity": "rss-audio",
+  "ownerSystem": "rss-audio",
+  "routes": [
+    {
+      "routeId": "rss.publish.telegram.v1",
+      "routeKind": "rss_publish_route",
+      "workloadType": "rss_publish",
+      "chatIdBinding": "rss_chat_id",
+      "threadMode": "exact",
+      "threadIdBinding": "rss_publish_thread_id",
+      "rules": [
+        {
+          "ruleId": "rss-url-or-audio",
+          "ruleVersion": "v1",
+          "mediaKinds": ["audio", "voice", "document_audio"],
+          "textModes": ["url"]
+        }
+      ]
+    },
+    {
+      "routeId": "transcribe.audio.telegram.v1",
+      "routeKind": "transcribe_audio_route",
+      "workloadType": "transcribe_audio",
+      "ownerSystem": "transcribe-audio",
+      "chatIdBinding": "rss_chat_id",
+      "threadMode": "exact",
+      "threadIdBinding": "rss_transcribe_thread_id",
+      "rules": [
+        {
+          "ruleId": "scribe-start-url-or-audio",
+          "ruleVersion": "v1",
+          "mediaKinds": ["audio", "voice", "document_audio"],
+          "textModes": ["url"],
+          "requireReply": false
+        },
+        {
+          "ruleId": "scribe-append-reply-text-or-audio",
+          "ruleVersion": "v1",
+          "mediaKinds": ["audio", "voice", "document_audio"],
+          "textModes": ["url", "non_command_text"],
+          "requireReply": true
+        }
+      ]
+    }
+  ]
+}

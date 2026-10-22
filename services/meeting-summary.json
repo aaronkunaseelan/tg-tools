@@ -1,0 +1,22 @@
+{
+  "service": "meeting-summary",
+  "botIdentity": "meeting-summary",
+  "ownerSystem": "meeting-summary",
+  "routes": [
+    {
+      "routeId": "meeting.note.telegram.v1",
+      "routeKind": "meeting_note_route",
+      "workloadType": "meeting_note",
+      "chatIdBinding": "meeting_chat_id",
+      "threadMode": "exact",
+      "threadIdBinding": "meeting_thread_id",
+      "rules": [
+        {
+          "ruleId": "meeting-audio",
+          "ruleVersion": "v1",
+          "mediaKinds": ["audio", "voice", "document_audio"]
+        }
+      ]
+    }
+  ]
+}

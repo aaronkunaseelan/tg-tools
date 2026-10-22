@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools==83.0.0", "wheel==0.47.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tg-tools-common"
+version = "0.1.0"
+description = "Shared tg-tools Python contracts and helpers"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.setuptools]
+packages = ["tg_tools_common"]

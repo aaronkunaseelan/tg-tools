@@ -1,0 +1,20 @@
+[Unit]
+Description=meeting-summary worker
+After=network-online.target runtime-controller-api.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.local/lib/tg-tools/current/meeting-summary
+Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONPATH=%h/.local/lib/tg-tools/current/meeting-summary:%h/.local/lib/tg-tools/current/shared
+EnvironmentFile=%h/tools/tools.env
+EnvironmentFile=%h/.config/agent-secrets/credentials.env
+EnvironmentFile=%h/.config/tg-tools/meeting-summary.env
+ExecStart=%h/.local/lib/tg-tools/runtime/bin/python runtime_worker.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

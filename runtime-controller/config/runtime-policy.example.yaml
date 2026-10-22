@@ -1,0 +1,89 @@
+policies:
+  - workloadType: qmd_embedding
+    queueClass: foreground
+    executionProfile: embed_batch
+    executionShape: remote_async_artifact
+    admissionAction: admit_now
+    submissionMode: explicit_batch
+    maxItems: 4096
+
+  - workloadType: embeddings
+    queueClass: background
+    executionProfile: gpu_batch
+    executionShape: remote_async_artifact
+    admissionAction: defer
+    submissionMode: explicit_batch
+    maxWaitSec: 120
+    targetItems: 128
+    maxItems: 512
+    maxBytes: 8388608
+
+  - workloadType: scorer
+    queueClass: foreground
+    executionProfile: cpu_small
+    executionShape: local_bounded
+    admissionAction: admit_now
+    submissionMode: singleton
+
+  - workloadType: transcription
+    queueClass: background
+    executionProfile: remote_api
+    executionShape: remote_async_artifact
+    admissionAction: admit_now
+    submissionMode: singleton
+
+  - workloadType: meeting_summary
+    queueClass: foreground
+    executionProfile: cpu_media
+    executionShape: local_bounded
+    admissionAction: admit_now
+    submissionMode: singleton
+
+  - workloadType: meeting_summary
+    queueClass: background
+    executionProfile: cpu_media
+    executionShape: local_bounded
+    admissionAction: admit_now
+    submissionMode: singleton
+
+  - workloadType: pi_prompt
+    queueClass: foreground
+    executionProfile: pi_worker
+    executionShape: local_bounded
+    admissionAction: admit_now
+    submissionMode: singleton
+
+  - workloadType: attachment_prep
+    queueClass: foreground
+    executionProfile: cpu_media
+    executionShape: local_bounded
+    admissionAction: admit_now
+    submissionMode: singleton
+
+  - workloadType: tts_synthesize
+    queueClass: foreground
+    executionProfile: cpu_io
+    executionShape: local_bounded
+    admissionAction: admit_now
+    submissionMode: singleton
+
+  - workloadType: x_tts_explain
+    queueClass: foreground
+    executionProfile: model_tts_io
+    executionShape: local_bounded
+    admissionAction: admit_now
+    submissionMode: singleton
+
+  - workloadType: rss_publish
+    queueClass: foreground
+    executionProfile: cpu_media
+    executionShape: local_bounded
+    admissionAction: admit_now
+    submissionMode: singleton
+
+  - workloadType: transcribe_audio
+    queueClass: foreground
+    executionProfile: cpu_media
+    executionShape: local_bounded
+    admissionAction: admit_now
+    submissionMode: singleton

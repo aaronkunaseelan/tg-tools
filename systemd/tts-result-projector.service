@@ -1,0 +1,19 @@
+[Unit]
+Description=TTS result projector
+After=network-online.target runtime-controller-api.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.local/lib/tg-tools/current/tts
+Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONPATH=%h/.local/lib/tg-tools/current/tts:%h/.local/lib/tg-tools/current/shared
+EnvironmentFile=%h/tools/tools.env
+EnvironmentFile=%h/.config/tg-tools/tts.env
+ExecStart=%h/.local/lib/tg-tools/runtime/bin/python -c "from tts_worker.result_projector import main; main()"
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

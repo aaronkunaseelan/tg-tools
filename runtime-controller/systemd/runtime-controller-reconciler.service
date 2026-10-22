@@ -1,0 +1,15 @@
+[Unit]
+Description=runtime-controller reconciler
+After=network-online.target postgresql.service runtime-controller-api.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/tools/runtime-controller
+EnvironmentFile=%h/tools/tools.env
+ExecStart=/usr/bin/env npm run reconciler
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

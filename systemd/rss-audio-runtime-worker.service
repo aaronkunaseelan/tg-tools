@@ -1,0 +1,21 @@
+[Unit]
+Description=rss-audio publish worker
+After=network-online.target runtime-controller-api.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.local/lib/tg-tools/current/rss-audio
+Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONPATH=%h/.local/lib/tg-tools/current/rss-audio:%h/.local/lib/tg-tools/current/shared:%h/.local/lib/tg-tools/current/transcribe-audio
+Environment=RSS_AUDIO_RUNTIME_WORKER_ID=rss-audio-runtime-worker
+EnvironmentFile=%h/tools/tools.env
+EnvironmentFile=%h/.config/agent-secrets/credentials.env
+EnvironmentFile=%h/.config/tg-tools/rss-audio.env
+ExecStart=%h/.local/lib/tg-tools/runtime/bin/python runtime_worker.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

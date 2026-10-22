@@ -1,0 +1,21 @@
+[Unit]
+Description=Telegram gateway for the rss-audio bot (rss-audio, tts)
+After=network-online.target postgresql.service runtime-controller-api.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.local/lib/tg-tools/current/tg-gateway
+Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONPATH=%h/.local/lib/tg-tools/current/tg-gateway:%h/.local/lib/tg-tools/current/shared:%h/.local/lib/tg-tools/current/rss-audio
+EnvironmentFile=%h/tools/tools.env
+EnvironmentFile=%h/.config/agent-secrets/credentials.env
+EnvironmentFile=%h/.config/tg-tools/rss-audio.env
+EnvironmentFile=%h/.config/tg-tools/gateway-rss.env
+ExecStart=%h/.local/lib/tg-tools/runtime/bin/python -m tg_gateway.daemon
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

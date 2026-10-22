@@ -1,0 +1,13 @@
+# Configuration
+- `wrangler.toml`: `name` (Worker name, e.g. `example-rss`), `main` (bundle entrypoint, `src/index.js`), `compatibility_date` (runtime date), `workers_dev` (public worker hostname).
+- `[vars].B2_RSS_BUCKET`: private RSS origin bucket, e.g. `example-audio`; `B2_PRIVATE_BUCKET`: authenticated newsletter origin, e.g. `example-news`.
+- `[[d1_databases]]`: `binding=DB` (episode/feed store), `database_name` (e.g. `example-episodes`), `database_id` (your provider-assigned UUID).
+- Worker secret `API_TOKEN`: bearer credential for episode writes/admin operations.
+- Worker secrets `B2_RSS_KEY_ID`, `B2_RSS_KEY`: read-only RSS bucket credentials.
+- Worker secrets `B2_APPLICATION_KEY_ID`, `B2_APPLICATION_KEY`: newsletter B2 credentials.
+- Worker secrets `NEWSL_RSS_USERNAME`, `NEWSL_RSS_PASSWORD`: HTTP Basic authentication for all newsletter routes.
+- Set secrets using Wrangler's secret commands; never put values in Git. Dummy credential example: `replace-me`.
+- `package.json` / `.node-version`: pinned Node/npm/Wrangler versions; npm scripts additionally require the external `../../scripts/worker-deps.py` (see README).
+- `src/index.js` is a recovered bundle: the public delivery host and fallback bucket are still compiled in; changing vars does not replace the host.
+- Legacy redirect/rewrite hosts at `src/index.js:1058,1142,1341` remain unchanged; the owner may want to drop them before publication. This is not a generic-host source distribution.
+- `recovery/` is private provenance and excluded from `git archive`, as is `.gitattributes`.

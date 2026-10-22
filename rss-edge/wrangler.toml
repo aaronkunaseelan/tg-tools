@@ -1,0 +1,14 @@
+name = "rss-edge"
+main = "src/index.js"
+compatibility_date = "2026-03-01"
+workers_dev = true
+
+[vars]
+# Set to the verified private copy before deployment. RSS credentials are Worker secrets.
+B2_RSS_BUCKET = "rss-endpoints-private-05802"
+B2_PRIVATE_BUCKET = "newsl-private-05802"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "rss-episodes"
+database_id = "855f5f4b-efa8-4105-8f3d-7b4702dd62f5"

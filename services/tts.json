@@ -1,0 +1,43 @@
+{
+    "service": "tts",
+    "botIdentity": "rss-audio",
+    "ownerSystem": "tts",
+    "routes": [
+        {
+            "routeId": "tts.synthesize.telegram.v1",
+            "routeKind": "tts_synthesize_route",
+            "workloadType": "tts_synthesize",
+            "ownerSystem": "tts",
+            "chatIdBinding": "tts_chat_id",
+            "threadMode": "exact",
+            "threadIdBinding": "tts_thread_id",
+            "rules": [
+                {
+                    "ruleId": "tts-text-url-or-file",
+                    "ruleVersion": "v1",
+                    "commandNames": ["tts", "voice", "speed"],
+                    "mediaKinds": ["document", "any"],
+                    "textModes": ["url", "non_command_text"]
+                }
+            ]
+        },
+        {
+            "routeId": "x-tts.explain.telegram.v1",
+            "routeKind": "x_tts_explain_route",
+            "workloadType": "x_tts_explain",
+            "ownerSystem": "x-tts",
+            "chatIdBinding": "tts_chat_id",
+            "threadMode": "exact",
+            "threadIdBinding": "x_tts_thread_id",
+            "rules": [
+                {
+                    "ruleId": "x-tts-text-url-or-file",
+                    "ruleVersion": "v1",
+                    "commandNames": ["xtts", "mode", "length", "voice"],
+                    "mediaKinds": ["document", "any"],
+                    "textModes": ["url", "non_command_text"]
+                }
+            ]
+        }
+    ]
+}
