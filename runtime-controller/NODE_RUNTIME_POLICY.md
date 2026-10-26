@@ -2,8 +2,9 @@
 
 Scope: `~/tools/runtime-controller/`.
 
-- Runtime: Node 24.20.0 (`.node-version`), supported policy range >=24 <25.
-- Package manager: npm 12.0.2, pinned in packageManager/devEngines. Use
+- Runtime: Node major from `engines`/`devEngines` (`>=26 <27`); exact versions live only in
+  `~/workbench/scripts/agent-automation/agent-tools-update/runtimes.toml`.
+- Package manager: npm major `^12` in devEngines (exact version in runtimes.toml). Use
   `python3 deploy/no-secret-env.py -- npm ...` for dependency commands.
 - Lock state: package-lock.json.
 - Routine dependency commands must not inherit broad user, cloud, browser, Docker, SSH agent, or package-manager credentials.

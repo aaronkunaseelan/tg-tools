@@ -1,7 +1,7 @@
 # Immutable releases
 Release IDs are full Git commit SHAs from now on; older directory IDs have unknown provenance.
 Never run services from a checkout or edit an existing release.
-Use the Node version in `.node-version` and pinned npm; see `docs/deployment.md` for configuration.
+Use Node and npm matching `engines`/`devEngines` (exact versions in agent-tools-update/runtimes.toml); see `docs/deployment.md` for configuration.
 
 ## Build and qualify (disposable worktree)
 ```sh
