@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import selectors
 import signal
 import subprocess
 import tempfile
@@ -17,6 +18,7 @@ from .roles import resolve_role
 HARNESS_HOME = os.environ.get("TTS_PI_HOME") or None
 LOG_CAP_BYTES = int(os.environ.get("TTS_PI_LOG_CAP", 4 * 1024 * 1024))
 KILL_GRACE_S = 10
+LOG_OVERFLOW_EXIT = 122  # named capture outcome; never treat partial output as success
 FAULT_HOOK = None
 
 ENV_KEEP = {"PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG",
@@ -125,19 +127,6 @@ def pi_env(provider: str) -> dict:
     return env
 
 
-def _truncate(path: str, cap: int) -> None:
-    try:
-        size = os.path.getsize(path)
-    except OSError:
-        return
-    if size <= cap:
-        return
-    with open(path, "r+b") as log:
-        log.truncate(cap)
-        log.seek(0, os.SEEK_END)
-        log.write(b"\n[truncated: log exceeded %d bytes (was %d)]\n" % (cap, size))
-
-
 def _kill_group(p: subprocess.Popen, grace_s: float) -> None:
     """SIGTERM the whole group, grace, SIGKILL, reap."""
     try:
@@ -164,43 +153,85 @@ def run_contained(cmd: list[str], prompt: str, attempt_dir: str, env: dict,
                   timeout_s: int, cap_bytes: int = LOG_CAP_BYTES,
                   grace_s: float = KILL_GRACE_S,
                   tag: str = "") -> tuple[int | None, bool, str, str]:
-    """Run in a new session, with stdin prompt and capped file logs."""
+    """Capture bounded live logs; exit 122 names a log_overflow failure.
+
+    Parent-owned pipe capture keeps each file at cap_bytes even during the
+    termination grace period. No post-exit truncation or unbounded buffering.
+    """
+    if cap_bytes < 0:
+        raise ValueError("cap_bytes must be nonnegative")
     _hit("attempt.before-start", tag)
     os.makedirs(attempt_dir, exist_ok=True)
     out_p = os.path.join(attempt_dir, "stdout.log")
     err_p = os.path.join(attempt_dir, "stderr.log")
     timed_out = False
-    with open(out_p, "wb") as stdout, open(err_p, "wb") as stderr:
-        p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=stdout,
-                             stderr=stderr, cwd=attempt_dir, env=env,
-                             shell=False, start_new_session=True,
-                             close_fds=True)
-        _hit("attempt.after-start", tag)
+    overflow = False
+    with open(out_p, "wb", buffering=0) as stdout, open(err_p, "wb", buffering=0) as stderr:
+        p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, cwd=attempt_dir, env=env,
+                             shell=False, start_new_session=True, close_fds=True)
         try:
-            sink = current_progress()
-            deadline = time.monotonic() + timeout_s
-            input_bytes = prompt.encode("utf-8")
-            while True:
-                sink.check()
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise subprocess.TimeoutExpired(cmd, timeout_s)
-                try:
-                    p.communicate(input=input_bytes, timeout=min(5, remaining))
-                    break
-                except subprocess.TimeoutExpired:
-                    # communicate retains buffered input across timeout retries.
-                    input_bytes = None
+            with selectors.DefaultSelector() as poll:
+                for pipe, log in ((p.stdout, stdout), (p.stderr, stderr)):
+                    os.set_blocking(pipe.fileno(), False)
+                    poll.register(pipe, selectors.EVENT_READ, [log, 0])
+                pending = memoryview(prompt.encode("utf-8"))
+                if pending:
+                    os.set_blocking(p.stdin.fileno(), False)
+                    poll.register(p.stdin, selectors.EVENT_WRITE)
+                else:
+                    p.stdin.close()
+                sink = current_progress()
+                deadline = time.monotonic() + timeout_s
+                _hit("attempt.after-start", tag)
+                while poll.get_map():
+                    sink.check()
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(cmd, timeout_s)
+                    for key, _ in poll.select(min(0.2, remaining)):
+                        if key.fileobj is p.stdin:
+                            try:
+                                written = os.write(p.stdin.fileno(), pending[:4096])
+                                pending = pending[written:]
+                            except BrokenPipeError:
+                                pending = pending[len(pending):]
+                            if not pending:
+                                poll.unregister(p.stdin)
+                                p.stdin.close()
+                            continue
+                        chunk = os.read(key.fd, 65536)
+                        if not chunk:
+                            poll.unregister(key.fileobj)
+                            key.fileobj.close()
+                            continue
+                        log, size = key.data
+                        log.write(chunk[:max(0, cap_bytes - size)])
+                        key.data[1] += len(chunk)
+                        if key.data[1] > cap_bytes:
+                            overflow = True
+                            break
+                    if overflow:
+                        _kill_group(p, grace_s)
+                        break
+                p.wait(timeout=max(0.01, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
             timed_out = True
             _kill_group(p, grace_s)
         except BaseException:
             _kill_group(p, grace_s)
             raise
-    _truncate(out_p, cap_bytes)
-    _truncate(err_p, cap_bytes)
+        finally:
+            for pipe in (p.stdin, p.stdout, p.stderr):
+                if not pipe.closed:
+                    pipe.close()
+        if overflow:
+            marker = b"log_overflow: child output exceeded capture bound\n"[:cap_bytes]
+            stderr.seek(0)
+            stderr.truncate(0)
+            stderr.write(marker)
     _hit("attempt.after-capture", tag)
-    return p.returncode, timed_out, out_p, err_p
+    return LOG_OVERFLOW_EXIT if overflow else p.returncode, timed_out, out_p, err_p
 
 
 @dataclass
@@ -259,6 +290,8 @@ class PiRunner:
             cmd, prompt, attempt_dir, env, timeout_s, tag=session_name or "")
         duration = time.monotonic() - started
         stdout = _read_capped(out_p, LOG_CAP_BYTES)
+        if rc == LOG_OVERFLOW_EXIT:
+            return StepResult("", duration, False, "log_overflow: child output exceeded capture bound", attempt_dir)
         if timed_out:
             return StepResult("", duration, False,
                               "step timed out after %ss (process group terminated)" % timeout_s,
@@ -286,6 +319,8 @@ class PiRunner:
         rc, timed_out, out_p, err_p = run_contained(
             cmd, prompt, attempt_dir, env, timeout_s, tag=session_name or "")
         duration = time.monotonic() - started
+        if rc == LOG_OVERFLOW_EXIT:
+            return StepResult("", duration, False, "log_overflow: child output exceeded capture bound", attempt_dir)
         if timed_out:
             return StepResult("", duration, False,
                               "step timed out after %ss (process group terminated)" % timeout_s,
@@ -321,13 +356,13 @@ def artifacts_safe(name: str) -> str:
 
 
 def _read_capped(path: str, cap_bytes: int = LOG_CAP_BYTES) -> str:
-    """Read at most cap_bytes (+truncation-marker slack) from a log file.
+    """Read at most cap_bytes from a log file.
 
     Callers must pass the same cap they gave run_contained so the read
     limit matches the on-disk truncation limit.
     """
     try:
         with open(path, "rb") as source:
-            return source.read(cap_bytes + 4096).decode("utf-8", errors="replace")
+            return source.read(cap_bytes).decode("utf-8", errors="replace")
     except OSError:
         return ""

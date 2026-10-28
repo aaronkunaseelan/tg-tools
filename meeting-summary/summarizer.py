@@ -41,12 +41,6 @@ def _prompt_rule_text() -> str:
     return MISSING_INFORMATION_RULE_BLOCK
 
 
-def truncate_text(text: str, max_chars: int) -> tuple[str, bool]:
-    if len(text) <= max_chars:
-        return text, False
-    return text[: max_chars - 3].rstrip() + "...", True
-
-
 def strip_json_fences(text: str) -> str:
     text = text.strip()
     if text.startswith("```"):
@@ -60,6 +54,7 @@ def strip_json_fences(text: str) -> str:
 
 def read_sse_output_text(response) -> str:
     parts: list[str] = []
+    completed = False
     for raw_line in response:
         line = raw_line.decode("utf-8", errors="replace").strip()
         if not line.startswith("data: "):
@@ -69,10 +64,19 @@ def read_sse_output_text(response) -> str:
             continue
         try:
             event = json.loads(payload)
-        except json.JSONDecodeError:
-            continue
+        except json.JSONDecodeError as exc:
+            raise SummaryError("malformed openai-codex stream") from exc
+        kind = event.get("type")
+        if kind in {"error", "response.failed", "response.incomplete"}:
+            raise SummaryError(f"openai-codex stream ended with {kind}")
+        if kind == "response.completed":
+            if event.get("response", {}).get("status") != "completed":
+                raise SummaryError("openai-codex response did not complete")
+            completed = True
         if event.get("type") == "response.output_text.delta" and event.get("delta"):
             parts.append(str(event["delta"]))
+    if not completed:
+        raise SummaryError("incomplete openai-codex stream")
     text = "".join(parts).strip()
     if not text:
         raise SummaryError("empty openai-codex response")
@@ -129,7 +133,7 @@ def call_codex_json(
 
 
 def build_chunk_summary_prompt(chunk_index: int, total_chunks: int, transcript_text: str) -> str:
-    content, truncated = truncate_text(transcript_text, 16000)
+    content = transcript_text
     missing_information_rules = _prompt_rule_text()
     return textwrap.dedent(
         f"""
@@ -145,7 +149,6 @@ def build_chunk_summary_prompt(chunk_index: int, total_chunks: int, transcript_t
         - Output JSON only.
 
         Chunk: {chunk_index + 1}/{total_chunks}
-        Truncated: {str(truncated).lower()}
         Transcript:
         {content}
         """
@@ -184,6 +187,11 @@ def summarize_transcript_chunks(
         auth = load_openai_codex_auth(settings.pi_auth_path)
     except OpenAIAuthError as exc:
         raise SummaryError(str(exc)) from exc
+    # Partition without discarding any characters; every part gets a summary.
+    chunk_texts = [text[start:start + 16000] for text in chunk_texts
+                   for start in range(0, len(text), 16000)]
+    if not chunk_texts:
+        raise SummaryError("empty meeting transcript")
     chunk_summaries: list[dict[str, Any]] = []
     for index, chunk_text in enumerate(chunk_texts):
         chunk_summary = call_codex_json(

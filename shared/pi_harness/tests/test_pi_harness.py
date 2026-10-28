@@ -21,7 +21,7 @@ import pytest
 
 from pi_harness import PiRunner, resolve_role
 from pi_harness.preflight import AuthModeError, assert_codex_oauth
-from pi_harness.runner import pruned_env, run_contained
+from pi_harness.runner import LOG_OVERFLOW_EXIT, pruned_env, run_contained
 
 
 @pytest.mark.parametrize("override, role, expected", [
@@ -96,9 +96,8 @@ def test_run_contained_pipes_kills_and_caps(tmp_path):
     _, timed_out, _, _ = run_contained(["/bin/sh", "-c", "sleep 5"], "", str(tmp_path), env, 1, grace_s=0.1)
     assert timed_out and time.monotonic() - started < 4
 
-    _, _, stdout, _ = run_contained(["/bin/sh", "-c", "printf 1234567890"], "", str(tmp_path), env, 2, cap_bytes=4)
-    data = open(stdout, "rb").read()
-    assert data.startswith(b"1234") and b"[truncated:" in data
+    rc, timed_out, stdout, _ = run_contained(["/bin/sh", "-c", "printf 1234567890"], "", str(tmp_path), env, 2, cap_bytes=4)
+    assert (rc, timed_out, open(stdout, "rb").read()) == (LOG_OVERFLOW_EXIT, False, b"1234")
 
 
 def _fake_claude(tmp_path, monkeypatch, body):

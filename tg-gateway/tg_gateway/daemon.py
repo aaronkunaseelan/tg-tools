@@ -184,6 +184,18 @@ async def _reply(runtime: GatewayRuntime, message: Any, text: str) -> None:
         chat_id=message.chat_id, thread_id=message.thread_id, reply_to_message_id=message.message_id, text=text))
 
 
+async def _command_uncertain(runtime: GatewayRuntime, message: Any, update_uid: str) -> None:
+    # Stable outbox identity: replay repairs the notification, not the effect.
+    owner = runtime.settings.bot_identity
+    await asyncio.to_thread(runtime.runtime_client.append_delivery, {
+        "resultOwner": owner, "resultRoute": f"telegram.{owner}.confirmation.v1",
+        "deliveryKey": f"{update_uid}:command-uncertain", "deliveryKind": "telegram_reply_text",
+        "payloadJson": {"deliveryKind": "telegram_reply_text", "chatId": message.chat_id,
+                        "threadId": message.thread_id, "replyToMessageId": message.message_id,
+                        "text": "Command outcome uncertain; not retried automatically. Check its effects before issuing a new command."},
+    })
+
+
 async def handle_message(runtime: GatewayRuntime, event: Any) -> None:
     message = runtime.gateway.normalize_message(event.message)
     if not is_allowed_message(runtime.settings, message):
@@ -199,13 +211,19 @@ async def handle_message(runtime: GatewayRuntime, event: Any) -> None:
     if shape.command is not None:
         update_uid = f"message:{shape.bot_identity}:{message.chat_id}:{message.message_id}"
         if not await asyncio.to_thread(runtime.handled_updates.claim_update, update_uid):
-            logger.info("skipping already handled update %s", update_uid)
+            if await asyncio.to_thread(runtime.handled_updates.disposition, update_uid) == "uncertain":
+                await _command_uncertain(runtime, message, update_uid)
             return
         parts = (message.text or "").strip().split(maxsplit=1)
-        handled = await runtime.adapter.handle_command(
-            runtime, message, command=shape.command, arg=parts[1] if len(parts) > 1 else "")
-        if not handled:
-            await _reply(runtime, message, f"Unsupported command: /{shape.command}")
+        try:
+            handled = await runtime.adapter.handle_command(
+                runtime, message, command=shape.command, arg=parts[1] if len(parts) > 1 else "")
+            if not handled:
+                await _reply(runtime, message, f"Unsupported command: /{shape.command}")
+        except Exception:
+            await _command_uncertain(runtime, message, update_uid)
+            raise
+        await asyncio.to_thread(runtime.handled_updates.mark_handled, update_uid)
         return
     if await runtime.adapter.handle_message(runtime, message, shape=shape):
         return
@@ -253,9 +271,9 @@ async def _hand_off(runtime: GatewayRuntime, message: Any, shape: TelegramUpdate
     if not created:
         logger.info("skipping already handed-off update %s", update_uid)
         return
-    if not with_progress:
+    outcome = await asyncio.to_thread(runtime.handoff_drainer.drain_once, update_uid=update_uid)
+    if not with_progress and outcome == "submitted":
         await _reply(runtime, message, "Received — queued.")
-    outcome = await asyncio.to_thread(runtime.handoff_drainer.drain_once)
     logger.info("source handoff update=%s drain_outcome=%s", update_uid, outcome)
 
 

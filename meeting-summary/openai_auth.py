@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import json
-import os
-import tempfile
+import shutil
+import subprocess
 import time
 import urllib.error
 import urllib.parse
@@ -33,23 +33,37 @@ def _read_json(path: Path) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def _write_json_atomic(path: Path, data: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        "w",
-        encoding="utf-8",
-        dir=path.parent,
-        delete=False,
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-    ) as handle:
-        json.dump(data, handle, indent=2)
-        handle.write("\n")
-        temp_path = Path(handle.name)
-    os.replace(temp_path, path)
+def _store_refreshed_entry(path: Path, previous: dict, updated: dict) -> dict:
+    # Use Pi's actual credential owner: its shared lock and latest-file merge.
+    # A concurrent rotation/deletion of this provider wins over our stale refresh.
+    pi = shutil.which("pi")
+    if not pi:
+        raise OpenAIAuthError("Pi credential storage unavailable")
+    module = Path(pi).resolve().parents[1] / "core" / "auth-storage.js"
+    script = """
+        import { readFileSync } from 'node:fs';
+        const { AuthStorage } = await import(process.argv[1]);
+        const { path, previous, updated } = JSON.parse(readFileSync(0, 'utf8'));
+        const storage = AuthStorage.create(path);
+        const result = await storage.modify('openai-codex', async current => {
+            if (JSON.stringify(current) !== JSON.stringify(previous)) return undefined;
+            return updated;
+        });
+        process.stdout.write(JSON.stringify(result ?? {}));
+    """
+    try:
+        result = subprocess.run(
+            ["node", "--input-type=module", "-e", script, module.as_uri()],
+            input=json.dumps({"path": str(path.resolve()), "previous": previous, "updated": updated}),
+            text=True, capture_output=True, timeout=60, check=True,
+        )
+        return json.loads(result.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        # Child output may carry credentials; never put it into the error.
+        raise OpenAIAuthError("Pi credential mutation failed") from None
 
 
-def _refresh_openai_codex_oauth(auth_path: Path, auth_data: dict[str, Any], entry: dict[str, Any]) -> dict[str, Any]:
+def _refresh_openai_codex_oauth(auth_path: Path, entry: dict[str, Any]) -> dict[str, Any]:
     refresh_token = str(entry.get("refresh") or "").strip()
     if not refresh_token:
         raise OpenAIAuthError("openai-codex token expired and refresh token is missing")
@@ -88,9 +102,7 @@ def _refresh_openai_codex_oauth(auth_path: Path, auth_data: dict[str, Any], entr
         "refresh": new_refresh_token,
         "expires": int(time.time() * 1000) + expires_in * 1000,
     }
-    auth_data = {**auth_data, "openai-codex": updated}
-    _write_json_atomic(auth_path, auth_data)
-    return updated
+    return _store_refreshed_entry(auth_path, entry, updated)
 
 
 def load_openai_codex_auth(auth_path: Path) -> OpenAICodexAuth:
@@ -110,7 +122,9 @@ def load_openai_codex_auth(auth_path: Path) -> OpenAICodexAuth:
     access = str(entry.get("access") or "").strip()
     should_refresh = not access or (expires and expires <= now_ms + OPENAI_OAUTH_REFRESH_WINDOW_MS)
     if should_refresh:
-        entry = _refresh_openai_codex_oauth(auth_path, auth_data, entry)
+        entry = _refresh_openai_codex_oauth(auth_path, entry)
+        if entry.get("type") != "oauth" or not entry.get("accountId"):
+            raise OpenAIAuthError("openai-codex credentials changed during refresh")
         access = str(entry.get("access") or "").strip()
         expires = int(entry.get("expires") or 0)
 

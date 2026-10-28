@@ -7,7 +7,7 @@
 - Worker secrets `B2_APPLICATION_KEY_ID`, `B2_APPLICATION_KEY`: newsletter B2 credentials.
 - Worker secrets `NEWSL_RSS_USERNAME`, `NEWSL_RSS_PASSWORD`: HTTP Basic authentication for all newsletter routes.
 - Set secrets using Wrangler's secret commands; never put values in Git. Dummy credential example: `replace-me`.
-- `package.json` / `.node-version`: pinned Node/npm/Wrangler versions; npm scripts additionally require the external `../../scripts/worker-deps.py` (see README).
+- `package.json`: Node/npm major versions (`engines`) and the pinned Wrangler version; npm scripts additionally require the external `../../scripts/worker-deps.py` (see README).
 - `src/index.js` is a recovered bundle: the public delivery host and fallback bucket are still compiled in; changing vars does not replace the host.
 - Legacy redirect/rewrite hosts at `src/index.js:1058,1142,1341` remain unchanged; the owner may want to drop them before publication. This is not a generic-host source distribution.
 - `recovery/` is private provenance and excluded from `git archive`, as is `.gitattributes`.

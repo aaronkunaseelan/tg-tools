@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,7 +41,7 @@ def probe_duration(source_path: Path, settings: Settings) -> float:
         raise AudioError(f"ffprobe failed: {proc.stderr.strip()[:300]}")
     data = json.loads(proc.stdout)
     duration = float((data.get("format") or {}).get("duration") or 0)
-    if duration <= 0:
+    if not math.isfinite(duration) or duration <= 0:
         raise AudioError("audio duration missing or zero")
     return duration
 
@@ -114,7 +115,11 @@ def prepare_audio(source_path: Path, work_dir: Path, settings: Settings) -> Prep
         if not chunk_path.exists() or chunk_path.stat().st_size < 1024:
             if chunk_path.exists():
                 chunk_path.unlink()
-            break
+            raise AudioError(f"audio coverage incomplete at {offset}s: missing or tiny chunk")
+        chunk_duration = probe_duration(chunk_path, settings)
+        expected = min(settings.chunk_seconds, duration - offset)
+        if abs(chunk_duration - expected) > 0.25:
+            raise AudioError(f"audio coverage incomplete at {offset}s: expected {expected}s, got {chunk_duration}s")
         chunk_paths.append(chunk_path)
         chunk_index += 1
         offset += settings.chunk_seconds

@@ -101,3 +101,6 @@ def test_shared_key_receipt_is_per_delivery(stack):
 def test_update_claimed_once(stack):
     store = PostgresHandledUpdateStore(dsn=stack.dsn())
     assert [store.claim_update("message:-100:9"), store.claim_update("message:-100:9")] == [True, False]
+    assert store.disposition("message:-100:9") == "uncertain"
+    store.mark_handled("message:-100:9")
+    assert store.disposition("message:-100:9") == "handled"

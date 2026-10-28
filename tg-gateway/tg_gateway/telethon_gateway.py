@@ -238,10 +238,12 @@ class TelethonGateway:
         entity = await self._get_entity(chat_id)
         message = await self._client.get_messages(entity, ids=message_id)
         if message is None or getattr(message, "media", None) is None:
-            raise ValueError(f"No media found for file id {file_id}")
+            from .source_handoff import HandoffRejected
+            raise HandoffRejected("source_unavailable", "Telegram source media is no longer available")
         path = await self._client.download_media(message, file=str(target_path))
         if path is None:
-            raise RuntimeError("download_media returned None")
+            from .source_handoff import HandoffRejected
+            raise HandoffRejected("source_unavailable", "Telegram returned no media bytes")
         file_obj = getattr(message, "file", None)
         return DownloadedAttachment(
             file_id=file_id,

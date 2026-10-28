@@ -25,5 +25,5 @@ Services read the process environment; systemd loads `~/.config/agent-secrets/ru
 - `RUNTIME_CONTROLLER_QMD_EMBED_ADAPTER`: `auto`, `reference_stub`, `qmd_bridge`; bridge payload `qmdRepoRoot` overrides the Python env root.
 - Modal sets `QMD_EMBED_WORKER_VENUE=modal` if absent; QMD's own provider credentials/config remain QMD-owned.
 ## Tooling
-`.node-version` and `package.json` pin Node/npm/dependencies. `deploy/no-secret-env.py` removes credentials from dependency subprocesses. See [release.md](release.md).
+`package.json` sets the Node/npm major versions (`engines`) and pins dependencies; exact host versions live in agent-tools-update's `runtimes.toml`. `deploy/no-secret-env.py` removes credentials from dependency subprocesses. See [release.md](release.md).
 Tests require `RUNTIME_TEST_PGHOST` (absolute disposable socket directory), optional `RUNTIME_TEST_PGPORT` (5432), `RUNTIME_TEST_PGUSER` (ubuntu). Never point tests at the production socket.

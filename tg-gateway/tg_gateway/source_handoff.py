@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -101,7 +102,7 @@ class HandoffStore(Protocol):
     must raise HandoffLeaseLost when the token is stale."""
 
     def create_handoff(self, row: dict[str, Any]) -> bool: ...
-    def claim_next(self, *, owner: str, bot_identity: str, lease_seconds: int) -> dict[str, Any] | None: ...
+    def claim_next(self, *, owner: str, bot_identity: str, lease_seconds: int, update_uid: str | None = None) -> dict[str, Any] | None: ...
     def record_staged(self, handoff_id: int, *, lease_token: str, path: str, sha256: str, size: int, intent_json: dict[str, Any]) -> None: ...
     def record_receipt(self, handoff_id: int, receipt_id: str, *, lease_token: str) -> None: ...
     def record_job(self, handoff_id: int, job_id: str, *, lease_token: str) -> None: ...
@@ -154,10 +155,11 @@ class SourceHandoffDrainer:
     max_telegram_bytes: int = DEFAULT_MAX_TELEGRAM_BYTES
     lease_seconds: int = DEFAULT_LEASE_SECONDS
 
-    def drain_once(self) -> str:
+    def drain_once(self, *, update_uid: str | None = None) -> str:
         """Process at most one pending/staged handoff. Returns outcome."""
         handoff = self.store.claim_next(
-            owner=self.owner, bot_identity=self.bot_identity, lease_seconds=self.lease_seconds)
+            owner=self.owner, bot_identity=self.bot_identity, lease_seconds=self.lease_seconds,
+            update_uid=update_uid)
         if handoff is None:
             return "idle"
         handoff_id = int(handoff["handoff_id"])
@@ -211,6 +213,14 @@ class SourceHandoffDrainer:
             if staged.is_symlink() or not staged.is_file():
                 raise HandoffRejected("source_type_mismatch", "staged attachment is not a regular file")
             sha, size = _sha256_file(staged, self.max_telegram_bytes)
+        # Persist bytes and their directory entry before committing retention.
+        with staged.open("rb") as handle:
+            os.fsync(handle.fileno())
+        directory = os.open(staged.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
         job_input.update({
             "localSourcePath": str(staged),
             "stagedSha256": sha,
@@ -316,7 +326,7 @@ class PostgresSourceHandoffStore:
                      json.dumps(row["progress_target"])))
         return True
 
-    def claim_next(self, *, owner: str, bot_identity: str, lease_seconds: int) -> dict[str, Any] | None:
+    def claim_next(self, *, owner: str, bot_identity: str, lease_seconds: int, update_uid: str | None = None) -> dict[str, Any] | None:
         now = datetime.now(timezone.utc)
         with self._connect() as conn:
             row = conn.execute(
@@ -324,12 +334,13 @@ class PostgresSourceHandoffStore:
                 SELECT handoff_id FROM tg_gateway.source_handoffs
                  WHERE bot_identity = %s
                    AND state IN ('pending', 'staged')
+                   AND (%s::text IS NULL OR update_uid = %s)
                    AND (lease_expires_at IS NULL OR lease_expires_at < now())
                  ORDER BY handoff_id
                  FOR UPDATE SKIP LOCKED
                  LIMIT 1
                 """,
-                (bot_identity,),
+                (bot_identity, update_uid, update_uid),
             ).fetchone()
             if row is None:
                 return None

@@ -14,8 +14,8 @@ Public RSS paths are delivered by the Worker from **private** bucket `rss-endpoi
 
 ## Pinned dependencies and commands
 
-Node 24.20.0 and npm 12.0.2 are required and checked against `.node-version`,
-exact engines and `packageManager` metadata; Wrangler is locked exactly to
+Node 26 and npm 12 (major versions, `engines` in `package.json`) are required; exact host
+versions live in agent-tools-update's `runtimes.toml`. Wrangler is locked exactly to
 4.147.0 in `package-lock.json`. Do not use global Wrangler or `npx`.
 
 ```bash

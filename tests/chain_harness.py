@@ -469,7 +469,8 @@ def codex_responses(stack: Stack, reply: Callable[[dict[str, Any]], Any]) -> str
     def handler(req: EdgeRequest) -> tuple[int, Any]:
         text = json.dumps(reply(req.json()))
         event = {"type": "response.output_text.delta", "delta": text}
-        return 200, f"data: {json.dumps(event)}\n\ndata: [DONE]\n\n".encode()
+        completed = {"type": "response.completed", "response": {"status": "completed"}}
+        return 200, f"data: {json.dumps(event)}\n\ndata: {json.dumps(completed)}\n\ndata: [DONE]\n\n".encode()
     stack.edge.route("POST", r"/backend-api/codex/responses$", handler)
     return stack.edge.url + "/backend-api/codex/responses"
 

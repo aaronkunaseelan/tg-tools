@@ -25,7 +25,7 @@ from summarizer import SummaryError, call_codex_json, read_sse_output_text, rend
 
 def sse(text):
     return b"".join(b"data: " + json.dumps({"type": "response.output_text.delta", "delta": part}).encode() + b"\n"
-                    for part in (text[:5], text[5:])) + b"data: [DONE]\n"
+                    for part in (text[:5], text[5:])) + b'data: {"type":"response.completed","response":{"status":"completed"}}\n' + b"data: [DONE]\n"
 
 
 def test_parse_table():

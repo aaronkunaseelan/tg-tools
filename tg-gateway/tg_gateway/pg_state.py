@@ -16,14 +16,27 @@ class PostgresHandledUpdateStore:
         with psycopg.connect(self._dsn) as conn:
             row = conn.execute(
                 """
-                INSERT INTO tg_gateway.handled_updates (update_uid, source_system)
-                VALUES (%s, %s)
+                INSERT INTO tg_gateway.handled_updates (update_uid, source_system, disposition)
+                VALUES (%s, %s, 'uncertain')
                 ON CONFLICT (update_uid) DO NOTHING
                 RETURNING update_uid
                 """,
                 (update_uid, source_system),
             ).fetchone()
         return row is not None
+
+    def disposition(self, update_uid: str) -> str | None:
+        with psycopg.connect(self._dsn) as conn:
+            row = conn.execute(
+                "SELECT disposition FROM tg_gateway.handled_updates WHERE update_uid = %s",
+                (update_uid,)).fetchone()
+        return row[0] if row else None
+
+    def mark_handled(self, update_uid: str) -> None:
+        with psycopg.connect(self._dsn) as conn:
+            conn.execute(
+                "UPDATE tg_gateway.handled_updates SET disposition = 'handled' WHERE update_uid = %s",
+                (update_uid,))
 
 
 class PostgresGatewayState:

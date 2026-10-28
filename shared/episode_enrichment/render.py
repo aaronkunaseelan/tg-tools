@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 
+from tg_tools_common.public_source import public_source_reference
+
 from .paragraphs import normalize
 
 UNKNOWN_DATE = "Unknown"
@@ -65,6 +67,7 @@ def render_notes_markdown(
         links.append(f"[MP3]({mp3_url})")
     if script_url:
         links.append(f"[Script]({script_url})")
+    source_url = public_source_reference(source_url)
     if source_url:
         links.append(f"[Original]({source_url})")
     if links:
@@ -113,7 +116,7 @@ def build_feed_description(
     parts.append(" ".join(facts))
     document_label = "Notes" if script_url else ("Transcript" if source_kind == "audio" else "Script")
     for label, url in (("MP3", mp3_url), (document_label, notes_url), ("Script", script_url),
-                       ("Original", source_url)):
+                       ("Original", public_source_reference(source_url))):
         if url:
             parts.append(f"{label}: {url}")
     return "\n\n".join(part for part in parts if part).strip()
@@ -146,7 +149,7 @@ def build_manifest(
         "source": {
             "publishedAt": published,
             "dateBasis": date_basis,
-            "sourceUrl": source_url,
+            "sourceUrl": public_source_reference(source_url),
             "durationSeconds": duration_seconds,
         },
         "artifacts": {

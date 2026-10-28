@@ -1,12 +1,12 @@
 """Recover final confirmation from durable RSS results; never rerun publication."""
 import logging
 
+from tg_tools_common.runtime_contract import TERMINAL_RESULT_KINDS
+
 from pipeline import render_completion_message
 from runtime_jobs import confirmation_delivery_payload
 
 log = logging.getLogger(__name__)
-
-TERMINAL_KINDS = {"succeeded", "dead", "cancelled"}
 
 
 class RSSResultProjector:
@@ -16,7 +16,7 @@ class RSSResultProjector:
     def project_once(self) -> int:
         projected = 0
         for result in self.client.list_results(result_owner="rss-audio", limit=100) or []:
-            if result.get("resultKind") not in TERMINAL_KINDS:
+            if result.get("resultKind") not in TERMINAL_RESULT_KINDS:
                 continue
             try:
                 self._project(result)

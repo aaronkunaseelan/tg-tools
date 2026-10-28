@@ -28,10 +28,11 @@ from .notifications import render_failure_notification
 logger = logging.getLogger(__name__)
 
 OWNERS = ("tts", "x-tts")
-TERMINAL_KINDS = {"succeeded", "dead", "failed", "terminal_error"}
 
 
 def render_notification(result_kind: str, result_json: dict[str, Any]) -> str:
+    if result_kind == "cancelled":
+        return "Request cancelled."
     if result_kind == "succeeded" and result_json.get("ok"):
         text = (f"Posted to {feed_title()}:\n{result_json.get('title', '')}\n"
                 f"{result_json.get('publicAudioUrl', '')}\n"
@@ -100,7 +101,7 @@ class ResultProjector:
 
     def _project(self, owner: str, result: dict[str, Any]) -> bool:
         result_kind = str(result.get("resultKind") or "")
-        if result_kind not in TERMINAL_KINDS:
+        if result_kind not in runtime_contract.TERMINAL_RESULT_KINDS:
             # Retry/intermediate rows must never notify; leave unconsumed.
             logger.info("skipping non-terminal result kind=%s id=%s",
                         result_kind, result.get("resultId"))

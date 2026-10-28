@@ -6,6 +6,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from tg_tools_common.public_source import public_source_reference
+
 
 def sha256_file(path: Path) -> str:
     h = hashlib.sha256()
@@ -19,7 +21,7 @@ def write_manifest(path: Path, *, source: dict[str, Any], artifacts: dict[str, P
     data = {
         "schemaVersion": 1,
         "createdAt": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-        "source": source,
+        "source": {**source, "sourceRef": public_source_reference(source.get("sourceRef"))},
         "artifacts": {name: {"sha256": sha256_file(p), "bytes": p.stat().st_size} for name, p in artifacts.items() if p.exists()},
         "chunkReceipts": chunk_receipts,
         "modelUsage": model_usage or {},

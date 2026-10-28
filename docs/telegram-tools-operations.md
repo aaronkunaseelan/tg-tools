@@ -131,6 +131,14 @@ SELECT handoff_id, state, attempts, lease_expires_at, last_error
  WHERE state IN ('pending', 'staged') AND created_at < now() - interval '15 minutes';
 ```
 
+Commands use `tg_gateway.handled_updates.disposition`: a new claim is
+`uncertain` until its adapter returns. Exceptions or replay of an interrupted
+claim enqueue a stable-key uncertainty notification, never repeat the command.
+A process loss leaves its disposition available for reconciliation; inspect
+effects before issuing a new command. Migration 007 adds this column, preserving
+older handled markers. Source acknowledgments are sent only after their own
+handoff is staged and submitted, not after a different queued row drains.
+
 Job input carries exactly the source the worker consumes: top-level
 `sourceText` or `sourceUrl`, or staged file fields. Receipts are metadata
 only. Job rows therefore hold private text: never log full input JSON, and

@@ -64,12 +64,23 @@ class GatewayAdapter:
         if command == "start":
             await self._reply(runtime, message, "Send a meeting audio file. Use /status and /queue to inspect runtime state.")
             return True
-        if command in {"status", "queue", "run"}:
+        if command == "status":
+            counts = {}
+            for status in ("pending", "retryable", "leased"):
+                payload = await asyncio.to_thread(
+                    runtime.runtime_client.list_jobs, result_owner="meeting-summary",
+                    workload_type="meeting_summary", status=status, limit=1)
+                # Missing producer evidence must not become a healthy zero.
+                counts[status] = int(payload["count"])
+            await self._reply(runtime, message, "\n".join(
+                f"{status}={count}" for status, count in counts.items()))
+            return True
+        if command in {"queue", "run"}:
             payload = await asyncio.to_thread(
                 runtime.runtime_client.list_jobs,
                 result_owner="meeting-summary",
                 workload_type="meeting_summary",
-                status="pending,retryable,leased" if command in {"queue", "run"} else None,
+                status="pending,retryable,leased",
                 limit=20,
             )
             items = list(payload.get("items") or [])
@@ -77,14 +88,8 @@ class GatewayAdapter:
                 text = "Queue is empty." if not items else "\n".join(
                     f"{row.get('status')} {str(row.get('jobId') or '')[:8]} {row.get('producerRef') or ''}" for row in items
                 )
-            elif command == "run":
-                text = f"runtime_ok=true\nqueue_visible={len(items)}\nworkers and consumers are long-running services."
             else:
-                counts: dict[str, int] = {}
-                for row in items:
-                    status = str(row.get("status") or "unknown")
-                    counts[status] = counts.get(status, 0) + 1
-                text = "\n".join(f"{status}={counts.get(status, 0)}" for status in ("pending", "retryable", "leased"))
+                text = f"runtime_ok=true\nqueue_visible={len(items)}\nworkers and consumers are long-running services."
             await self._reply(runtime, message, text)
             return True
         return False

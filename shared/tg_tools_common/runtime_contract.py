@@ -17,6 +17,8 @@ PRIVATE_TEXT_KEYS = frozenset({
     "messageText", "messageBody", "rawMessage", "rawText",
 })
 SOURCE_KEYS = frozenset({"sourceText", "sourceUrl"})
+# runtime-controller src/types/runtime.ts RESULT_KINDS (not attempt statuses).
+TERMINAL_RESULT_KINDS = frozenset({"succeeded", "dead", "cancelled"})
 
 
 def telegram_source_key(bot_identity: str, chat_id: int, message_id: int) -> str:
