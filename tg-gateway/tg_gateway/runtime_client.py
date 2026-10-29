@@ -100,7 +100,7 @@ class RuntimeClient:
         return self._get("/healthz", {})
 
     def health_summary(self, *, workloads: list[str], owners: list[str]) -> dict[str, Any]:
-        return self._get("/v1/health-summary", {
+        return self._get("/v2/health-summary", {
             "workloadTypes": ",".join(workloads), "resultOwners": ",".join(owners), "windowSec": 21600})
 
     def admit_source_receipt(self, payload: dict[str, Any]) -> dict[str, Any]:

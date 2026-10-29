@@ -21,7 +21,7 @@ function errorClass(value: unknown): string {
 /** Producer-owned, payload-free view. Every history read has an indexed row cap.
  * complete=false means a cap was reached: consumers must not infer absence/counts.
  */
-export async function getHealthSummary(db: pg.Pool | pg.PoolClient, workloads: string[], owners: string[], windowSec = 21600) {
+export async function getHealthSummary(db: pg.Pool | pg.PoolClient, workloads: string[], owners: string[], windowSec = 21600, version: 1 | 2 = 2) {
   summaryNames(workloads.join(","));
   summaryNames(owners.join(","));
   summaryWindow(String(windowSec));
@@ -64,6 +64,7 @@ export async function getHealthSummary(db: pg.Pool | pg.PoolClient, workloads: s
   };
   for (const r of dead.rows) if (workloads.includes(r.workload_type)) add("job", r.workload_type, r.error_class);
   let failuresComplete = dead.rows.length <= SUMMARY_LIMIT;
+  let supersededDeliveries = 0;
   for (const owner of owners) {
     const deliveries = await db.query<{ workload_type: string | null; last_error_class: string | null }>(
       `SELECT j.workload_type, d.last_error_class FROM
@@ -72,8 +73,14 @@ export async function getHealthSummary(db: pg.Pool | pg.PoolClient, workloads: s
           ORDER BY dead_at DESC LIMIT $4) d
        LEFT JOIN runtime.jobs j ON j.job_id = d.job_id`, [owner, since, at, SUMMARY_LIMIT + 1]);
     failuresComplete &&= deliveries.rows.length <= SUMMARY_LIMIT;
-    for (const r of deliveries.rows) add("delivery", r.workload_type ?? owner, r.last_error_class);
+    for (const r of deliveries.rows) {
+      // Keep the durable dead state for replay fencing; supersession is not failure.
+      const superseded = r.last_error_class === "product_delivery_superseded";
+      if (superseded) supersededDeliveries++;
+      if (version === 1 || !superseded) add("delivery", r.workload_type ?? owner, r.last_error_class);
+    }
   }
-  return { schema: "runtime.health-summary/1", at: at.getTime() / 1000, windowSec,
-    workloads: items, failuresComplete, failures: [...grouped.values()] };
+  return { schema: `runtime.health-summary/${version}`, at: at.getTime() / 1000, windowSec,
+    workloads: items, failuresComplete, failures: [...grouped.values()],
+    ...(version === 2 ? { supersededDeliveries } : {}) };
 }

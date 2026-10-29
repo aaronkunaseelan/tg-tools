@@ -140,7 +140,7 @@ async function main(): Promise<void> {
         return;
       }
 
-      if (url.pathname === "/v1/health-summary" && method === "GET") {
+      if (["/v1/health-summary", "/v2/health-summary"].includes(url.pathname) && method === "GET") {
         let workloads: string[], owners: string[], windowSec: number;
         try {
           workloads = summaryNames(url.searchParams.get("workloadTypes"));
@@ -149,7 +149,8 @@ async function main(): Promise<void> {
         } catch {
           throw badRequest("invalid_health_summary_query", "Invalid health-summary query");
         }
-        writeJson(res, 200, await getHealthSummary(pool, workloads, owners, windowSec));
+        writeJson(res, 200, await getHealthSummary(pool, workloads, owners, windowSec,
+          url.pathname === "/v1/health-summary" ? 1 : 2));
         return;
       }
 

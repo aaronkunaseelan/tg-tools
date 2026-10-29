@@ -19,12 +19,12 @@ BOUNDS = {'tts_synthesize': 7200}
 
 
 def summary():
-    return {'schema': 'runtime.health-summary/1', 'at': NOW, 'windowSec': 21600,
+    return {'schema': 'runtime.health-summary/2', 'at': NOW, 'windowSec': 21600,
             'workloads': [{'workloadType': 'tts_synthesize', 'newestJobAt': '2027-01-15T08:00:00Z',
                            'jobsByStatus': {'dead': 0, 'succeeded': 2}, 'countsComplete': True,
                            'activeComplete': True, 'oldestActiveAgeSec': None,
                            'pastDeadline': False, 'expiredLease': False}],
-            'failuresComplete': True, 'failures': []}
+            'failuresComplete': True, 'failures': [], 'supersededDeliveries': 0}
 
 
 def client(value=None, health=None):
@@ -85,6 +85,42 @@ def test_recent_dead(kind):
     assert 'tts_synthesize speech_timeout' in check(value, 'recent_failures')['reason']
 
 
+def test_superseded_deliveries_are_non_failures_from_producer():
+    data = summary()
+    data['supersededDeliveries'] = 3
+    assert check(run(client(data)), 'recent_failures')['ok']
+
+
+def test_controller_superseded_delivery_to_telemetry_real_path():
+    from chain_harness import start_stack
+    sys.path.insert(0, str(ROOT / 'tg-gateway'))
+    from tg_gateway.runtime_client import RuntimeClient
+    stack = start_stack()
+    try:
+        runtime = RuntimeClient(base_url=stack.controller_url, bearer_token="chain-token")
+        for error in ("product_delivery_superseded", "telegram_forbidden"):
+            appended = runtime.append_delivery({
+                "resultOwner": "tts", "resultRoute": "tts.reply", "deliveryProvider": "telegram",
+                "deliveryKind": "text_message", "deliveryKey": error, "payloadJson": {}})
+            claimed = runtime.claim_delivery(claim_owner="telemetry-test",
+                                             delivery_id=appended["delivery"]["deliveryId"])["delivery"]
+            runtime.finalize_delivery({"deliveryId": claimed["deliveryId"], "claimToken": claimed["claimToken"],
+                                       "outcome": "terminal_error", "errorClass": error})
+            data = runtime.health_summary(workloads=list(BOUNDS), owners=["tts"])
+            assert not problems(SUMMARY_CONTRACT, data)
+            assert data["supersededDeliveries"] == 1
+            value = collect(runtime, [], BOUNDS, list(BOUNDS), ["tts"], lambda: (False, None))
+            if error == "product_delivery_superseded":
+                assert data["failures"] == []
+                assert value["state"] == "green"
+            else:
+                assert data["failures"] == [{"kind": "delivery", "workloadType": "tts",
+                                             "errorClass": error, "count": 1}]
+                assert not check(value, "recent_failures")["ok"]
+    finally:
+        stack.stop()
+
+
 def test_worker_stale_missing_and_unreadable_configuration():
     stale = {'ok': True, 'runtime': {'workerHeartbeats': [{'workerId': 'tts-worker', 'heartbeatFresh': False}]}}
     assert not check(run(client(health=stale)), 'workers')['ok']
@@ -114,7 +150,7 @@ def test_capped_and_invalid_summary_are_unknown_never_healthy():
     assert check(run(client(data)), 'recent_failures')['reason'].startswith('unknown:')
     # The live summary is read after collect() takes `now`, so it is a little newer.
     assert check(run(client({**summary(), 'at': NOW + 0.05})), 'stuck_jobs')['ok']
-    for bad in ({}, {**summary(), 'schema': 'wrong'}, {**summary(), 'at': NOW - 301}, {**summary(), 'at': NOW + 301},
+    for bad in ({}, {**summary(), 'schema': 'wrong'}, {**summary(), 'schema': 'runtime.health-summary/1'}, {**summary(), 'at': NOW - 301}, {**summary(), 'at': NOW + 301},
                 {**summary(), 'workloads': []}):
         c = client()
         c.health_summary = lambda **kwargs: bad
@@ -220,7 +256,7 @@ def test_existing_gateway_client_reads_health_and_summary_without_private_list_a
     value = c.health_summary(workloads=['tts_synthesize'], owners=['tts'])
     assert not problems(SUMMARY_CONTRACT, value)
     assert calls[0].endswith('/healthz')
-    assert '/v1/health-summary?' in calls[1] and 'windowSec=21600' in calls[1]
+    assert '/v2/health-summary?' in calls[1] and 'windowSec=21600' in calls[1]
 
 
 def test_invalid_heartbeat_is_unknown():

@@ -47,8 +47,9 @@ async function main(): Promise<void> {
   }
 
   if (command === "contract") {
-    if (process.argv[3] !== "runtime.health-summary/1") throw new Error("unknown contract");
-    console.log(await readFile(resolve(defaultMigrationsDir(), "../../contracts/runtime.health-summary-1.json"), "utf8"));
+    const version = /^runtime\.health-summary\/([12])$/.exec(process.argv[3] ?? "")?.[1];
+    if (!version) throw new Error("unknown contract");
+    console.log(await readFile(resolve(defaultMigrationsDir(), `../../contracts/runtime.health-summary-${version}.json`), "utf8"));
     return;
   }
 

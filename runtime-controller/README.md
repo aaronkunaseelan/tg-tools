@@ -364,7 +364,7 @@ npm run serve
 Endpoints:
 
 - `GET /healthz`
-- `GET /v1/health-summary` ([data-free bounded contract](docs/health-summary.md))
+- `GET /v2/health-summary` ([data-free bounded contract](docs/health-summary.md)); `/v1/health-summary` remains available for older readers
 - `POST /v1/submit`
 - `POST /v1/claim`
 - `GET /v1/jobs`

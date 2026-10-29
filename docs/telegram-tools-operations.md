@@ -108,7 +108,7 @@ opens a Telegram session, invokes a provider, or logs configuration. A stopped
 unit or unreadable configuration is unknown, not a guessed identity.
 
 Prerequisites: promote runtime-controller's authenticated
-`GET /v1/health-summary` (`runtime.health-summary/1`) and apply its additive
+`GET /v2/health-summary` (`runtime.health-summary/2`) and apply its additive
 `012_health_summary.sql` indexes first; apply gateway migration
 `008_health_handoffs.sql` for newest/pending handoff indexes. The endpoint's
 contract is vendored in `tg_tools_cli/contracts/` and validated at read time.
@@ -126,8 +126,12 @@ Checks:
   for meetings (defaults 7200+180=7380s). Age is current attempt start, not a
   renewable lease timestamp or original job submission. These are alarm bounds,
   not new processing timeouts. Missing workload bounds are unknown.
-- `recent_failures`: no job terminal result or delivery dead transition in 6h;
-  reasons name workload/error class only (standalone deliveries name their owner).
+- `recent_failures`: no job terminal result or failed delivery dead transition in 6h;
+  the controller excludes superseded progress edits and reports their separate
+  `supersededDeliveries` count. No consumer-side error-class filter is applied.
+  Promote the controller's side-by-side `/2` view before this reader; `/1` is not
+  accepted as a fallback (its failure meaning differs).
+  Reasons name workload/error class only (standalone deliveries name their owner).
 - `handoffs`: no gateway-owned source handoff pending/staged over 900s, checked
   with read-only, statement-timeout connections to both gateways' configured DBs.
 
@@ -198,7 +202,9 @@ treat backups and API responses as sensitive.
 
 Telegram delivery is at-least-once: a crash after sending and before recording
 can repeat one message. A dead outbox row is replayed by resetting it to
-pending after diagnosing it; never edit a payload in place.
+pending after diagnosing it; never edit a payload in place. Superseded progress
+edits (`product_delivery_superseded`) are intentional terminal non-failures, not
+replay candidates; the progress binding advances without resending the old edit.
 
 ### Progress messages
 

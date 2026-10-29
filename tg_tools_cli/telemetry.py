@@ -15,7 +15,7 @@ import time
 from .contract_validate import problems
 
 ROOT = Path(__file__).resolve().parents[1]
-SUMMARY_CONTRACT = json.loads((Path(__file__).parent / "contracts/runtime.health-summary-1.json").read_text())
+SUMMARY_CONTRACT = json.loads((Path(__file__).parent / "contracts/runtime.health-summary-2.json").read_text())
 WORD = re.compile(r"[A-Za-z0-9_.:-]{1,80}\Z")
 
 
