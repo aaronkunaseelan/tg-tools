@@ -44,9 +44,12 @@ def render_notification(result_kind: str, result_json: dict[str, Any]) -> str:
             text += (f"\nTokens: {usage.get('totalTokens', 'unavailable')}, "
                      f"Hangups: {len(result_json.get('hangups') or [])}")
         return text
-    stage = str(result_json.get("stage") or "unknown")
-    error_class = str(result_json.get("errorClass") or "unknown")
-    return render_failure_notification(stage, error_class, result_json.get("message"))
+    stage = str(result_json.get("stage") or "runtime")
+    error_class = str(result_json.get("errorClass") or "failure_details_unavailable")
+    message = result_json.get("message")
+    if not result_json.get("stage") and not result_json.get("errorClass"):
+        message = "Stage and reason were not recorded"
+    return render_failure_notification(stage, error_class, message)
 
 
 def delivery_payload(*, owner: str, job: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:

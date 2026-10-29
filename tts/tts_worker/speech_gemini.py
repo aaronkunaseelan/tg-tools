@@ -86,6 +86,8 @@ class SpeechResult:
 
 
 class GeminiSpeechProvider:
+    REQUEST_TIMEOUT_S = 120
+
     def __init__(self, *, api_key: str, voice: str = "Kore", http_post: Any | None = None) -> None:
         self.api_key = api_key
         self.voice = voice
@@ -109,7 +111,7 @@ class GeminiSpeechProvider:
             url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=" + self.api_key
             req = urllib_request.Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"}, method="POST")
             try:
-                with urllib_request.urlopen(req, timeout=120) as resp:
+                with urllib_request.urlopen(req, timeout=self.REQUEST_TIMEOUT_S) as resp:
                     raw = resp.read(MAX_PROVIDER_RESPONSE_BYTES + 1)
                     if len(raw) > MAX_PROVIDER_RESPONSE_BYTES:
                         raise SpeechError("audio_validation_failed", "Gemini TTS response exceeds byte cap")
@@ -117,7 +119,9 @@ class GeminiSpeechProvider:
             except urllib_error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", errors="replace")[:500]
                 raise SpeechError(classify_provider_http(exc.code, "gemini"), f"Gemini TTS HTTP {exc.code}: {detail}") from exc
-            except urllib_error.URLError as exc:
+            except (TimeoutError, urllib_error.URLError) as exc:
+                if isinstance(exc, TimeoutError) or isinstance(exc.reason, TimeoutError):
+                    raise SpeechError("speech_timeout", f"TimeoutError: socket read timed out after {self.REQUEST_TIMEOUT_S} s from gemini") from exc
                 raise SpeechError("gemini_error", f"Gemini TTS failed: {exc.reason}") from exc
         try:
             inline = obj["candidates"][0]["content"]["parts"][0]["inlineData"]
@@ -158,6 +162,8 @@ def _azure_text_error(data: bytes, content_type: str = "") -> str | None:
 
 
 class AzureSpeechProvider:
+    REQUEST_TIMEOUT_S = 300
+
     def __init__(self, *, base_url: str, api_key: str, key_cmd: str = "", model: str = "gpt-4o-mini-tts", voice: str = "nova", http_post: Any | None = None) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
@@ -193,13 +199,15 @@ class AzureSpeechProvider:
             url = self.base_url + "/openai/v1/audio/speech?api-version=preview"
             req = urllib_request.Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json", "Accept": "application/octet-stream", "api-key": key}, method="POST")
             try:
-                with urllib_request.urlopen(req, timeout=300) as resp:
+                with urllib_request.urlopen(req, timeout=self.REQUEST_TIMEOUT_S) as resp:
                     content_type = str(resp.headers.get("Content-Type") or "")
                     data = resp.read(MAX_PROVIDER_RESPONSE_BYTES + 1)
             except urllib_error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", errors="replace")[:500]
                 raise SpeechError(classify_provider_http(exc.code, "azure"), f"Azure TTS HTTP {exc.code}: {detail}") from exc
-            except urllib_error.URLError as exc:
+            except (TimeoutError, urllib_error.URLError) as exc:
+                if isinstance(exc, TimeoutError) or isinstance(exc.reason, TimeoutError):
+                    raise SpeechError("speech_timeout", f"TimeoutError: socket read timed out after {self.REQUEST_TIMEOUT_S} s from azure") from exc
                 raise SpeechError("azure_tts_error", f"Azure TTS failed: {exc.reason}") from exc
         if not isinstance(data, (bytes, bytearray)) or not data:
             raise SpeechError("azure_tts_error", "Azure TTS returned empty audio")

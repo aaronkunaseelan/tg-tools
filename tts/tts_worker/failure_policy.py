@@ -20,6 +20,9 @@ from tts_common import taxonomy
 
 # Deterministic failures: retrying the same input cannot succeed.
 TERMINAL_CLASSES = {
+    # Unexpected code failures and un-retried socket stalls must notify now.
+    "unexpected_failure",
+    "speech_timeout",
     "input_empty",
     "extract_metadata_only",
     "unsupported_format",

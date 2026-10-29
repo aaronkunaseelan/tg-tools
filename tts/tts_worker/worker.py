@@ -151,6 +151,7 @@ def _execute_job_in_root(
     _cancel = cancel_check or (lambda: None)
     workload = str(input_json.get("workloadType") or input_json.get("mode") or "")
     x_mode = workload == "x_tts_explain" or (str(input_json.get("mode")) == "explain" and str(input_json.get("promptVersion", "")).startswith("x_tts"))
+    stage = "admission"
     try:
         if x_mode and "length" in input_json:
             raise TTSJobError("admission", "length_not_allowed", "x-tts explain does not accept length")
@@ -161,10 +162,12 @@ def _execute_job_in_root(
         except ValueError as exc:
             raise TTSJobError("admission", "voice_invalid", str(exc)) from exc
         _cancel()
+        stage = "acquire"
         try:
             acquired = acquire_source(input_json, work, fetcher=source_fetcher)
         except AcquireError as exc:
             raise TTSJobError("acquire", exc.error_class, str(exc)) from exc
+        stage = "fingerprint"
         try:
             roles = reader_role_map() if x_mode else None
             fp = execution_fingerprint(
@@ -184,6 +187,7 @@ def _execute_job_in_root(
         except RoleMapError as exc:
             raise TTSJobError("fingerprint", "reader_role_map_failed", str(exc)) from exc
 
+        stage = "checkpoint"
         try:
             retry = decide_retry(work, fp)
         except RetryGuardConflict as exc:
@@ -218,6 +222,7 @@ def _execute_job_in_root(
             assert retry.checkpoint is not None
             checkpoint = retry.checkpoint
             current_progress().emit("generation_checkpoint", "reused", reason="checkpoint_reused")
+            stage = "publish"
             publication = checkpoint.publication
             artifacts = checkpoint.artifacts
             try:
@@ -260,6 +265,7 @@ def _execute_job_in_root(
                 raise TTSJobError("publish", exc.error_class, str(exc)) from exc
             return result_from_checkpoint(checkpoint, episode, source_key=source_key)
 
+        stage = "materialise"
         try:
             if CHATGPT_SHARE_RE.search(acquired.source_ref):
                 mat = materialise(
@@ -292,6 +298,7 @@ def _execute_job_in_root(
         hangups: list[str] = []
         presentation: dict[str, Any] = {}
         _cancel()
+        stage = "compile"
         try:
             artifact = work / "artifact.md"
             primary_document: Path | None = None
@@ -374,12 +381,13 @@ def _execute_job_in_root(
         except LeaseLost:
             raise
         except Exception as exc:
-            raise TTSJobError("compile", "compile_failed", str(exc)) from exc
+            raise TTSJobError("compile", "compile_failed", type(exc).__name__[:80]) from exc
 
         # Run the script-only analysis before speech-provider spend. The second
         # call after synthesis reuses these checkpoints and only re-renders
         # notes with final duration and URLs.
         _cancel()
+        stage = "enrichment"
         try:
             if x_mode:
                 try:
@@ -416,9 +424,10 @@ def _execute_job_in_root(
         except LeaseLost:
             raise
         except Exception as exc:
-            raise TTSJobError("enrichment", getattr(exc, "error_class", "enrichment_failed"), str(exc)) from exc
+            raise TTSJobError("enrichment", getattr(exc, "error_class", "enrichment_failed"), type(exc).__name__[:80]) from exc
 
         _cancel()
+        stage = "speech"
         try:
             if settings.speech_provider == "azure":
                 provider = AzureSpeechProvider(base_url=settings.azure_tts_base_url, api_key=settings.azure_tts_api_key, key_cmd=settings.azure_tts_key_cmd, model=settings.azure_tts_model, voice=voice, http_post=gemini_post)
@@ -437,6 +446,7 @@ def _execute_job_in_root(
         except SpeechError as exc:
             raise TTSJobError("speech", exc.error_class, str(exc)) from exc
         _cancel()
+        stage = "enrichment"
         try:
             enrichment_result = enrich(
                 source=document_source, work_dir=work / "enrichment", title=title,
@@ -469,8 +479,9 @@ def _execute_job_in_root(
         except LeaseLost:
             raise
         except Exception as exc:
-            raise TTSJobError("enrichment", getattr(exc, "error_class", "enrichment_failed"), str(exc)) from exc
+            raise TTSJobError("enrichment", getattr(exc, "error_class", "enrichment_failed"), type(exc).__name__[:80]) from exc
         _cancel()
+        stage = "manifest"
         manifest_path = work / "manifest.json"
         try:
             total_seconds_before_publish = round(time.time() - started, 3)
@@ -487,6 +498,7 @@ def _execute_job_in_root(
             write_manifest(manifest_path, source={"sourceKey": source_key, "sourceHash": acquired.source_hash, "sourceRef": acquired.source_ref}, artifacts=manifest_artifacts, chunk_receipts=speech.receipts, model_usage=usage, voice=provider.voice, timings={"totalSecondsBeforePublish": total_seconds_before_publish, "audioDurationSeconds": speech.duration_seconds}, warnings=list(meta.get("warnings") or []) + hangups, presentation=presentation)
         except Exception as exc:
             raise TTSJobError("manifest", "manifest_failed", str(exc)) from exc
+        stage = "checkpoint"
         try:
             written_checkpoint = write_generation_checkpoint(
                 work,
@@ -527,6 +539,7 @@ def _execute_job_in_root(
         except OSError as exc:
             raise TTSJobError("checkpoint", "generation_checkpoint_write_failed", str(exc)) from exc
         _cancel()
+        stage = "publish"
         try:
             ep = publish_episode(
                 fingerprint=fp, title=title, description=description,
@@ -544,8 +557,10 @@ def _execute_job_in_root(
                 state_dir=work, cancel=_cancel)
         except PublishError as exc:
             raise TTSJobError("publish", exc.error_class, str(exc)) from exc
-    except TTSJobError:
+    except (TTSJobError, LeaseLost):
         raise
+    except Exception as exc:
+        raise TTSJobError(stage, "unexpected_failure", type(exc).__name__[:80]) from exc
     return result_from_checkpoint(written_checkpoint, ep, source_key=source_key)
 
 
@@ -580,7 +595,9 @@ async def process_claim(*, client: Any, settings: Settings, claim: dict[str, Any
             # with a stale token, discard late output. The runtime re-leases.
             logger.warning("abandoning attempt after lease loss job=%s", job_id)
             return
-        except TTSJobError as exc:
+        except Exception as exc:
+            if not isinstance(exc, TTSJobError):
+                exc = TTSJobError("worker", "unexpected_failure", type(exc).__name__[:80])
             if heartbeat.lost:
                 logger.warning("abandoning failed attempt after lease loss job=%s", job_id)
                 return
