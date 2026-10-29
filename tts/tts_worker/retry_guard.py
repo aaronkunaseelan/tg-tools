@@ -44,6 +44,14 @@ class RetryGuardResult:
 class RetryIdentityConflict(RuntimeError):
     """Final retry state cannot safely be replayed."""
 
+    error_class = "publish_identity_conflict"
+
+
+class PartialPublicationConflict(RetryIdentityConflict):
+    """Retained publication state cannot be replayed without its generation."""
+
+    error_class = "publish_partial_identity_conflict"
+
 
 class RetryMarkerCorrupt(RetryIdentityConflict):
     """A publish marker is unreadable or schema-invalid, not conflicting.
@@ -242,7 +250,8 @@ def evaluate_retry_state(job_root: Path, expected_identity: str) -> RetryGuardRe
         return RetryGuardResult(RetryDecision.INSTALLED, checkpoint, installed)
 
     if exists[_I_NAME] and not installed_corrupt:
-        raise RetryIdentityConflict("installed marker exists without valid checkpoint")
+        raise PartialPublicationConflict(
+            "installed marker exists without valid checkpoint; operator reconciliation required")
 
     prepared: dict[str, Any] | None = None
     if exists[_P_NAME]:
@@ -258,7 +267,8 @@ def evaluate_retry_state(job_root: Path, expected_identity: str) -> RetryGuardRe
         # An unproven publish: a publication marker exists but no checkpoint
         # accounts for what was generated. Terminal regardless of corruption.
         if exists[_P_NAME] or exists[_I_NAME]:
-            raise RetryIdentityConflict("final publication marker exists without valid checkpoint")
+            raise PartialPublicationConflict(
+                "final publication marker exists without valid checkpoint; operator reconciliation required")
         if exists[_G_NAME]:
             return RetryGuardResult(RetryDecision.C2_RECOVERY, None, None)
         return RetryGuardResult(RetryDecision.GENERATE, None, None)
@@ -275,6 +285,22 @@ def evaluate_retry_state(job_root: Path, expected_identity: str) -> RetryGuardRe
             "corrupt installed marker with no pinned slug to re-post safely")
 
     return RetryGuardResult(RetryDecision.PUBLISH_FROM_G, checkpoint, None)
+
+
+def result_from_episode(episode: PublishedEpisode, *, source_key: str, x_mode: bool,
+                        existing: bool = False) -> dict[str, Any]:
+    duration = episode.duration
+    seconds = sum(int(value) * factor for value, factor in
+                  zip(duration.split(":"), (3600, 60, 1))) if duration else 0
+    return {
+        "ok": True, "schemaVersion": 1, "sourceKey": source_key,
+        "title": episode.title, "slug": episode.slug,
+        "publicAudioUrl": episode.mp3_url, "scriptUrl": episode.speech_text_url,
+        "notesUrl": episode.md_url, "manifestUrl": episode.manifest_url,
+        "feedUrl": episode.feed_url, "durationSeconds": seconds,
+        "mp3Size": episode.mp3_size, "modelUsage": {}, "hangups": [],
+        "xMode": x_mode, "existingEpisode": existing,
+    }
 
 
 def result_from_checkpoint(

@@ -1,0 +1,13 @@
+[Unit]
+Description=tg-tools product health telemetry (supervisor and mech-d)
+After=network-online.target runtime-controller-api.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/.local/lib/tg-tools/current/.
+Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONPATH=%h/.local/lib/tg-tools/current/.:%h/.local/lib/tg-tools/current/shared
+EnvironmentFile=%h/tools/tools.env
+EnvironmentFile=%h/.config/tg-tools/rss-audio.env
+ExecStart=%h/.local/lib/tg-tools/runtime/bin/python -m tg_tools_cli telemetry
+TimeoutStartSec=45

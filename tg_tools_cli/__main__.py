@@ -24,6 +24,10 @@ def main(argv: list[str] | None = None) -> int:
     explain.add_argument("--json", action="store_true", required=True)
     explain.set_defaults(func=lambda args: print(json.dumps(_jsonable(asdict(_manifest(args.service))),
                                                             sort_keys=True)))
+    telemetry = commands.add_parser("telemetry")
+    telemetry.add_argument("--dry-run", action="store_true", help="Print JSON without writing telemetry")
+    from .telemetry import run
+    telemetry.set_defaults(func=run)
     args = parser.parse_args(argv)
     try:
         args.func(args)

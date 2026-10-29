@@ -14,8 +14,8 @@ def _path(raw: str) -> Path:
     return Path(os.path.expanduser(raw)).resolve()
 
 
-def _flag(name: str, default: bool) -> bool:
-    raw = (os.environ.get(name) or "").strip().lower()
+def _flag(name: str, default: bool, environ=None) -> bool:
+    raw = ((os.environ if environ is None else environ).get(name) or "").strip().lower()
     return default if not raw else raw in {"1", "true", "yes", "on"}
 
 
@@ -55,9 +55,18 @@ class Settings:
     enrichment_jobs: int = 4
 
 
-def load_settings() -> Settings:
-    env = os.environ.get
-    base_url = required_env("RSS_AUDIO_BASE_URL").rstrip("/")
+PUBLISH_LEASE_SECONDS = 7200
+TRANSCRIBE_LEASE_SECONDS = 1800
+
+
+def transcribe_worker_id(worker_id: str) -> str:
+    return f"{worker_id}-transcribe"
+
+
+def load_settings(environ=None, *, pid=None) -> Settings:
+    source = os.environ if environ is None else environ
+    env = source.get
+    base_url = required_env("RSS_AUDIO_BASE_URL", source).rstrip("/")
     public_audio_base_url = env("RSS_AUDIO_PUBLIC_AUDIO_BASE_URL", f"{base_url}/audio/episodes").rstrip("/")
     return Settings(
         bot_token=env("RSS_AUDIO_BOT_TOKEN", ""),
@@ -72,7 +81,7 @@ def load_settings() -> Settings:
         mullvad_proxy=env("RSS_AUDIO_MULLVAD_PROXY", ""),
         yt_dlp_remote_components=env("RSS_AUDIO_YTDLP_REMOTE_COMPONENTS", ""),
         b2_remote=env("RSS_AUDIO_B2_REMOTE", "ak_b2"),
-        b2_bucket=required_env("RSS_AUDIO_B2_BUCKET"),
+        b2_bucket=required_env("RSS_AUDIO_B2_BUCKET", source),
         api_base_url=env("RSS_AUDIO_API_BASE_URL", base_url).rstrip("/"),
         api_token=env("RSS_AUDIO_API_TOKEN", ""),
         public_audio_base_url=public_audio_base_url,
@@ -81,13 +90,13 @@ def load_settings() -> Settings:
         feed_url=env("RSS_AUDIO_FEED_URL", f"{base_url}/audio/podcast.xml"),
         runtime_controller_url=env("RUNTIME_CONTROLLER_API_URL", "http://127.0.0.1:8787").rstrip("/"),
         runtime_controller_bearer_token=env("RUNTIME_CONTROLLER_BEARER_TOKEN", ""),
-        runtime_worker_id=env("RSS_AUDIO_RUNTIME_WORKER_ID", f"rss-audio-{os.getpid()}"),
+        runtime_worker_id=env("RSS_AUDIO_RUNTIME_WORKER_ID", f"rss-audio-{os.getpid() if pid is None else pid}"),
         work_dir=_path(env("RSS_AUDIO_WORK_DIR", "~/.local/share/tg-tools/rss-audio/work")),
         scribe_db_path=_path(env("RSS_AUDIO_SCRIBE_DB_PATH", "~/.local/share/tg-tools/rss-audio/scribe.sqlite3")),
         mullvad_control_url=env("RSS_AUDIO_MULLVAD_CONTROL_URL", "http://127.0.0.1:8000"),
         mullvad_control_token=env("RSS_AUDIO_MULLVAD_CONTROL_TOKEN", ""),
-        enrichment_enabled=_flag("RSS_AUDIO_ENRICHMENT_ENABLED", True),
-        enrichment_required=_flag("RSS_AUDIO_ENRICHMENT_REQUIRED", False),
+        enrichment_enabled=_flag("RSS_AUDIO_ENRICHMENT_ENABLED", True, source),
+        enrichment_required=_flag("RSS_AUDIO_ENRICHMENT_REQUIRED", False, source),
         enrichment_stt_model=env("RSS_AUDIO_ENRICHMENT_STT_MODEL", "mini"),
         enrichment_jobs=max(1, int(env("RSS_AUDIO_ENRICHMENT_JOBS", "4"))),
     )

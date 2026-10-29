@@ -14,7 +14,7 @@ from typing import Any
 
 from telegram import Bot
 
-from config import Settings, load_settings, validate_settings
+from config import Settings, load_settings, validate_settings, TRANSCRIBE_LEASE_SECONDS, transcribe_worker_id
 from download_names import _safe_download_name
 from mtproto_dl import download_file as mtproto_download
 from mtproto_dl import ensure_mtproto_ready, needs_mtproto
@@ -473,7 +473,7 @@ async def worker_loop(settings: Settings) -> None:
         with contextlib.suppress(NotImplementedError):
             loop.add_signal_handler(sig, stop.set)
 
-    worker_id = f"{settings.runtime_worker_id}-transcribe"
+    worker_id = transcribe_worker_id(settings.runtime_worker_id)
     registered = False
     while not stop.is_set():
         try:
@@ -495,7 +495,7 @@ async def worker_loop(settings: Settings) -> None:
             claim = await asyncio.to_thread(
                 client.claim_job,
                 worker_id=worker_id,
-                lease_duration_sec=1800,
+                lease_duration_sec=TRANSCRIBE_LEASE_SECONDS,
                 workload_types=("transcribe_audio",),
             )
             if claim:

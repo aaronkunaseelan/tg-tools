@@ -50,8 +50,8 @@ class Settings:
     runtime_result_poll_interval_sec: int
 
 
-def load_settings() -> Settings:
-    env = os.environ.get
+def load_settings(environ=None, *, pid=None) -> Settings:
+    env = (os.environ if environ is None else environ).get
     state_dir = _path(env("MEETING_SUMMARY_STATE_DIR", "~/.local/share/meeting-summary"))
     return Settings(
         pi_auth_path=_path(env("MEETING_SUMMARY_PI_AUTH_PATH", "~/.pi/agent/auth.json")),
@@ -69,7 +69,7 @@ def load_settings() -> Settings:
         ffprobe_bin=env("MEETING_SUMMARY_FFPROBE_BIN", "ffprobe"),
         runtime_controller_url=env("RUNTIME_CONTROLLER_API_URL", "http://127.0.0.1:8787").rstrip("/"),
         runtime_controller_bearer_token=env("RUNTIME_CONTROLLER_BEARER_TOKEN") or None,
-        runtime_worker_id=env("MEETING_SUMMARY_RUNTIME_WORKER_ID", f"meeting-summary-worker-{os.getpid()}"),
+        runtime_worker_id=env("MEETING_SUMMARY_RUNTIME_WORKER_ID", f"meeting-summary-worker-{os.getpid() if pid is None else pid}"),
         runtime_worker_venue=(env("MEETING_SUMMARY_RUNTIME_WORKER_VENUE") or "generic").strip().lower(),
         runtime_worker_capacity=max(1, int(env("MEETING_SUMMARY_RUNTIME_WORKER_CAPACITY", "1"))),
         runtime_supported_execution_profiles=_csv(env("MEETING_SUMMARY_RUNTIME_SUPPORTED_PROFILES", "cpu_media")),

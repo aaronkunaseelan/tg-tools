@@ -63,6 +63,16 @@ def test_publish_once_and_retry_returns_installed(tmp_path, edge):
     assert publish(tmp_path, edge) == episode and len(posts(edge)) == 1
 
 
+def test_same_identity_new_run_reuses_existing_bytes(tmp_path, edge):
+    first = publish(tmp_path, edge)
+    bucket = tmp_path / "bucket"
+    before = {str(p.relative_to(bucket)): p.read_bytes() for p in bucket.rglob("*") if p.is_file()}
+    (tmp_path / "state2").mkdir()
+    second = publish(tmp_path, edge, state="state2", title="Changed run title", converted=b"-new-run")
+    assert second == first and len(posts(edge)) == 1
+    assert before == {str(p.relative_to(bucket)): p.read_bytes() for p in bucket.rglob("*") if p.is_file()}
+
+
 def rss_edge_insert(edge, *, first_reply):
     """rss-edge createEpisode: plain INSERT (duplicate slug -> 400 UNIQUE), pub_date stored at ms precision."""
     def insert(req):
@@ -78,24 +88,22 @@ def rss_edge_insert(edge, *, first_reply):
 
 def test_lost_ack_converges_on_stored_row(tmp_path, edge):
     rss_edge_insert(edge, first_reply=(502, {"error": "bad gateway"}))
-    with pytest.raises(PublishError) as lost:
-        publish(tmp_path, edge)
-    assert lost.value.error_class == "publish_transient"
+    # Even the first call succeeds: 502 is reconciled against the committed row.
     episode = publish(tmp_path, edge)
+    assert publish(tmp_path, edge) == episode
     assert len(edge.episodes["tts"]) == 1 and episode.slug == edge.episodes["tts"][0]["slug"]
 
 
-def test_slug_taken_by_other_payload_is_conflict(tmp_path, edge):
-    rss_edge_insert(edge, first_reply=(502, {"error": "bad gateway"}))
-    with pytest.raises(PublishError):
-        publish(tmp_path, edge)
-    edge.episodes["tts"][0]["title"] = "Someone else"
+def test_identity_taken_by_other_route_is_conflict(tmp_path, edge):
+    publish(tmp_path, edge)
+    edge.episodes["tts"][0]["route"] = "other-route"
+    (tmp_path / "state2").mkdir()
     with pytest.raises(PublishError) as conflict:
-        publish(tmp_path, edge)
+        publish(tmp_path, edge, state="state2")
     assert conflict.value.error_class == "publish_identity_conflict"
 
 
-@pytest.mark.parametrize("existing, error", [(b"other bytes", "publish_failed"), (b"data-source_original", None)])
+@pytest.mark.parametrize("existing, error", [(b"other bytes", "publish_partial_identity_conflict"), (b"data-source_original", None)])
 def test_existing_key_is_never_rewritten(tmp_path, edge, existing, error):
     target = tmp_path / "bucket" / "tts" / "source" / ("a" * 64) / "source-original.pdf"
     target.parent.mkdir(parents=True)

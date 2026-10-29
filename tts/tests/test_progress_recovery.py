@@ -19,6 +19,8 @@ def setup_execution(tmp_path, monkeypatch, decision):
             "sourceOriginal", "sourceMarkdown", "sourceMeta", "artifactMarkdown",
             "speechText", "audioMp3", "manifestJson")},
     )
+    monkeypatch.setattr(worker, "find_published_episode", lambda **kw: None)
+    monkeypatch.setattr(worker, "require_empty_identity", lambda *args: None)
     monkeypatch.setattr(worker, "acquire_source", lambda *a, **kw: acquired)
     monkeypatch.setattr(worker, "execution_fingerprint", lambda **kw: "identity")
     monkeypatch.setattr(worker, "decide_retry", lambda *a: SimpleNamespace(

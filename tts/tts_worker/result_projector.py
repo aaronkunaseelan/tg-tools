@@ -34,7 +34,8 @@ def render_notification(result_kind: str, result_json: dict[str, Any]) -> str:
     if result_kind == "cancelled":
         return "Request cancelled."
     if result_kind == "succeeded" and result_json.get("ok"):
-        text = (f"Posted to {feed_title()}:\n{result_json.get('title', '')}\n"
+        label = "Existing episode in" if result_json.get("existingEpisode") else "Posted to"
+        text = (f"{label} {feed_title()}:\n{result_json.get('title', '')}\n"
                 f"{result_json.get('publicAudioUrl', '')}\n"
                 f"Script: {result_json.get('scriptUrl', '')}\n"
                 f"Notes: {result_json.get('notesUrl', '')}\n"

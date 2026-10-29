@@ -1,0 +1,10 @@
+[Unit]
+Description=Publish tg-tools telemetry every five minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+Unit=tg-tools-telemetry.service
+
+[Install]
+WantedBy=timers.target

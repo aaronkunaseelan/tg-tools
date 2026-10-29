@@ -2,7 +2,8 @@
 import { readFile } from "node:fs/promises";
 import { loadServerConfigFromEnv } from "./config/env.js";
 import { createPool, localPeerDatabaseConfig } from "./db/client.js";
-import { applyMigrations } from "./db/migrate.js";
+import { applyMigrations, defaultMigrationsDir } from "./db/migrate.js";
+import { resolve } from "node:path";
 import { claimRuntimeJob } from "./runtime/claim.js";
 import { finalizeAttempt } from "./runtime/finalize.js";
 import { heartbeatAttempt, markAttemptRunning } from "./runtime/heartbeat.js";
@@ -43,6 +44,12 @@ async function main(): Promise<void> {
   const [command] = process.argv.slice(2).filter((arg) => !arg.startsWith("--") && !arg.endsWith(".yaml") && !arg.endsWith(".yml"));
   if (!command) {
     throw new Error("command is required");
+  }
+
+  if (command === "contract") {
+    if (process.argv[3] !== "runtime.health-summary/1") throw new Error("unknown contract");
+    console.log(await readFile(resolve(defaultMigrationsDir(), "../../contracts/runtime.health-summary-1.json"), "utf8"));
+    return;
   }
 
   const databaseUrl = getArgValue("--database-url") ?? process.env.DATABASE_URL ?? null;

@@ -124,7 +124,9 @@ systemctl --user list-units 'tg-gateway-*' 'rss-audio-*' 'meeting-summary-*' 'tt
 journalctl --user -u tg-gateway-rss -n 100 --no-pager
 ```
 
-There is no single end-to-end health command. A running unit is not acceptance:
+`python3 -m tg_tools_cli telemetry --dry-run` reports data-free product health
+for the supervisor and mech-d (see the operations guide); it is not an end-to-end
+provider canary. A running unit is not acceptance:
 verify the intended immutable release, then send a canary through each enabled
 product. Correlate source receipt, job/attempt/result, artifact URI/hash, outbox
 entry and Telegram receipt; check the actual reply, feed, HEAD and ranged media

@@ -4,6 +4,7 @@ import { createPool } from "../db/client.js";
 import { loadServerConfigFromEnv } from "../config/env.js";
 import { badRequest } from "../errors/controller-error.js";
 import { getRuntimeHealth } from "../runtime/health.js";
+import { getHealthSummary, summaryNames, summaryWindow } from "../runtime/health-summary.js";
 import { claimRuntimeJob } from "../runtime/claim.js";
 import { abandonAttempt } from "../runtime/abandon.js";
 import { finalizeAttempt } from "../runtime/finalize.js";
@@ -136,6 +137,19 @@ async function main(): Promise<void> {
 
       if (!isAuthorized(req, config.bearerToken)) {
         writeJson(res, 401, { error: "unauthorized", code: "unauthorized" });
+        return;
+      }
+
+      if (url.pathname === "/v1/health-summary" && method === "GET") {
+        let workloads: string[], owners: string[], windowSec: number;
+        try {
+          workloads = summaryNames(url.searchParams.get("workloadTypes"));
+          owners = summaryNames(url.searchParams.get("resultOwners"));
+          windowSec = summaryWindow(url.searchParams.get("windowSec"));
+        } catch {
+          throw badRequest("invalid_health_summary_query", "Invalid health-summary query");
+        }
+        writeJson(res, 200, await getHealthSummary(pool, workloads, owners, windowSec));
         return;
       }
 

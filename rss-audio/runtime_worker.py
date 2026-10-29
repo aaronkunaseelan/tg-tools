@@ -21,7 +21,7 @@ from telegram import Bot
 from tg_tools_common.lease import AttemptLease, LeaseLost
 from tg_tools_common.progress import ProgressReporter, NullProgress, current_progress, use_progress
 
-from config import Settings, load_settings, validate_settings
+from config import Settings, load_settings, validate_settings, PUBLISH_LEASE_SECONDS
 from download_names import _safe_download_name
 from exit_rotation import ExitRotator
 from mtproto_dl import download_file as mtproto_download
@@ -654,7 +654,7 @@ async def worker_loop(settings: Settings) -> None:
                     )
                     registered = True
                 await asyncio.to_thread(client.heartbeat_worker, worker_id=worker_id, metadata_json={"phase": "idle"})
-                claim = await asyncio.to_thread(client.claim_job, worker_id=worker_id, lease_duration_sec=7200)
+                claim = await asyncio.to_thread(client.claim_job, worker_id=worker_id, lease_duration_sec=PUBLISH_LEASE_SECONDS)
                 consecutive_failures = 0
                 if claim:
                     await process_claim(client=client, settings=settings, bot=bot, claim=claim)

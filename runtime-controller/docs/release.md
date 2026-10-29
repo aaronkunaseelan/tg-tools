@@ -23,7 +23,7 @@ Only proceed after every gate exits zero. Do not overlap a worker's running job 
 base="$HOME/.local/lib/runtime-controller"
 release="$base/releases/$sha"
 mkdir "$release"                        # must not already exist
-cp -a dist package.json package-lock.json sql config deploy systemd python "$release/"
+cp -a dist package.json package-lock.json sql config contracts deploy systemd python "$release/"
 (cd "$release" && python3 deploy/no-secret-env.py -- npm ci --omit=dev --ignore-scripts)
 # Load the protected deployment environment without displaying its values.
 set -a; . "$HOME/.config/agent-secrets/runtime-controller.env"; set +a

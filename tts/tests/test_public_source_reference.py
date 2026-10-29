@@ -65,6 +65,7 @@ def test_fetch_credential_is_absent_from_episode_install_payload(tmp_path):
         source_meta=source, artifact_md=source, speech_txt=source,
         audio_mp3=source, manifest_json=source, duration_seconds=1,
         settings=settings, fingerprint='b' * 64, runner=lambda argv: None,
+        http_get=lambda feed, slug: [],
         http_post=lambda payload: posted.append(payload) or {'ok': True})
     assert len(posted) == 1
     assert MARKER not in json.dumps(posted), 'episode install POST publishes fetch credential'

@@ -36,10 +36,10 @@ def pythonpath(d: dict[str, list[str]]) -> str:
     return next(value.split("=", 1)[1] for value in d["Environment"] if value.startswith("PYTHONPATH="))
 
 
-def test_eight_units_shipped():
+def test_units_shipped():
     assert [unit.stem for unit in UNITS] == [
         "meeting-summary-result-consumer", "meeting-summary-runtime-worker", "rss-audio-runtime-worker",
-        "rss-audio-transcribe-runtime-worker", "tg-gateway-ms", "tg-gateway-rss", "tts-result-projector",
+        "rss-audio-transcribe-runtime-worker", "tg-gateway-ms", "tg-gateway-rss", "tg-tools-telemetry", "tts-result-projector",
         "tts-worker"]
 
 

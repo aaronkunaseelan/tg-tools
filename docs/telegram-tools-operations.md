@@ -10,6 +10,7 @@ when something goes wrong.
 | rss-audio | publish topic, scribe (transcribe) topic | `tg-gateway-rss`, `rss-audio-runtime-worker`, `rss-audio-transcribe-runtime-worker` | runtime jobs/results/outbox, scribe SQLite, B2 episodes |
 | tts / x-tts | TTS topic, X-TTS topic | `tg-gateway-rss`, `tts-worker`, `tts-result-projector` | runtime jobs/results/outbox, `TTS_WORK_DIR`, B2 episodes |
 | meeting-summary | meeting topic, review replies and Accept button | `tg-gateway-ms`, `meeting-summary-runtime-worker`, `meeting-summary-result-consumer` | runtime jobs/results/outbox, `tg_meeting_summary.*` |
+| health (all products) | supervisor watch and mech-d | `tg-tools-telemetry.service`, `tg-tools-telemetry.timer` (5 min) | `~/.local/state/telemetry/tg-tools.json` (`telemetry/1`) |
 
 One gateway process serves one bot identity and owns all of its Telegram
 ingress and delivery. `tg-gateway-rss` (bot identity `rss-audio`) serves the
@@ -87,7 +88,58 @@ systemctl --user list-units 'tg-gateway-*' 'rss-audio-*' 'meeting-summary-*' 'tt
 journalctl --user -u tg-gateway-rss -n 100 --no-pager
 systemctl --user show -p EnvironmentFiles tts-worker
 python3 -m tg_tools_cli routes explain --service tts --json      # from the checkout
+# Installed path; dry run prints only data-free telemetry, never writes the file:
+cd ~/.local/lib/tg-tools/current
+PYTHONPATH=shared ~/.local/lib/tg-tools/runtime/bin/python -m tg_tools_cli telemetry --dry-run
+systemctl --user status tg-tools-telemetry.timer tg-tools-telemetry.service
+journalctl --user -u tg-tools-telemetry.service -n 30 --no-pager
 ```
+
+### Product health telemetry
+
+A oneshot plus timer keeps monitoring independent of gateway/worker failures;
+no product loop reliably runs while all products are unhealthy. Install both new
+unit files from the promoted release (including `.timer`), then enable/start
+`tg-tools-telemetry.timer`. The service loads `tools.env` and `rss-audio.env` like
+the RSS workers. Product-specific worker IDs and thresholds come from each
+running unit's effective `/proc/<MainPID>/environ` and **the product's own config
+loader**, including PID-dependent defaults and the transcribe suffix. Nothing
+opens a Telegram session, invokes a provider, or logs configuration. A stopped
+unit or unreadable configuration is unknown, not a guessed identity.
+
+Prerequisites: promote runtime-controller's authenticated
+`GET /v1/health-summary` (`runtime.health-summary/1`) and apply its additive
+`012_health_summary.sql` indexes first; apply gateway migration
+`008_health_handoffs.sql` for newest/pending handoff indexes. The endpoint's
+contract is vendored in `tg_tools_cli/contracts/` and validated at read time.
+An old controller (404), missing schema/fields, stale response, failed SQL or
+unreadable config produces red `unknown:` checks, never empty healthy readings.
+
+Checks:
+- `controller`: existing runtime client can read `/healthz` and its `ok` is true.
+- `workers`: all four configured worker identities occur with
+  `heartbeatFresh: true`; freshness TTL belongs to the controller (normally 120s).
+- `stuck_jobs`: no current leased/running attempt has expired its lease or job
+  deadline, or exceeded its processing-age alarm. The named bound is **configured
+  lease duration** for TTS (default 7200s), existing **publish lease** (7200s) and
+  **transcribe lease** (1800s) for RSS, and **max audio duration + summary timeout**
+  for meetings (defaults 7200+180=7380s). Age is current attempt start, not a
+  renewable lease timestamp or original job submission. These are alarm bounds,
+  not new processing timeouts. Missing workload bounds are unknown.
+- `recent_failures`: no job terminal result or delivery dead transition in 6h;
+  reasons name workload/error class only (standalone deliveries name their owner).
+- `handoffs`: no gateway-owned source handoff pending/staged over 900s, checked
+  with read-only, statement-timeout connections to both gateways' configured DBs.
+
+Metrics: newest handoff age, newest job age per workload, and job counts by
+status. Silence is normal: no age check, and an empty history omits age metrics.
+The controller bounds each indexed history read to 10,001 rows; a cap hit is
+explicitly incomplete, never an exact count or healthy absence. Telemetry omits
+capped counts and reports unknown. The existing `/healthz` is unchanged (it also
+serves worker startup probes); new history reads occur only on the dedicated
+five-minute summary endpoint. Failed summaries do not suppress independent
+handoff/heartbeat checks. Output uses a same-directory temporary file plus atomic
+rename; dry-run never writes it.
 
 ## Telegram
 
@@ -213,6 +265,16 @@ speech spend, and the user is asked to upload the file.
   `.notes.md`, `.manifest.json`), all uploaded before the episode row is
   installed. Uploads are immutable; a retry reuses the pinned slug, and a
   conflicting existing row is `publish_identity_conflict`, never an overwrite.
+  Before generation and uploads, the worker reads the episode API and matches
+  the complete fingerprint in every public artifact URL (not the short slug
+  suffix). An existing episode returns success with an “Existing episode” reply,
+  without new speech or uploads. A create timeout/5xx is read back before it is
+  reported as failure: a committed insert is success, not a blind POST retry.
+  New public source metadata omits staging paths and caller MIME hints;
+  acquisition provenance remains in the local generation checkpoint.
+  Retained objects without a registered episode or usable checkpoint fail as
+  `publish_partial_identity_conflict`: operator reconciliation is required,
+  never regeneration over an orphan prefix or guessed episode registration.
 - **Speech**: Azure, one voice per job, one chunk at a time. Keys come from
   `~/.config/agent-secrets/azure-foundry.env`; startup refuses to run without
   a key source, but only a short synthesis proves the key is current.

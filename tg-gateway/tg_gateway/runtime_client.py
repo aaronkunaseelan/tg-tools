@@ -96,6 +96,13 @@ class RuntimeClient:
         except urllib_error.URLError as exc:
             raise RuntimeClientError(f"runtime request failed: {exc.reason}") from exc
 
+    def health(self) -> dict[str, Any]:
+        return self._get("/healthz", {})
+
+    def health_summary(self, *, workloads: list[str], owners: list[str]) -> dict[str, Any]:
+        return self._get("/v1/health-summary", {
+            "workloadTypes": ",".join(workloads), "resultOwners": ",".join(owners), "windowSec": 21600})
+
     def admit_source_receipt(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._request("POST", "/v1/source-receipts/admit", payload)
 

@@ -36,6 +36,7 @@ TERMINAL_CLASSES = {
     "length_not_allowed",
     # Same identity, different payload: never overwrite.
     "publish_identity_conflict",
+    "publish_partial_identity_conflict",
 } | set(taxonomy.TERMINAL_SOURCE_CLASSES)
 
 # Operator-repairable or transient: bounded retry with class-specific backoff.

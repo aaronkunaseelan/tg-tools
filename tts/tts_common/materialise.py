@@ -121,20 +121,21 @@ def _convert(input_path: Path, markdown_path: Path, declared_mime: str) -> dict[
     return meta
 
 
-def _write_meta(out_dir: Path, conversion: dict[str, Any], *, source_ref: str,
-                source_bytes: bytes, markdown: str, declared_mime: str,
-                method: str) -> Path:
-    """Record the conversion result with TTS acquisition provenance."""
+def _write_meta(out_dir: Path, conversion: dict[str, Any], *,
+                source_bytes: bytes, markdown: str, method: str) -> Path:
+    """Record identity-stable conversion facts, not local acquisition paths.
+
+    Acquisition provenance remains in the local generation checkpoint. This
+    sidecar is public and immutable, so a staging path or caller MIME hint
+    cannot participate in its bytes.
+    """
     meta = dict(conversion)
     canonical_mime = _canonical_mime(str(meta["mime_type"]))
     meta.setdefault("backend_attempts", [])
     meta.setdefault("warnings", [])
     meta.update({
-        "source_ref": source_ref,
-        "source": source_ref,
         "mime_type": canonical_mime,
         "mime": canonical_mime,
-        "declared_mime": declared_mime,
         "title": meta.get("title", ""),
         "extraction_method": meta.get("extraction_method", method),
         "method": method,
@@ -145,7 +146,7 @@ def _write_meta(out_dir: Path, conversion: dict[str, Any], *, source_ref: str,
         "converter_version": CONVERTER_VERSION,
     })
     path = out_dir / "source.meta.json"
-    path.write_text(json.dumps(meta, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+    path.write_text(json.dumps(meta, indent=2, ensure_ascii=True, sort_keys=True) + "\n", encoding="utf-8")
     return path
 
 
@@ -165,8 +166,7 @@ def materialise(source: str | bytes | Path, out_dir: str | Path,
         conversation = json.loads(conversation_meta.read_text(encoding="utf-8"))
         side = _write_meta(
             out, {"title": conversation.get("title", ""), "mime_type": "text/html"},
-            source_ref=source_ref, source_bytes=source_bytes, markdown=markdown,
-            declared_mime="text/html", method="chatgpt-share")
+            source_bytes=source_bytes, markdown=markdown, method="chatgpt-share")
         return {"markdown_path": final, "meta_path": side}
 
     source_bytes, reference, guessed_mime = _read_source(source)
@@ -181,7 +181,7 @@ def materialise(source: str | bytes | Path, out_dir: str | Path,
     markdown_path = out / "source.md"
     conversion = _convert(input_path, markdown_path, declared_mime)
     markdown = markdown_path.read_text(encoding="utf-8")
-    side = _write_meta(out, conversion, source_ref=reference, source_bytes=source_bytes,
-                       markdown=markdown, declared_mime=declared_mime,
+    side = _write_meta(out, conversion, source_bytes=source_bytes,
+                       markdown=markdown,
                        method=conversion["extraction_method"])
     return {"markdown_path": markdown_path, "meta_path": side}

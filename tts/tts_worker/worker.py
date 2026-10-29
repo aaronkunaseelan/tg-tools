@@ -39,7 +39,8 @@ from .generation_checkpoint import (
     write_generation_checkpoint,
 )
 from .manifest import write_manifest
-from .publisher import PublishError, pinned_artifact_prefix, publish_episode
+from .publisher import (PublishError, find_published_episode, pinned_artifact_prefix,
+                        publish_episode, require_empty_identity)
 from .retry_guard import (
     CheckpointRecoveryError,
     RetryDecision,
@@ -48,6 +49,7 @@ from .retry_guard import (
     decide_retry,
     quarantine_generation_checkpoint,
     result_from_checkpoint,
+    result_from_episode,
 )
 from .runtime_client import RuntimeClient, RuntimeClientError
 from .speech_gemini import (
@@ -187,11 +189,23 @@ def _execute_job_in_root(
         except RoleMapError as exc:
             raise TTSJobError("fingerprint", "reader_role_map_failed", str(exc)) from exc
 
+        stage = "publish_lookup"
+        _cancel()
+        try:
+            existing = find_published_episode(
+                settings=settings, fingerprint=fp, route="x-tts" if x_mode else "tts",
+                episode_kind="explained_read" if x_mode else "faithful_read", http_get=episode_get)
+        except PublishError as exc:
+            raise TTSJobError(stage, exc.error_class, str(exc)) from exc
+        if existing is not None:
+            current_progress().emit("publication_checkpoint", "reused", reason="checkpoint_reused")
+            return result_from_episode(existing, source_key=source_key, x_mode=x_mode, existing=True)
+
         stage = "checkpoint"
         try:
             retry = decide_retry(work, fp)
         except RetryGuardConflict as exc:
-            raise TTSJobError("checkpoint", "publish_identity_conflict", str(exc)) from exc
+            raise TTSJobError("checkpoint", exc.error_class, str(exc)) from exc
         if retry.decision is RetryDecision.C2_RECOVERY:
             try:
                 quarantine_generation_checkpoint(work, attempt_id)
@@ -264,6 +278,13 @@ def _execute_job_in_root(
             except PublishError as exc:
                 raise TTSJobError("publish", exc.error_class, str(exc)) from exc
             return result_from_checkpoint(checkpoint, episode, source_key=source_key)
+
+        stage = "publish_lookup"
+        _cancel()
+        try:
+            require_empty_identity(settings, fp)
+        except PublishError as exc:
+            raise TTSJobError(stage, exc.error_class, str(exc)) from exc
 
         stage = "materialise"
         try:

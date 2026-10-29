@@ -1,0 +1,118 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": [
+    "schema",
+    "at",
+    "windowSec",
+    "workloads",
+    "failuresComplete",
+    "failures"
+  ],
+  "properties": {
+    "schema": {
+      "const": "runtime.health-summary/1",
+      "type": "string"
+    },
+    "at": {
+      "type": "number",
+      "minimum": 0
+    },
+    "windowSec": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 604800
+    },
+    "workloads": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "workloadType",
+          "newestJobAt",
+          "jobsByStatus",
+          "countsComplete",
+          "activeComplete",
+          "oldestActiveAgeSec",
+          "pastDeadline",
+          "expiredLease"
+        ],
+        "properties": {
+          "workloadType": {
+            "type": "string"
+          },
+          "newestJobAt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "jobsByStatus": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "countsComplete": {
+            "type": "boolean"
+          },
+          "activeComplete": {
+            "type": "boolean"
+          },
+          "oldestActiveAgeSec": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "pastDeadline": {
+            "type": "boolean"
+          },
+          "expiredLease": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "failuresComplete": {
+      "type": "boolean"
+    },
+    "failures": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "kind",
+          "workloadType",
+          "errorClass",
+          "count"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "job",
+              "delivery"
+            ]
+          },
+          "workloadType": {
+            "type": "string"
+          },
+          "errorClass": {
+            "type": "string"
+          },
+          "count": {
+            "type": "integer",
+            "minimum": 1
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false,
+  "description": "Data-free producer view read by tg-tools telemetry. Counts and absence are authoritative only when the corresponding Complete flag is true; indexed row reads cap at 10001. Dead job time is terminal result creation; dead delivery time is dead_at. Active age is current attempt started_at. See docs/health-summary.md."
+}
