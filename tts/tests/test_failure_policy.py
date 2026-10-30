@@ -6,13 +6,14 @@ classify_outcome(error_class)            -> (outcome, backoff s)
 | extract_deferred (ocr_pending, recovery available)                                  | retry 120 |
 | extract_deferred (any other reason, or no recovery)                                 | terminal (service_configuration_failure) |
 publisher._classify_http: 403 1010 blocked, 400 UNIQUE duplicate, 409 conflict(terminal), 401 auth, 429/503 transient
-validate_voice: provider-native voices only (Azure "nova", Gemini "kore"); "en-US-JennyNeural" on Gemini fails
+validate_voice: provider-native voices only (Azure "nova", Gemini "kore", self-hosted Kokoro "af_heart"); "en-US-JennyNeural" on Gemini fails
+speech_engine: under self-hosted an Azure voice name ("Nova") goes to Azure, a Kokoro voice stays; other providers unchanged
 execution_fingerprint: deterministic, voice case-insensitive, length-insensitive; mode/voice/model/roles/source change it
 """
 import pytest
 
 from tts_common import taxonomy
-from tts_worker.failure_policy import classify_outcome, effective_error_class, validate_voice
+from tts_worker.failure_policy import classify_outcome, effective_error_class, speech_engine, validate_voice
 from tts_worker.fingerprint import execution_fingerprint
 from tts_worker.publisher import _classify_http
 
@@ -51,7 +52,9 @@ def test_classify_publish_http(code, detail, error_class):
 
 @pytest.mark.parametrize("provider, voice, ok", [("azure", "nova", True), ("gemini", "kore", True),
                                                  ("unknown-provider", "whatever", True),
-                                                 ("gemini", "en-US-JennyNeural", False), ("azure", "kore-nope", False)])
+                                                 ("gemini", "en-US-JennyNeural", False), ("azure", "kore-nope", False),
+                                                 ("self-hosted", "af_heart", True), ("self-hosted", "bm_george", True),
+                                                 ("self-hosted", "nova", False), ("azure", "af_heart", False)])
 def test_validate_voice(provider, voice, ok):
     if ok:
         validate_voice(provider, voice)
@@ -71,3 +74,10 @@ def test_fingerprint():
     changes = [dict(voice="ash"), dict(mode="read"), dict(speech_model="other"), dict(reader_roles={}),
                dict(source_hash="b" * 64)]
     assert len({fp(), *(fp(**c) for c in changes)}) == len(changes) + 1
+
+
+@pytest.mark.parametrize("provider, voice, engine", [("self-hosted", "af_heart", "self-hosted"), ("self-hosted", "Nova", "azure"),
+                                                     ("self-hosted", "af_nova", "self-hosted"), ("azure", "nova", "azure"),
+                                                     ("gemini", "kore", "gemini")])
+def test_speech_engine(provider, voice, engine):
+    assert speech_engine(provider, voice) == engine

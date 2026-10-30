@@ -4,7 +4,11 @@
 call ``sys.exit`` on failure, so this module imports it and converts
 ``SystemExit`` into a typed error the pipeline can classify.
 
-Default deployment is **mini**. A live comparison across nine
+When transcribe.py has a self-hosted endpoint configured (m3-asr, Parakeet
+Ultra), the whole file goes there first and Azure is the fallback; the returned
+``Transcript`` says which engine ran, so manifests record it.
+
+Default Azure deployment is **mini**. A live comparison across nine
 proper nouns (Amadei, Jefferson, Cicero, Cheyenne, Victor Miller, Bernie,
 Loving Grace, Anthropic) found mini and full byte-identical on every name; the
 only differences were punctuation, capitalization, and filler removal. Full
@@ -70,42 +74,74 @@ def load_transcribe_module():
     return module
 
 
+class Transcript(str):
+    """Formatted transcript text that also names the engine that produced it.
+
+    ``stt_engine`` is the self-hosted model label (for example
+    ``parakeet-ultra@fluidaudio-0.18.0``), or None when Azure produced it with
+    the requested model.
+    """
+    stt_engine: str | None = None
+
+
+def _transcribe_self_hosted(tool, audio_path: str) -> tuple[str, str] | None:
+    """The self-hosted endpoint's (raw text, model label), or None to use Azure."""
+    config = tool.load_self_hosted_config() if hasattr(tool, "load_self_hosted_config") else None
+    if config is None:
+        return None
+    sink = current_progress()
+    occurrence = sink.emit("transcribe_chunks", "started", completed=0, total=1, units="chunks")
+    result = tool.transcribe_self_hosted(config, audio_path)
+    if result:
+        sink.emit("transcribe_chunks", "completed", occurrence=occurrence, completed=1, total=1, units="chunks")
+    else:
+        sink.emit("transcribe_chunks", "interrupted", occurrence=occurrence)
+        logger.warning("self-hosted transcription failed for %s; falling back to Azure", audio_path)
+    return result
+
+
 def transcribe_audio(
     audio_path: str | Path,
     *,
     model: str = DEFAULT_STT_MODEL,
     jobs: int = 4,
     module=None,
-) -> str:
+) -> Transcript:
     """Transcribe a local audio file to formatted transcript text.
 
     Returns paragraph-formatted text (blank-line separated), which is exactly
-    what ``paragraphs.build_stream`` expects.
+    what ``paragraphs.build_stream`` expects. A configured self-hosted endpoint
+    is tried first with the whole file; ``model`` picks the Azure fallback.
     """
     tool = module or load_transcribe_module()
     audio_path = str(audio_path)
+    engine = None
 
     try:
         tool._load_local_env()
         tool.ensure_dependencies()
-        config = tool.load_azure_openai_config()
-        access_token = tool.fetch_azure_access_token(config)
-        resolved = tool.resolve_transcribe_model(model, config)
-        logger.info("transcribing %s with Azure deployment %s", audio_path, resolved)
+        result = _transcribe_self_hosted(tool, audio_path)
+        if result:
+            raw, engine = result
+        else:
+            config = tool.load_azure_openai_config()
+            access_token = tool.fetch_azure_access_token(config)
+            resolved = tool.resolve_transcribe_model(model, config)
+            logger.info("transcribing %s with Azure deployment %s", audio_path, resolved)
 
-        with tempfile.TemporaryDirectory(prefix="enrich-stt-") as tmpdir:
-            sink = current_progress()
-            with sink.stage("split_audio"):
-                chunks = tool.prepare_chunks(audio_path, tmpdir)
-            occurrence = sink.emit("transcribe_chunks", "started", completed=0, total=len(chunks), units="chunks")
-            def on_chunk(completed, total):
-                sink.check()
-                sink.emit("transcribe_chunks", "advanced", occurrence=occurrence, completed=completed, total=total, units="chunks")
-            import inspect
-            extra = {"on_progress": on_chunk} if "on_progress" in inspect.signature(tool.transcribe_all).parameters else {}
-            raw = tool.transcribe_all(config, access_token, chunks, resolved, jobs=jobs, **extra)
-            if raw and raw.strip():
-                sink.emit("transcribe_chunks", "completed", occurrence=occurrence, completed=len(chunks), total=len(chunks), units="chunks")
+            with tempfile.TemporaryDirectory(prefix="enrich-stt-") as tmpdir:
+                sink = current_progress()
+                with sink.stage("split_audio"):
+                    chunks = tool.prepare_chunks(audio_path, tmpdir)
+                occurrence = sink.emit("transcribe_chunks", "started", completed=0, total=len(chunks), units="chunks")
+                def on_chunk(completed, total):
+                    sink.check()
+                    sink.emit("transcribe_chunks", "advanced", occurrence=occurrence, completed=completed, total=total, units="chunks")
+                import inspect
+                extra = {"on_progress": on_chunk} if "on_progress" in inspect.signature(tool.transcribe_all).parameters else {}
+                raw = tool.transcribe_all(config, access_token, chunks, resolved, jobs=jobs, **extra)
+                if raw and raw.strip():
+                    sink.emit("transcribe_chunks", "completed", occurrence=occurrence, completed=len(chunks), total=len(chunks), units="chunks")
     except SystemExit as exc:
         # transcribe.py logs the real reason to stderr before exiting.
         raise TranscriptionError(
@@ -117,4 +153,6 @@ def transcribe_audio(
     formatted = tool.format_transcript(raw)
     if not formatted.strip():
         raise TranscriptionError("transcript formatting produced no paragraphs")
-    return formatted
+    transcript = Transcript(formatted)
+    transcript.stt_engine = engine
+    return transcript

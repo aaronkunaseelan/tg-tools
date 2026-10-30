@@ -823,6 +823,7 @@ def _source_tool_settings(settings: Settings) -> SourceToolSettings:
     return SourceToolSettings(
         mac_ssh_target=settings.mac_ssh_target,
         mac_ytdlp_path=settings.mac_ytdlp_path,
+        mac_cookies_from_browser=settings.mac_cookies_from_browser,
         yt_dlp_bin=settings.yt_dlp_bin,
         yt_dlp_format=settings.yt_dlp_format,
         ffmpeg_bin=settings.ffmpeg_bin,

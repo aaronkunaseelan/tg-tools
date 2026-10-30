@@ -143,6 +143,8 @@ class SourceToolSettings:
     mullvad_control_token: str = ""
     yt_dlp_remote_components: str = ""
     yt_dlp_format: str = "ba"
+    # Browser whose cookies yt-dlp reads on the Mac route; empty sends none.
+    mac_cookies_from_browser: str = "safari"
 
 
 @dataclass(frozen=True)
@@ -553,13 +555,18 @@ def _default_metadata_timeout(route: SourceRoute) -> int:
     return 90 if route == SourceRoute.MAC_SSH else 30
 
 
+def _mac_cookie_args(settings: SourceToolSettings) -> str:
+    browser = settings.mac_cookies_from_browser.strip()
+    return f"--cookies-from-browser {shlex.quote(browser)} " if browser else ""
+
+
 def _mac_metadata_command(settings: SourceToolSettings, url: str) -> list[str]:
     remote_component_args = _remote_component_shell_args(settings)
     remote = (
         "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; "
         f"{shlex.quote(settings.mac_ytdlp_path)} "
         "--dump-json --no-playlist "
-        "--cookies-from-browser safari "
+        f"{_mac_cookie_args(settings)}"
         f"{remote_component_args} "
         f"{shlex.quote(url)}"
     )
@@ -590,7 +597,7 @@ def _mac_stage_download_command(settings: SourceToolSettings, url: str, remote_o
     remote = (
         "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; "
         f"{shlex.quote(settings.mac_ytdlp_path)} "
-        "--cookies-from-browser safari "
+        f"{_mac_cookie_args(settings)}"
         f"{remote_component_args} "
         f"-f {shlex.quote(settings.yt_dlp_format)} "
         f"-o {shlex.quote(remote_output_template)} --no-playlist "

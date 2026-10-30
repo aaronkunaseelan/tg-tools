@@ -433,7 +433,9 @@ def azure_stt(stack: Stack, transcript: str) -> dict[str, str]:
             "AZURE_OPENAI_TRANSCRIPTION_FULL_DEPLOYMENT": "chain-full",
             "AZURE_OPENAI_TRANSCRIPTION_TENANT_ID": "chain-tenant",
             "AZURE_OPENAI_TRANSCRIPTION_CLIENT_ID": "chain-client",
-            "AZURE_OPENAI_TRANSCRIPTION_CLIENT_SECRET": "chain-secret"}
+            "AZURE_OPENAI_TRANSCRIPTION_CLIENT_SECRET": "chain-secret",
+            # Set empty so the host's self-hosted endpoint never answers a chain.
+            "TRANSCRIBE_AUDIO_SELF_HOSTED_URL": ""}
 
 
 def build_gateway(monkeypatch: Any, env: dict[str, str], files: dict[str, bytes] | None = None) -> Any:

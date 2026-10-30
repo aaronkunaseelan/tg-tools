@@ -13,6 +13,8 @@ Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 Environment=PYTHONPATH=%h/.local/lib/tg-tools/current/tts:%h/.local/lib/tg-tools/current/shared
 EnvironmentFile=%h/tools/tools.env
 EnvironmentFile=%h/.config/agent-secrets/azure-foundry.env
+# Self-hosted speech URL and token (m3-tts); optional: absent means Azure or Gemini only.
+EnvironmentFile=-%h/.config/agent-secrets/self-hosted-speech.env
 EnvironmentFile=%h/.config/tg-tools/tts.env
 ExecStart=%h/.local/lib/tg-tools/runtime/bin/python -m tts_worker
 Restart=on-failure

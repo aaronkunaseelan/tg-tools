@@ -294,10 +294,9 @@ def _build_tts_like(shape: telegram_routes.TelegramUpdateShape, route: telegram_
         raise ValueError("x-tts explain does not accept selectors: " +
                          ", ".join(sorted(forbidden)))
     if explain:
-        input_json.update({"mode": "explain", "voice": "nova",
-                           "promptVersion": "reader-v4"})
+        input_json.update({"mode": "explain", "promptVersion": "reader-v4"})
     else:
-        input_json.update({"voice": "nova", "speakingRate": "normal"})
+        input_json.update({"speakingRate": "normal"})
     input_json.update(options)
     input_json = {k: v for k, v in input_json.items() if v is not None}
     required = [

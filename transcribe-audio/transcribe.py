@@ -4,8 +4,11 @@ transcribe-audio: Transcribe a local audio file or supported URL to formatted te
 
 Pipeline:
   1. URL helper   → optional fetch/download to MP3 via rss-audio helper logic
-  2. ffprobe      → detect duration, codec, bitrate
-  3. ffmpeg       → convert to compact Azure-friendly audio
+  2. Self-hosted  → when configured, the whole file to an OpenAI-compatible
+                    transcription endpoint (m3-asr: Parakeet on the owner's Mac);
+                    any failure falls back to Azure (steps 3-4)
+  3. ffprobe      → detect duration, codec, bitrate
+     ffmpeg       → convert to compact Azure-friendly audio
                   → ogg/opus 32k mono 16kHz
                   → split into compact chunks when needed
   4. Azure OpenAI → deployment-specific audio transcriptions endpoint
@@ -21,6 +24,10 @@ Auth:
     $AZURE_OPENAI_TRANSCRIPTION_TENANT_ID
     $AZURE_OPENAI_TRANSCRIPTION_CLIENT_ID
     $AZURE_OPENAI_TRANSCRIPTION_CLIENT_SECRET
+  Optional self-hosted endpoint (unset URL: Azure only):
+    $TRANSCRIBE_AUDIO_SELF_HOSTED_URL     e.g. http://host:8178/v1
+    $TRANSCRIBE_AUDIO_SELF_HOSTED_TOKEN   bearer token
+    $TRANSCRIBE_AUDIO_SELF_HOSTED_MODEL   default parakeet-ultra
 
 Usage:
     transcribe-audio <audio-file-or-url>              # formatted to stdout
@@ -28,9 +35,11 @@ Usage:
     transcribe-audio <audio-file-or-url> -o out.md    # formatted to file
     transcribe-audio <audio-file-or-url> --model full # use full deployment alias
     transcribe-audio <audio-file-or-url> --jobs 4     # parallel chunk uploads
+    transcribe-audio <audio-file-or-url> --engine-file engine.json  # which engine ran
 
 --model accepts a deployment name or an alias that resolves to the configured
 mini or full deployment: mini, full, gpt-4o-mini-transcribe, gpt-4o-transcribe.
+It applies to Azure, so with a self-hosted endpoint it picks the fallback.
 """
 
 from __future__ import annotations
@@ -62,9 +71,10 @@ log = logging.getLogger("transcribe-audio")
 TG_TOOLS_ROOT = Path(__file__).resolve().parents[1]
 RSS_AUDIO_HELPER_DIR = TG_TOOLS_ROOT / "rss-audio"
 # Run as a CLI (qmd2 does, with a scrubbed env) it loads its own settings:
-# the Azure service principal, and rss-audio's source route for URL inputs.
-# Explicit environment always wins.
+# the self-hosted endpoint, the Azure service principal, and rss-audio's
+# source route for URL inputs. Explicit environment always wins.
 LOCAL_ENV_PATHS = (
+    Path.home() / ".config" / "agent-secrets" / "self-hosted-transcription.env",
     Path.home() / ".config" / "agent-secrets" / "azure-openai-transcription.env",
     Path.home() / ".config" / "tg-tools" / "rss-audio.env",
 )
@@ -93,6 +103,17 @@ AZURE_OPENAI_TRANSCRIPTION_CLIENT_SECRET_ENV = "AZURE_OPENAI_TRANSCRIPTION_CLIEN
 AZURE_OPENAI_TRANSCRIPTION_API_VERSION_ENV = "AZURE_OPENAI_TRANSCRIPTION_API_VERSION"
 AZURE_OPENAI_SCOPE = "https://cognitiveservices.azure.com/.default"
 AZURE_OPENAI_TRANSCRIPTION_API_VERSION_DEFAULT = "2024-10-21"
+
+TRANSCRIBE_AUDIO_SELF_HOSTED_URL_ENV = "TRANSCRIBE_AUDIO_SELF_HOSTED_URL"
+TRANSCRIBE_AUDIO_SELF_HOSTED_TOKEN_ENV = "TRANSCRIBE_AUDIO_SELF_HOSTED_TOKEN"
+TRANSCRIBE_AUDIO_SELF_HOSTED_MODEL_ENV = "TRANSCRIBE_AUDIO_SELF_HOSTED_MODEL"
+SELF_HOSTED_MODEL_DEFAULT = "parakeet-ultra"
+SELF_HOSTED_PROVIDER = "self-hosted"
+# The whole source file is uploaded (the endpoint converts it): an hour of mp3
+# is ~60 MB, and re-encoding here costs more than sending it. Larger inputs,
+# usually video, go to Azure's compact chunks instead.
+SELF_HOSTED_MAX_BYTES = 200 * 1024 * 1024
+SELF_HOSTED_TIMEOUT_SEC = 600
 
 TRANSCRIBE_AUDIO_MODEL_ENV = "TRANSCRIBE_AUDIO_MODEL"
 TRANSCRIBE_AUDIO_MODEL_MINI_ENV = "TRANSCRIBE_AUDIO_MODEL_MINI"
@@ -208,6 +229,25 @@ def load_azure_openai_config() -> AzureOpenAIConfig:
     )
 
 
+@dataclass(frozen=True)
+class SelfHostedConfig:
+    url: str
+    token: str
+    model: str
+
+
+def load_self_hosted_config() -> SelfHostedConfig | None:
+    """The self-hosted endpoint tried before Azure, or None when no URL is configured."""
+    url = (os.environ.get(TRANSCRIBE_AUDIO_SELF_HOSTED_URL_ENV) or "").strip().rstrip("/")
+    if not url:
+        return None
+    return SelfHostedConfig(
+        url=url,
+        token=(os.environ.get(TRANSCRIBE_AUDIO_SELF_HOSTED_TOKEN_ENV) or "").strip(),
+        model=(os.environ.get(TRANSCRIBE_AUDIO_SELF_HOSTED_MODEL_ENV) or "").strip() or SELF_HOSTED_MODEL_DEFAULT,
+    )
+
+
 def _transcribe_model_defaults(config: AzureOpenAIConfig) -> tuple[str, str, str]:
     mini = (os.environ.get(TRANSCRIBE_AUDIO_MODEL_MINI_ENV) or "").strip() or config.mini_deployment
     full = (os.environ.get(TRANSCRIBE_AUDIO_MODEL_FULL_ENV) or "").strip() or config.full_deployment
@@ -299,6 +339,8 @@ def load_source_tool_settings() -> SourceToolSettings:
             "RSS_AUDIO_MAC_YTDLP_PATH",
             default="",
         ),
+        # Empty is meaningful (no cookies), so no _env_first here.
+        mac_cookies_from_browser=os.environ.get("RSS_AUDIO_MAC_COOKIES_FROM_BROWSER", "safari"),
         yt_dlp_bin=_env_first(
             TRANSCRIBE_AUDIO_YTDLP_BIN_ENV,
             "RSS_AUDIO_YTDLP_BIN",
@@ -476,6 +518,23 @@ def _audio_content_type(chunk_path: str) -> str:
     }.get(ext, "application/octet-stream")
 
 
+def _multipart_body(audio_path: str, fields: dict[str, str]) -> tuple[bytes, str]:
+    """A transcription request body (the audio as ``file``, then ``fields``) and its Content-Type."""
+    boundary = f"----FormBoundary{int(time.time() * 1000)}"
+    with open(audio_path, "rb") as f:
+        audio_data = f.read()
+    parts = [
+        f"--{boundary}\r\n".encode(),
+        f'Content-Disposition: form-data; name="file"; filename="{os.path.basename(audio_path)}"\r\n'.encode(),
+        f"Content-Type: {_audio_content_type(audio_path)}\r\n\r\n".encode(),
+        audio_data + b"\r\n",
+    ]
+    for name, value in fields.items():
+        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode())
+    parts.append(f"--{boundary}--\r\n".encode())
+    return b"".join(parts), f"multipart/form-data; boundary={boundary}"
+
+
 def transcribe_chunk(
     config: AzureOpenAIConfig,
     access_token: str,
@@ -484,26 +543,8 @@ def transcribe_chunk(
 ) -> str | None:
     """Transcribe one audio chunk via Azure OpenAI."""
     filename = os.path.basename(chunk_path)
-    boundary = f"----FormBoundary{int(time.time() * 1000)}"
-
-    with open(chunk_path, "rb") as f:
-        audio_data = f.read()
-
-    body = b""
-    body += f"--{boundary}\r\n".encode()
-    body += f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'.encode()
-    body += f"Content-Type: {_audio_content_type(chunk_path)}\r\n\r\n".encode()
-    body += audio_data + b"\r\n"
-    body += f"--{boundary}\r\n".encode()
-    body += b'Content-Disposition: form-data; name="model"\r\n\r\n'
-    body += f"{model}\r\n".encode()
-    body += f"--{boundary}\r\n".encode()
-    body += b'Content-Disposition: form-data; name="response_format"\r\n\r\n'
-    body += b"json\r\n"
-    body += f"--{boundary}\r\n".encode()
-    body += b'Content-Disposition: form-data; name="prompt"\r\n\r\n'
-    body += f"{TRANSCRIPTION_PROMPT}\r\n".encode()
-    body += f"--{boundary}--\r\n".encode()
+    body, content_type = _multipart_body(
+        chunk_path, {"model": model, "response_format": "json", "prompt": TRANSCRIPTION_PROMPT})
 
     transcription_url = (
         f"{config.endpoint}/openai/deployments/{urllib.parse.quote(model, safe='')}"
@@ -514,7 +555,7 @@ def transcribe_chunk(
         data=body,
         headers={
             "Authorization": f"Bearer {access_token}",
-            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Content-Type": content_type,
         },
     )
 
@@ -599,6 +640,47 @@ def transcribe_all(
                 on_progress(completed, len(chunks))
 
     return "\n\n".join(part for part in parts if part)
+
+
+# ── Self-hosted transcription ────────────────────────────────────────────────
+
+def transcribe_self_hosted(config: SelfHostedConfig, audio_path: str) -> tuple[str, str] | None:
+    """Transcribe a whole file on the self-hosted endpoint.
+
+    Returns (raw transcript, model label such as parakeet-ultra@fluidaudio-0.18.0),
+    or None after logging why, so the caller falls back to Azure.
+    """
+    size = os.path.getsize(audio_path)
+    if size > SELF_HOSTED_MAX_BYTES:
+        log.warning("Self-hosted transcription skipped: %.0f MB is over %d MB",
+                    size / 1024 / 1024, SELF_HOSTED_MAX_BYTES // 1024 // 1024)
+        return None
+    body, content_type = _multipart_body(audio_path, {"model": config.model, "response_format": "json"})
+    req = urllib.request.Request(
+        f"{config.url}/audio/transcriptions",
+        data=body,
+        headers={"Authorization": f"Bearer {config.token}", "Content-Type": content_type},
+    )
+    log.info(f"Transcribing {os.path.basename(audio_path)} ({size / 1024 / 1024:.1f} MB) "
+             f"with self-hosted {config.model} at {config.url}...")
+    started = time.monotonic()
+    try:
+        with urllib.request.urlopen(req, timeout=SELF_HOSTED_TIMEOUT_SEC) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        log.warning("Self-hosted transcription error %s: %s", e.code, e.read().decode(errors="replace")[:300])
+        return None
+    except (OSError, ValueError) as e:
+        log.warning("Self-hosted transcription failed: %s", e)
+        return None
+    text = (data.get("text") or "").strip() if isinstance(data, dict) else ""
+    if not text:
+        log.warning("Self-hosted transcription returned no text")
+        return None
+    model = str(data.get("model") or config.model)
+    label = f"{model}@{data['engine']}" if data.get("engine") else model
+    log.info(f"  → {len(text)} chars from {label} in {time.monotonic() - started:.1f}s")
+    return text, label
 
 
 # ── Local formatting ──────────────────────────────────────────────────────────
@@ -696,6 +778,10 @@ def main():
         "--jobs", type=int, default=DEFAULT_JOBS,
         help=f"Parallel chunk transcription jobs (default: {DEFAULT_JOBS})",
     )
+    parser.add_argument(
+        "--engine-file",
+        help='Write the engine that produced the transcript as JSON: {"provider", "model"}',
+    )
     args = parser.parse_args()
 
     _load_local_env()
@@ -715,24 +801,35 @@ def main():
 
         log.info(f"Input: {audio_path} ({size / 1024 / 1024:.1f} MB)")
 
-        config = load_azure_openai_config()
-        access_token = fetch_azure_access_token(config)
+        # Step 1: self-hosted, whole file
+        self_hosted = load_self_hosted_config()
+        result = transcribe_self_hosted(self_hosted, audio_path) if self_hosted else None
+        if result:
+            transcript, engine_model = result
+            engine_provider = SELF_HOSTED_PROVIDER
+        else:
+            if self_hosted:
+                log.warning("Falling back to Azure transcription")
+            config = load_azure_openai_config()
+            access_token = fetch_azure_access_token(config)
 
-        # Step 1: Convert + chunk
-        chunks = prepare_chunks(audio_path, tmpdir)
-
-        # Step 2: Transcribe
-        resolved_model = resolve_transcribe_model(args.model, config)
-        if args.model and resolved_model != args.model:
-            log.info("Resolved Azure deployment alias %s -> %s", args.model, resolved_model)
-        elif not args.model:
-            log.info("Selected default Azure transcription deployment: %s", resolved_model)
-        transcript = transcribe_all(config, access_token, chunks, resolved_model, jobs=args.jobs)
+            # Step 2: Azure: convert + chunk, then transcribe
+            chunks = prepare_chunks(audio_path, tmpdir)
+            resolved_model = resolve_transcribe_model(args.model, config)
+            if args.model and resolved_model != args.model:
+                log.info("Resolved Azure deployment alias %s -> %s", args.model, resolved_model)
+            elif not args.model:
+                log.info("Selected default Azure transcription deployment: %s", resolved_model)
+            transcript = transcribe_all(config, access_token, chunks, resolved_model, jobs=args.jobs)
+            engine_provider, engine_model = "azure", resolved_model
         if not transcript:
             log.error("Transcription failed")
             sys.exit(1)
 
         log.info(f"Total transcript: {len(transcript)} chars")
+        if args.engine_file:
+            Path(args.engine_file).expanduser().write_text(
+                json.dumps({"provider": engine_provider, "model": engine_model}) + "\n", encoding="utf-8")
 
         # Step 3: Format (unless --raw)
         if args.raw:

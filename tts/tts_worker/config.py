@@ -30,6 +30,10 @@ class Settings:
     gemini_api_key: str
     default_voice: str
     speech_provider: str
+    self_hosted_speech_url: str
+    self_hosted_speech_token: str
+    self_hosted_speech_model: str
+    fallback_voice: str
     azure_tts_base_url: str
     azure_tts_api_key: str
     azure_tts_key_cmd: str
@@ -48,6 +52,9 @@ class Settings:
     azure_chat_api_key: str
     azure_chat_key_cmd: str
     title_model: str
+
+
+DEFAULT_VOICES = {"azure": "nova", "self-hosted": "af_heart"}
 
 
 def feed_title(env: dict[str, str] | None = None) -> str:
@@ -75,8 +82,14 @@ def load_settings(env: dict[str, str] | None = None) -> Settings:
         database_dsn=e.get("TTS_DATABASE_URL") or "dbname=runtime_controller user=ubuntu host=/var/run/postgresql",
         work_dir=Path(e.get("TTS_WORK_DIR", "~/.local/share/tg-tools/tts/work")).expanduser().absolute(),
         gemini_api_key=e.get("GEMINI_API_KEY", ""),
-        default_voice=e.get("TTS_DEFAULT_VOICE") or ("nova" if e.get("TTS_SPEECH_PROVIDER") == "azure" else "Kore"),
+        default_voice=e.get("TTS_DEFAULT_VOICE") or DEFAULT_VOICES.get(e.get("TTS_SPEECH_PROVIDER", ""), "Kore"),
         speech_provider=e.get("TTS_SPEECH_PROVIDER", "gemini"),
+        # self-hosted: an OpenAI-compatible base URL (m3-tts, e.g. http://host:8179/v1); Azure reads the whole
+        # episode in TTS_FALLBACK_VOICE when it fails.
+        self_hosted_speech_url=e.get("TTS_SELF_HOSTED_SPEECH_URL", "").strip().rstrip("/"),
+        self_hosted_speech_token=e.get("TTS_SELF_HOSTED_SPEECH_TOKEN", "").strip(),
+        self_hosted_speech_model=e.get("TTS_SELF_HOSTED_SPEECH_MODEL") or "kokoro-82m",
+        fallback_voice=e.get("TTS_FALLBACK_VOICE") or "nova",
         azure_tts_base_url=required_env("TTS_AZURE_TTS_BASE_URL", e).rstrip("/"),
         azure_tts_api_key=e.get("TTS_AZURE_TTS_API_KEY", ""),
         azure_tts_key_cmd=required_env("TTS_AZURE_TTS_KEY_CMD", e),

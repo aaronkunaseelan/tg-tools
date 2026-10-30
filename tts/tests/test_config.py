@@ -51,3 +51,19 @@ def test_notification_requires_feed_title(monkeypatch, missing):
         monkeypatch.setenv("TTS_FEED_TITLE", missing)
     with pytest.raises(ValueError, match="TTS_FEED_TITLE"):
         render_notification("succeeded", {"ok": True})
+
+
+@pytest.mark.parametrize("extra, voice, fatal", [
+    ({}, "nova", False),
+    ({"TTS_SPEECH_PROVIDER": "self-hosted"}, "af_heart", True),
+    ({"TTS_SPEECH_PROVIDER": "self-hosted", "TTS_SELF_HOSTED_SPEECH_URL": "http://m3.test:8179/v1/",
+      "TTS_SELF_HOSTED_SPEECH_TOKEN": "t"}, "af_heart", False),
+])
+def test_self_hosted_speech_config(extra, voice, fatal):
+    from tts_worker.startup import validate_startup
+    settings = load_settings({**ACCOUNT_ENV, "TTS_SPEECH_PROVIDER": "azure", **extra})
+    assert (settings.default_voice, settings.fallback_voice, settings.self_hosted_speech_model) == (voice, "nova", "kokoro-82m")
+    if extra.get("TTS_SELF_HOSTED_SPEECH_URL"):
+        assert settings.self_hosted_speech_url == "http://m3.test:8179/v1"
+    errors, _ = validate_startup(settings)
+    assert any("TTS_SELF_HOSTED_SPEECH_URL" in e for e in errors) == fatal

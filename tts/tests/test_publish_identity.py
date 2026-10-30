@@ -79,7 +79,7 @@ def test_published_identity_skips_all_generation(tmp_path, monkeypatch):
     monkeypatch.setattr(worker, 'find_published_episode', lambda **kw: ep)
     def no_generation(*args, **kwargs):
         pytest.fail('existing identity must not materialise, generate or synthesize')
-    for name in ('materialise', 'resolve_title', 'synthesize_speech', 'decide_retry'):
+    for name in ('materialise', 'resolve_title', 'synthesize_with_fallback', 'decide_retry'):
         monkeypatch.setattr(worker, name, no_generation)
     result = worker._execute_job_in_root(**kwargs)
     assert result['ok'] and result['existingEpisode']

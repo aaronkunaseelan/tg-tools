@@ -22,6 +22,8 @@ logger = logging.getLogger(__name__)
 
 SCRIPT_FILE = "script.md"
 SCRIPT_HASH_FILE = "script.sha256"
+# The self-hosted engine that wrote script.md, so a resumed job still records it.
+STT_ENGINE_FILE = "stt-engine.txt"
 PARAGRAPHS_FILE = "paragraphs.json"
 ANALYSIS_FILE = "analysis.json"
 MENTIONS_FILE = "mentions.json"
@@ -44,6 +46,7 @@ class PreparedScript:
     path: Path
     sha256: str
     source: TranscriptSource
+    stt_engine: str | None = None
 
 
 @dataclass
@@ -110,6 +113,8 @@ def ensure_script(*, work_dir: str | Path, source: TranscriptSource | None = Non
     if existing and existing.strip() and getattr(source, "kind", "audio") == "audio":
         current_progress().emit("transcript_checkpoint", "reused", reason="checkpoint_reused")
         text = existing
+        engine_path = work / STT_ENGINE_FILE
+        stt_engine = engine_path.read_text(encoding="utf-8").strip() if engine_path.is_file() else None
     else:
         try:
             text = source.transcript()
@@ -117,6 +122,7 @@ def ensure_script(*, work_dir: str | Path, source: TranscriptSource | None = Non
             raise EnrichmentError(exc.stage, str(exc)) from exc
         except (TypeError, ValueError, OSError) as exc:
             raise EnrichmentError("script", str(exc)) from exc
+        stt_engine = getattr(text, "stt_engine", None)
     if not isinstance(text, str) or not text.strip():
         raise EnrichmentError("script", "script contains no text")
 
@@ -127,7 +133,11 @@ def ensure_script(*, work_dir: str | Path, source: TranscriptSource | None = Non
         _invalidate_dependents(work)
     _atomic_write(script_path, render.render_script_markdown(text))
     _atomic_write(work / SCRIPT_HASH_FILE, digest + "\n")
-    return PreparedScript(text=text, path=script_path, sha256=digest, source=source)
+    if stt_engine:
+        _atomic_write(work / STT_ENGINE_FILE, stt_engine + "\n")
+    else:
+        (work / STT_ENGINE_FILE).unlink(missing_ok=True)
+    return PreparedScript(text=text, path=script_path, sha256=digest, source=source, stt_engine=stt_engine)
 
 
 @tracked_stage("prepare_paragraphs")
@@ -248,7 +258,7 @@ def enrich_script(
         title=title, slug=slug, published=published, date_basis=date_basis,
         duration_seconds=duration_seconds, mp3_url=mp3_url,
         notes_url=notes_url, script_url=script_url, source_url=source_url,
-        stt_model=stt_model if source_kind == "audio" else None,
+        stt_model=(script.stt_engine or stt_model) if source_kind == "audio" else None,
         roles={"topics": TOPICS_ROLE, "mentions": MENTIONS_ROLE},
         source_kind=source_kind,
         content_origin=getattr(script.source, "content_origin", "unknown"),

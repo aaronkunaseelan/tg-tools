@@ -106,7 +106,7 @@ def test_execution_failure_reaches_reply_with_real_stage(monkeypatch, tmp_path, 
     monkeypatch.setattr(worker, "enrich", enrich)
     def synthesize(*a, **kw):
         raise OSError("PRIVATE https://synthetic.test/?secret=hidden")
-    monkeypatch.setattr(worker, "synthesize_speech", synthesize)
+    monkeypatch.setattr(worker, "synthesize_with_fallback", synthesize)
     with pytest.raises(worker.TTSJobError) as error:
         worker._execute_job_in_root(**kwargs)
     assert error.value.stage == failure_stage

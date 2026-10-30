@@ -116,7 +116,21 @@ KNOWN_VOICES = {
                "leda", "orus", "puck", "pulcherrima", "rasalgethi",
                "sadachbia", "sadaltager", "schedar", "sulafat", "umbriel",
                "vindemiatrix", "zephyr", "zubenelgenubi"},
+    # Kokoro-82M's English voices on m3-tts (American af_/am_, British bf_/bm_).
+    "self-hosted": {"af_alloy", "af_aoede", "af_bella", "af_heart", "af_jessica", "af_kore",
+                    "af_nicole", "af_nova", "af_river", "af_sarah", "af_sky", "am_adam",
+                    "am_echo", "am_eric", "am_fenrir", "am_liam", "am_michael", "am_onyx",
+                    "am_puck", "am_santa", "bf_alice", "bf_emma", "bf_isabella", "bf_lily",
+                    "bm_daniel", "bm_fable", "bm_george", "bm_lewis"},
 }
+
+
+def speech_engine(provider: str, voice: str) -> str:
+    """The provider that speaks this voice. Under self-hosted an Azure voice name (an explicit choice, or a
+    job admitted before the switch) goes to Azure, so it keeps its voice and its episode identity."""
+    if provider == "self-hosted" and voice.lower() in KNOWN_VOICES["azure"]:
+        return "azure"
+    return provider
 
 
 def validate_voice(provider: str, voice: str, extra: set[str] | None = None) -> None:

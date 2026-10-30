@@ -94,11 +94,38 @@ def _transcribe_one(
     )
 
 
+def _transcribe_self_hosted(module: ModuleType, chunk_paths: tuple[Path, ...]) -> TranscriptionBatch | None:
+    """Every chunk on the self-hosted endpoint, in order (it runs one job at a time).
+
+    None when no endpoint is configured or any chunk fails, so the whole batch goes
+    to Azure and one batch never mixes engines.
+    """
+    config = module.load_self_hosted_config()
+    if config is None:
+        return None
+    chunks: list[ChunkTranscript] = []
+    label = config.model
+    for index, chunk_path in enumerate(chunk_paths):
+        started = time.monotonic()
+        result = module.transcribe_self_hosted(config, str(chunk_path))
+        text = str(module.format_transcript(result[0]) or "").strip() if result else ""
+        if not text:
+            return None
+        label = result[1]
+        chunks.append(ChunkTranscript(chunk_index=index, name=chunk_path.name, text=text, language=None,
+                                      elapsed_seconds=time.monotonic() - started))
+    return TranscriptionBatch(provider=module.SELF_HOSTED_PROVIDER, model=label, chunks=tuple(chunks))
+
+
 def transcribe_chunks(*, settings: Settings, chunk_paths: tuple[Path, ...]) -> TranscriptionBatch:
     if not chunk_paths:
         raise ASRError("no audio chunks provided")
 
     module = _load_transcribe_audio()
+    module._load_local_env()
+    batch = _transcribe_self_hosted(module, chunk_paths)
+    if batch is not None:
+        return batch
     config, access_token = _endpoint_config(module)
     try:
         resolved_model = str(module.resolve_transcribe_model(settings.transcribe_model, config))

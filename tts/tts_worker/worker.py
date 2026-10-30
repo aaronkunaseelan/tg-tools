@@ -31,7 +31,7 @@ from .episode_title import heuristic_title, resolve_title
 from tts_reader.adapter import compile_explained_artifact_pi
 from tts_reader.errors import ExplainError
 from .config import Settings, load_settings
-from .failure_policy import classify_outcome, effective_error_class, validate_voice
+from .failure_policy import classify_outcome, effective_error_class, speech_engine, validate_voice
 from .fingerprint import RoleMapError, execution_fingerprint, reader_role_map
 from .generation_checkpoint import (
     GenerationCheckpointIdentityConflict,
@@ -55,9 +55,9 @@ from .runtime_client import RuntimeClient, RuntimeClientError
 from .speech_gemini import (
     AzureSpeechProvider,
     GeminiSpeechProvider,
+    SelfHostedSpeechProvider,
     SpeechError,
-    speech_chunk_char_limit,
-    synthesize_speech,
+    synthesize_with_fallback,
 )
 from .work_state import WorkRootError, acquire_work_root, ensure_work_state
 
@@ -159,8 +159,9 @@ def _execute_job_in_root(
             raise TTSJobError("admission", "length_not_allowed", "x-tts explain does not accept length")
         # Admission: reject invalid voices before any acquisition/model spend.
         voice = str(input_json.get("voice") or settings.default_voice)
+        engine = speech_engine(settings.speech_provider, voice)
         try:
-            validate_voice(settings.speech_provider, voice)
+            validate_voice(engine, voice)
         except ValueError as exc:
             raise TTSJobError("admission", "voice_invalid", str(exc)) from exc
         _cancel()
@@ -177,12 +178,10 @@ def _execute_job_in_root(
                 mode="explain" if x_mode else "read",
                 requested_length=str(input_json.get("length") or "standard"),
                 voice=voice,
-                speech_provider=settings.speech_provider,
-                speech_model=(
-                    settings.azure_tts_model
-                    if settings.speech_provider == "azure"
-                    else "gemini-2.5-flash-preview-tts"
-                ),
+                speech_provider=engine,
+                speech_model=(settings.azure_tts_model if engine == "azure"
+                              else settings.self_hosted_speech_model if engine == "self-hosted"
+                              else GeminiSpeechProvider.model),
                 reader_roles=roles,
                 transform_contract_config_version=CONVERTER_VERSION,
             )
@@ -450,20 +449,27 @@ def _execute_job_in_root(
         _cancel()
         stage = "speech"
         try:
-            if settings.speech_provider == "azure":
-                provider = AzureSpeechProvider(base_url=settings.azure_tts_base_url, api_key=settings.azure_tts_api_key, key_cmd=settings.azure_tts_key_cmd, model=settings.azure_tts_model, voice=voice, http_post=gemini_post)
+            azure = lambda v: AzureSpeechProvider(base_url=settings.azure_tts_base_url, api_key=settings.azure_tts_api_key, key_cmd=settings.azure_tts_key_cmd, model=settings.azure_tts_model, voice=v, http_post=gemini_post)
+            if engine == "self-hosted":
+                # Azure reads the whole episode again if m3 fails: one episode, one voice.
+                providers = [SelfHostedSpeechProvider(base_url=settings.self_hosted_speech_url, token=settings.self_hosted_speech_token, model=settings.self_hosted_speech_model, voice=voice, http_post=gemini_post),
+                             azure(settings.fallback_voice)]
+            elif engine == "azure":
+                providers = [azure(voice)]
             else:
-                provider = GeminiSpeechProvider(api_key=settings.gemini_api_key, voice=voice, http_post=gemini_post)
-            speech = synthesize_speech(
+                providers = [GeminiSpeechProvider(api_key=settings.gemini_api_key, voice=voice, http_post=gemini_post)]
+            speech, provider, fallback_notes = synthesize_with_fallback(
                 speech_text,
                 work / "speech",
-                provider=provider,
+                providers=providers,
                 ffmpeg_bin=settings.ffmpeg_bin,
                 ffprobe_bin=settings.ffprobe_bin,
                 runner=media_runner,
-                max_chars=speech_chunk_char_limit(settings.speech_provider, speech_text),
                 cancel=_cancel,
             )
+            for note in fallback_notes:
+                logger.warning("tts speech fell back: %s", note)
+            hangups = list(hangups) + fallback_notes
         except SpeechError as exc:
             raise TTSJobError("speech", exc.error_class, str(exc)) from exc
         _cancel()

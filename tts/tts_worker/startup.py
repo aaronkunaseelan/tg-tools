@@ -52,8 +52,10 @@ def validate_startup(settings) -> tuple[list[str], list[str]]:
         fatal.append("TTS_PUBLIC_BASE_URL is not set")
     if not settings.api_base_url:
         fatal.append("TTS_API_BASE_URL is not set")
-    if settings.speech_provider == "azure":
-        # Check configuration only; do not spend quota or expose keys at startup.
+    if settings.speech_provider == "self-hosted" and not (settings.self_hosted_speech_url and settings.self_hosted_speech_token):
+        fatal.append("TTS_SPEECH_PROVIDER=self-hosted requires TTS_SELF_HOSTED_SPEECH_URL and TTS_SELF_HOSTED_SPEECH_TOKEN")
+    if settings.speech_provider in ("azure", "self-hosted"):
+        # Azure speaks, or is the self-hosted fallback. Check configuration only; do not spend quota or expose keys at startup.
         credentials = [("TTS_AZURE_TTS", settings.azure_tts_api_key, settings.azure_tts_key_cmd)]
         if settings.title_model:
             credentials.append(("TTS_AZURE_CHAT", settings.azure_chat_api_key, settings.azure_chat_key_cmd))

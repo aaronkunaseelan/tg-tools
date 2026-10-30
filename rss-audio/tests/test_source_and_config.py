@@ -4,10 +4,12 @@ validate_source_url: metadata IP / localhost / private literal -> SourceAudioErr
 classify_text      | "listen https://x/file.mp3" -> direct_audio_url | "watch https://youtu.be/abc?si=x," -> url (punctuation trimmed)
 stable_url_for_display drops tracking; episode names drop stop words, date prefix, 12-hex suffix
 sanitized_source_subprocess_env keeps PATH only; yt-dlp never loads remote components (local or via Mac)
+Mac route cookies: default --cookies-from-browser safari; RSS_AUDIO_MAC_COOKIES_FROM_BROWSER= sends none
 first_actionable_error_line skips route wrappers; run_command keeps pipefail failures (real bash)
 validate_settings  | complete -> ok | missing / https / scheme-less proxy, missing ssh, relative yt-dlp -> named error
                    | all three missing -> all three named together
 """
+import dataclasses
 import os
 from datetime import UTC, datetime
 from unittest import mock
@@ -56,6 +58,15 @@ def test_subprocess_hygiene():
     with pytest.raises(source_audio.SourceAudioError) as err:
         source_audio.run_command(["/bin/bash", "-lc", "set -o pipefail; false | true"], stage="download")
     assert err.value.stage == "download"
+
+
+def test_mac_cookies():
+    url = "https://example.com/v"
+    assert "--cookies-from-browser safari " in source_audio._mac_metadata_command(TOOLS, url)[2]
+    none = dataclasses.replace(TOOLS, mac_cookies_from_browser=settings(RSS_AUDIO_MAC_COOKIES_FROM_BROWSER="").mac_cookies_from_browser)
+    assert "cookies" not in source_audio._mac_metadata_command(none, url)[2]
+    assert "cookies" not in source_audio._mac_stage_download_command(none, url, "/tmp/rss-audio-source-x/source.%(ext)s")[2]
+    assert settings().mac_cookies_from_browser == "safari"
 
 
 @pytest.mark.parametrize("key", ["RSS_AUDIO_BASE_URL", "RSS_AUDIO_B2_BUCKET"])

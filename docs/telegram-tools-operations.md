@@ -45,6 +45,7 @@ unit's `Environment=PYTHONPATH` and would pin a stale release.
 | `tts.env` | `tts-worker`, `tts-result-projector` |
 | `meeting-summary.env` | meeting-summary workers, `tg-gateway-ms` |
 | `gateway-ms.env` | `tg-gateway-ms` |
+| `~/.config/agent-secrets/self-hosted-speech.env` (optional) | `tts-worker`: `TTS_SELF_HOSTED_SPEECH_URL`, `TTS_SELF_HOSTED_SPEECH_TOKEN` for `TTS_SPEECH_PROVIDER=self-hosted` |
 
 Templates with every key are in `config/*.env.example`.
 

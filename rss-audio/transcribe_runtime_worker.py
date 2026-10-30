@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import re
@@ -39,6 +40,9 @@ class TranscribeResult:
     title_hint: str | None
     filename: str
     force_document: bool
+    # The engine that ran (transcribe.py --engine-file); None: the requested one.
+    provider: str | None = None
+    model: str | None = None
 
 
 def _safe_doc_stem(value: str) -> str:
@@ -176,6 +180,7 @@ async def execute_transcribe_job(settings: Settings, bot: Bot, input_json: dict[
             source_arg = await _download_telegram_input(settings, bot, input_json, tmpdir)
 
         out_path = os.path.join(tmpdir, "transcript.md")
+        engine_path = os.path.join(tmpdir, "engine.json")
         proc = await asyncio.create_subprocess_exec(
             sys.executable,
             TRANSCRIBE_BIN,
@@ -186,6 +191,8 @@ async def execute_transcribe_job(settings: Settings, bot: Bot, input_json: dict[
             str(input_json.get("jobs") or 3),
             "-o",
             out_path,
+            "--engine-file",
+            engine_path,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=_transcribe_subprocess_env(),
@@ -210,11 +217,14 @@ async def execute_transcribe_job(settings: Settings, bot: Bot, input_json: dict[
         if not os.path.isfile(out_path) or os.path.getsize(out_path) == 0:
             raise PipelineError("transcribe", "Empty transcript output")
         transcript = Path(out_path).read_text(encoding="utf-8").strip()
+        engine = json.loads(Path(engine_path).read_text(encoding="utf-8")) if os.path.isfile(engine_path) else {}
         return TranscribeResult(
             transcript=transcript,
             title_hint=title_hint,
             filename=_transcript_doc_name(input_json, title_hint),
             force_document=force_document,
+            provider=engine.get("provider"),
+            model=engine.get("model"),
         )
 
 
@@ -350,8 +360,8 @@ async def _execute_claim(*, client: RuntimeClient, settings: Settings, bot: Bot,
                 source_metadata={
                     "inputKind": input_json.get("inputKind"),
                     "titleHint": result.title_hint,
-                    "transcribeProvider": input_json.get("provider"),
-                    "transcribeModel": input_json.get("model"),
+                    "transcribeProvider": result.provider or input_json.get("provider"),
+                    "transcribeModel": result.model or input_json.get("model"),
                     "transcriptChars": len(result.transcript),
                 },
             )
@@ -414,6 +424,8 @@ async def _execute_claim(*, client: RuntimeClient, settings: Settings, bot: Bot,
         "titleHint": result.title_hint,
         "filename": result.filename,
         "sourceUrlDisplay": _source_url_display(input_json),
+        "transcribeProvider": result.provider or input_json.get("provider"),
+        "transcribeModel": result.model or input_json.get("model"),
     }
     if scribe and revision is not None:
         result_json.update(
@@ -427,8 +439,8 @@ async def _execute_claim(*, client: RuntimeClient, settings: Settings, bot: Bot,
                 "markdownChars": len(revision.markdown_text),
                 "entryChars": len(result.transcript),
                 "inputKind": input_json.get("inputKind"),
-                "transcribeProvider": input_json.get("provider"),
-                "transcribeModel": input_json.get("model"),
+                "transcribeProvider": result.provider or input_json.get("provider"),
+                "transcribeModel": result.model or input_json.get("model"),
             }
         )
     finalized = await asyncio.to_thread(

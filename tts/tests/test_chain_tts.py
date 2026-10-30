@@ -10,6 +10,9 @@ point at is read back from the bucket by key.
 Case table
 | case                  | input                         | proves                                              |
 | tts text message      | plain text in the tts topic   | faithful read published; reply links the exact mp3  |
+|   x speech azure      | TTS_SPEECH_PROVIDER=azure     | Azure nova speaks                                    |
+|   x self-hosted       | m3-tts answers                | Kokoro af_heart speaks; no Azure speech call         |
+|   x self-hosted down  | m3-tts 503                    | Azure nova reads the whole episode; fallback noted   |
 | x-tts document upload | arXiv 1006.3868 PDF upload    | staged upload; write/review/revise on one claude     |
 |                       |                               | session (--resume); notes + script published         |
 """
@@ -53,7 +56,7 @@ def stack(tmp_path, monkeypatch):
     stack.stop()
 
 
-def _tts_settings(stack, monkeypatch):
+def _tts_settings(stack, monkeypatch, speech_env=None):
     from tts_worker.config import load_settings
     env = {
         "TG_TOOLS_PROGRESS_ENABLED": "1",
@@ -68,6 +71,7 @@ def _tts_settings(stack, monkeypatch):
         "TTS_AZURE_CHAT_BASE_URL": stack.edge.url + "/openai/v1", "TTS_AZURE_CHAT_KEY_CMD": "printf chain",
         "TTS_TITLE_MODEL": "",
         "TTS_PI_ROLES_FILE": "",
+        **(speech_env or {}),
     }
     for key, value in env.items():
         monkeypatch.setenv(key, value)
@@ -81,7 +85,7 @@ def _exact_get(stack, url: str) -> bytes:
     return (stack.bucket / url[len(prefix):]).read_bytes()
 
 
-async def _run_lane(stack, monkeypatch, event, files=None):
+async def _run_lane(stack, monkeypatch, event, files=None, speech_env=None, speech_fallback=False):
     from tg_gateway import daemon
     from tts_worker.result_projector import ResultProjector
     from tts_worker.runtime_client import RuntimeClient
@@ -96,7 +100,7 @@ async def _run_lane(stack, monkeypatch, event, files=None):
     job_id = stack.psql("select job_id from tg_gateway.source_handoffs where state = 'submitted'")
     assert job_id, stack.psql("select state, last_error from tg_gateway.source_handoffs")
 
-    settings = _tts_settings(stack, monkeypatch)
+    settings = _tts_settings(stack, monkeypatch, speech_env)
     await run_until(lambda: worker_loop(settings),
                     lambda: stack.job(job_id)["job"]["status"] in {"succeeded", "dead", "failed"})
     job = stack.job(job_id)["job"]
@@ -105,7 +109,10 @@ async def _run_lane(stack, monkeypatch, event, files=None):
     names = {stage["stage"] for stage in stages}
     assert {"acquire_source", "extract_document", "topic_analysis", "reference_extraction",
             "synthesize_speech", "publish_episode"} <= names
-    assert all(stage["kind"] in {"completed", "reused"} for stage in stages)
+    # A speech fallback leaves the abandoned first read as one interrupted synthesize_speech; the progress view lists
+    # only completed and active stages.
+    interrupted = [s["stage"] for s in stages if s["kind"] not in {"completed", "reused"}]
+    assert interrupted == (["synthesize_speech"] if speech_fallback else []), stages
     if job["workloadType"] == "x_tts_explain":
         assert {"write_explanation", "review_explanation", "revise_explanation"} <= names
     else:
@@ -136,14 +143,33 @@ def _episode_checks(stack, event):
     return episode, notes.decode(), script.decode()
 
 
-def test_tts_text_message_publishes_and_replies(stack, monkeypatch):
+SELF_HOSTED = {"TTS_SPEECH_PROVIDER": "self-hosted", "TTS_SELF_HOSTED_SPEECH_TOKEN": "chain"}
+
+
+@pytest.mark.parametrize("speech, m3_status, voice, receipts", [
+    ("azure", None, "nova", ("azure", "gpt-4o-mini-tts")),
+    ("self-hosted", 200, "af_heart", ("self-hosted", "kokoro-82m")),
+    ("self-hosted", 503, "nova", ("azure", "gpt-4o-mini-tts")),
+])
+def test_tts_text_message_publishes_and_replies(stack, monkeypatch, speech, m3_status, voice, receipts):
+    speech_env = {}
+    if speech == "self-hosted":
+        speech_env = {**SELF_HOSTED, "TTS_SELF_HOSTED_SPEECH_URL": stack.edge.url + "/m3/v1"}
+        stack.edge.route("POST", r"/m3/v1/audio/speech$", lambda req: (
+            (200, tone_pcm(len(req.json()["input"].split()) / 2.5)) if m3_status == 200 else (m3_status, {"error": "down"})))
     event = inbound(thread_id=TTS_THREAD, message_id=101, text=SOURCE)
-    asyncio.run(_run_lane(stack, monkeypatch, event))
+    asyncio.run(_run_lane(stack, monkeypatch, event, speech_env=speech_env, speech_fallback=m3_status == 503))
+    speech_calls = [r.json()["voice"] for r in stack.edge.requests if r.path.endswith("/audio/speech")]
+    assert speech_calls[-1] == voice and ("af_heart" in speech_calls) == (speech == "self-hosted")
     assert [r.text for r in FakeTelegram.replies] == ["Received — queued."]
     episode, notes, script = _episode_checks(stack, event)
     assert episode["route"] == "tts" and episode["episode_kind"] == "faithful_read"
     assert "sixteen million particles" in script and episode["mp3_url"] in notes
     assert {c["step"] for c in model_calls(stack.root / "models.jsonl")} == {"topics", "mentions"}
+    manifest = json.loads(_exact_get(stack, episode["manifest_url"]))
+    assert manifest["voice"] == voice
+    assert {(r["provider"], r["model"]) for r in manifest["chunkReceipts"]} == {receipts}
+    assert any(w.startswith("speech_fallback: self-hosted failed") for w in manifest["warnings"]) == (m3_status == 503)
 
 
 @pytest.mark.skipif(not (Path(__file__).parent / "fixtures" / "arxiv-1006.3868.pdf").exists(),

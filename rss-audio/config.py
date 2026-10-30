@@ -52,6 +52,7 @@ class Settings:
     # so no feed item lacks a transcript.
     enrichment_required: bool = False
     enrichment_stt_model: str = "mini"
+    mac_cookies_from_browser: str = "safari"
     enrichment_jobs: int = 4
 
 
@@ -73,6 +74,7 @@ def load_settings(environ=None, *, pid=None) -> Settings:
         fail_log_dir=_path(env("RSS_AUDIO_FAIL_LOG_DIR", "~/tools/logs/rss-audio")),
         mac_ssh_target=env("RSS_AUDIO_MAC_SSH", ""),
         mac_ytdlp_path=env("RSS_AUDIO_MAC_YTDLP_PATH", ""),
+        mac_cookies_from_browser=env("RSS_AUDIO_MAC_COOKIES_FROM_BROWSER", "safari"),
         yt_dlp_bin=env("RSS_AUDIO_YTDLP_BIN", "yt-dlp"),
         yt_dlp_format=env("RSS_AUDIO_YTDLP_FORMAT", "ba").strip() or "ba",
         ffmpeg_bin=env("RSS_AUDIO_FFMPEG_BIN", "ffmpeg"),

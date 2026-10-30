@@ -30,7 +30,10 @@ render: notes list every heading, section only topics with references, reference
         unknown date explicit, feed description labels the notes link
 source.ScriptSource: lossless `## ` section layout, section -> topic ranges, grammar errors
 naming.build_episode_names: one metadata-led prefix for every artifact
+stt: self-hosted result -> Transcript.stt_engine = its label | no result -> Azure, stt_engine None
+     ensure_script checkpoints the engine, so a resumed job still reports it
 """
+from types import SimpleNamespace
 from datetime import UTC, datetime
 
 import pytest
@@ -182,3 +185,37 @@ def test_episode_names_share_one_prefix():
     assert names.prefix.startswith("1843-08-01-charles-babbage-ada-lovelace-") and names.prefix.endswith("abcdef123456")
     assert [names.audio_name, names.script_name, names.notes_name, names.manifest_name] == [
         names.prefix + suffix for suffix in (".mp3", ".script.md", ".notes.md", ".manifest.json")]
+
+
+def stt_tool(self_hosted):
+    return SimpleNamespace(
+        _load_local_env=lambda: None, ensure_dependencies=lambda: None,
+        load_self_hosted_config=lambda: object(), transcribe_self_hosted=lambda config, path: self_hosted,
+        load_azure_openai_config=lambda: None, fetch_azure_access_token=lambda config: "token",
+        resolve_transcribe_model=lambda model, config: "chain-mini", prepare_chunks=lambda path, tmp: [path],
+        transcribe_all=lambda config, token, chunks, model, jobs: TRANSCRIPT, format_transcript=lambda raw: raw)
+
+
+class TextSource:
+    kind, content_origin, topic_origin, summary_origin = "audio", "stt_transcript", "luna_topics", "luna_summary"
+
+    def __init__(self, text):
+        self.text = text
+
+    def transcript(self):
+        if self.text is None:
+            raise AssertionError("a checkpointed script must not be transcribed again")
+        return self.text
+
+
+def test_stt_engine(tmp_path):
+    from episode_enrichment.pipeline import ensure_script
+    from episode_enrichment.stt import transcribe_audio
+
+    label = "parakeet-ultra@fluidaudio-0.18.0"
+    local = transcribe_audio("a.mp3", module=stt_tool((TRANSCRIPT, label)))
+    azure = transcribe_audio("a.mp3", module=stt_tool(None))
+    assert (local.stt_engine, azure, azure.stt_engine) == (label, TRANSCRIPT, None)
+    assert ensure_script(work_dir=tmp_path, source=TextSource(local)).stt_engine == label
+    assert ensure_script(work_dir=tmp_path, source=TextSource(None)).stt_engine == label
+    assert ensure_script(work_dir=tmp_path / "azure", source=TextSource(azure)).stt_engine is None

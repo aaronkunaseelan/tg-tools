@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import re
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass
@@ -87,6 +88,7 @@ class SpeechResult:
 
 class GeminiSpeechProvider:
     REQUEST_TIMEOUT_S = 120
+    name, model = "gemini", "gemini-2.5-flash-preview-tts"
 
     def __init__(self, *, api_key: str, voice: str = "Kore", http_post: Any | None = None) -> None:
         self.api_key = api_key
@@ -136,7 +138,7 @@ class GeminiSpeechProvider:
         return data, mime
 
 
-def _azure_text_error(data: bytes, content_type: str = "") -> str | None:
+def _azure_text_error(data: bytes, content_type: str = "", label: str = "Azure TTS") -> str | None:
     """Return a bounded provider error only when the full response is textual.
 
     Raw PCM is arbitrary binary and may begin with JSON/HTML punctuation, so a
@@ -149,7 +151,7 @@ def _azure_text_error(data: bytes, content_type: str = "") -> str | None:
         parsed = json.loads(data.decode("utf-8-sig"))
     except (UnicodeDecodeError, json.JSONDecodeError):
         if declared_text:
-            return f"Azure TTS returned {media_type or 'text'} instead of PCM"
+            return f"{label} returned {media_type or 'text'} instead of PCM"
         return None
     detail = parsed.get("error", parsed) if isinstance(parsed, dict) else parsed
     if isinstance(detail, dict):
@@ -157,12 +159,13 @@ def _azure_text_error(data: bytes, content_type: str = "") -> str | None:
         message = str(detail.get("message") or "").strip()
         summary = ": ".join(part for part in (code, message) if part)
         if summary:
-            return f"Azure TTS returned JSON instead of PCM: {summary[:500]}"
-    return "Azure TTS returned JSON instead of PCM"
+            return f"{label} returned JSON instead of PCM: {summary[:500]}"
+    return f"{label} returned JSON instead of PCM"
 
 
 class AzureSpeechProvider:
     REQUEST_TIMEOUT_S = 300
+    name, label, error_prefix = "azure", "Azure TTS", "azure"
 
     def __init__(self, *, base_url: str, api_key: str, key_cmd: str = "", model: str = "gpt-4o-mini-tts", voice: str = "nova", http_post: Any | None = None) -> None:
         self.base_url = base_url.rstrip("/")
@@ -184,40 +187,57 @@ class AzureSpeechProvider:
         self.api_key = key
         return key
 
+    def _request(self, payload: dict[str, Any]) -> urllib_request.Request:
+        url = self.base_url + "/openai/v1/audio/speech?api-version=preview"
+        return urllib_request.Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json", "Accept": "application/octet-stream", "api-key": self._resolve_key()}, method="POST")
+
     def synthesize_pcm(self, chunk: str) -> tuple[bytes, str]:
         payload = {"model": self.model, "input": chunk, "voice": self.voice, "response_format": "pcm"}
         content_type = ""
+        error_class = f"{self.error_prefix}_tts_error"
         if self.http_post is not None:
             try:
                 data = self.http_post(payload)
             except SpeechError:
                 raise
             except Exception as exc:
-                raise SpeechError("azure_tts_error", str(exc)) from exc
+                raise SpeechError(error_class, str(exc)) from exc
         else:
-            key = self._resolve_key()
-            url = self.base_url + "/openai/v1/audio/speech?api-version=preview"
-            req = urllib_request.Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json", "Accept": "application/octet-stream", "api-key": key}, method="POST")
+            req = self._request(payload)
             try:
                 with urllib_request.urlopen(req, timeout=self.REQUEST_TIMEOUT_S) as resp:
                     content_type = str(resp.headers.get("Content-Type") or "")
                     data = resp.read(MAX_PROVIDER_RESPONSE_BYTES + 1)
             except urllib_error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", errors="replace")[:500]
-                raise SpeechError(classify_provider_http(exc.code, "azure"), f"Azure TTS HTTP {exc.code}: {detail}") from exc
+                raise SpeechError(classify_provider_http(exc.code, self.error_prefix), f"{self.label} HTTP {exc.code}: {detail}") from exc
             except (TimeoutError, urllib_error.URLError) as exc:
                 if isinstance(exc, TimeoutError) or isinstance(exc.reason, TimeoutError):
-                    raise SpeechError("speech_timeout", f"TimeoutError: socket read timed out after {self.REQUEST_TIMEOUT_S} s from azure") from exc
-                raise SpeechError("azure_tts_error", f"Azure TTS failed: {exc.reason}") from exc
+                    raise SpeechError("speech_timeout", f"TimeoutError: socket read timed out after {self.REQUEST_TIMEOUT_S} s from {self.name}") from exc
+                raise SpeechError(error_class, f"{self.label} failed: {exc.reason}") from exc
         if not isinstance(data, (bytes, bytearray)) or not data:
-            raise SpeechError("azure_tts_error", "Azure TTS returned empty audio")
+            raise SpeechError(error_class, f"{self.label} returned empty audio")
         data = bytes(data)
         if len(data) > MAX_PROVIDER_RESPONSE_BYTES:
-            raise SpeechError("audio_validation_failed", "Azure TTS response exceeds byte cap")
-        text_error = _azure_text_error(data, content_type)
+            raise SpeechError("audio_validation_failed", f"{self.label} response exceeds byte cap")
+        text_error = _azure_text_error(data, content_type, self.label)
         if text_error:
-            raise SpeechError("azure_tts_error", text_error)
+            raise SpeechError(error_class, text_error)
         return data, "audio/L16;codec=pcm;rate=24000"
+
+
+class SelfHostedSpeechProvider(AzureSpeechProvider):
+    """OpenAI's /v1/audio/speech on our own host (m3-tts: Kokoro-82M on mac-pro), with Azure's PCM contract."""
+    REQUEST_TIMEOUT_S = 120  # a 3,000-char chunk takes ~10 s on m3
+    name, label, error_prefix = "self-hosted", "self-hosted TTS", "self_hosted"
+
+    def __init__(self, *, base_url: str, token: str, model: str = "kokoro-82m", voice: str = "af_heart", http_post: Any | None = None) -> None:
+        super().__init__(base_url=base_url, api_key=token, model=model, voice=voice, http_post=http_post)
+
+    def _request(self, payload: dict[str, Any]) -> urllib_request.Request:
+        if not self.api_key.strip():
+            raise SpeechError("self_hosted_auth_required", "self-hosted TTS token is required")
+        return urllib_request.Request(self.base_url + "/audio/speech", data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json", "Accept": "application/octet-stream", "Authorization": "Bearer " + self.api_key.strip()}, method="POST")
 
 
 def _validate_pcm(pcm: bytes, index: int, *, real_media: bool) -> None:
@@ -345,7 +365,8 @@ def _synthesize_speech(
         if not mp3_path.exists():
             mp3_path.write_bytes(b"fake-mp3") if runner is not None else None
         pcm_path.unlink(missing_ok=True)  # bound disk after conversion
-        receipts.append({"index": index, "chars": len(chunk), "bytes": len(pcm), "duration": round(time.time() - started, 3), "status": "ok"})
+        receipts.append({"index": index, "chars": len(chunk), "bytes": len(pcm), "duration": round(time.time() - started, 3), "status": "ok",
+                         "provider": getattr(provider, "name", ""), "model": getattr(provider, "model", "")})
         mp3s.append(mp3_path)
         report(index, len(chunks))
     _cancel()  # fence before concatenation/ffmpeg
@@ -367,3 +388,20 @@ def _synthesize_speech(
     if runner is None:
         validate_duration_pace(speech_text, duration)
     return SpeechResult(audio_path=audio, receipts=receipts, duration_seconds=duration)
+
+
+def synthesize_with_fallback(speech_text: str, out_dir: Path, *, providers: list[Any], **kwargs: Any) -> tuple[SpeechResult, Any, list[str]]:
+    """Speak the whole text with the first provider that succeeds; a failure starts the next one from chunk 1,
+    so an episode never mixes voices. Returns the result, the provider that spoke and a note per failure."""
+    notes: list[str] = []
+    for provider in providers[:-1]:
+        try:
+            return synthesize_speech(speech_text, out_dir, provider=provider,
+                                     max_chars=speech_chunk_char_limit(provider.name, speech_text), **kwargs), provider, notes
+        except SpeechError as exc:
+            notes.append(f"speech_fallback: {provider.name} failed ({exc.error_class}: {str(exc)[:200]}); "
+                         f"read again with {providers[-1].name} voice {providers[-1].voice}")
+            shutil.rmtree(out_dir, ignore_errors=True)
+    provider = providers[-1]
+    return synthesize_speech(speech_text, out_dir, provider=provider,
+                             max_chars=speech_chunk_char_limit(provider.name, speech_text), **kwargs), provider, notes
