@@ -8,7 +8,8 @@ validator's pip in `tool.tg-tools.bootstrap-dependencies`.
 
 ## Regenerate the lock
 
-From the source root, with Python 3.12 and uv 0.11.32:
+From the source root, with Python 3.12 and uv 0.11.32. The host's own uv moves on (pipx upgrades it), so the pinned one lives at
+`~/.local/lib/tg-tools/uv-0.11.32/bin/uv` (a venv with `pip install uv==0.11.32`); use that path wherever `~/.local/bin/uv` appears below.
 
 ```sh
 python3 scripts/generate_requirements_workspace.py
