@@ -18,7 +18,7 @@ RUNTIMES = Path.home() / ".local/lib/tg-tools/runtimes"
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--uv", type=Path, required=True, help="Absolute path to uv 0.11.32")
+    parser.add_argument("--uv", type=Path, required=True, help="Absolute path to uv 0.13.5")
     args = parser.parse_args()
     if sys.version_info < (3, 12):
         parser.error("Python >=3.12 required")
@@ -57,8 +57,8 @@ def main() -> None:
     if pins(locked) != pins(expected):
         parser.error("hash lock disagrees with runtime/build/bootstrap pins")
     version = subprocess.check_output([str(uv), "--version"], text=True, env=env).strip()
-    if version.split()[:2] != ["uv", "0.11.32"]:
-        parser.error("expected uv 0.11.32")
+    if version.split()[:2] != ["uv", "0.13.5"]:
+        parser.error("expected uv 0.13.5")
     lock_hash = hashlib.sha256(lock.read_bytes()).hexdigest()
     identity = {"lock_sha256": lock_hash, "python": platform.python_version(),
                 "system": platform.system(), "machine": platform.machine(),
