@@ -6,7 +6,7 @@ Telegram tools for turning links, documents and recordings into podcast episodes
 
 - **Faithful reads (TTS):** send text, a URL or a supported document to the configured topic and receive a podcast episode of the source text.
 - **Explained reads (X-TTS):** send a source to a separate topic for an explanatory script, synthesized and published as an episode.
-- **rss-audio:** turn an audio link or Telegram file into an MP3 podcast episode. Optional enrichment adds a verbatim transcript, notes, topic ranges and evidence-bound references. Audio can still publish when optional enrichment fails; required enrichment makes that failure block publication.
+- **rss-audio:** turn an audio link or Telegram file into an MP3 podcast episode. Optional enrichment adds a verbatim transcript, notes, topic ranges and evidence-bound references. When optional enrichment fails, the audio still publishes, and so does the transcript if speech-to-text finished (no notes); required enrichment makes that failure block publication.
 - **Scribe:** send audio, voice or a media URL to start a Markdown transcript. Reply to a linked message with text or more audio to append and receive the next complete revision.
 - **Meeting notes:** audio becomes a Markdown preview with editable date, title and attendees. An Accept button commits the reviewed version; stale buttons cannot accept a newer preview.
 - **Visible execution:** configured RSS/TTS jobs can show stage, elapsed time, measured counts, checkpoint reuse and contact health in Telegram. Progress is not a fabricated percentage or ETA; terminal results and provider receipts remain authoritative.
@@ -40,6 +40,7 @@ The [layout index](docs/README.md) and product guides describe each adapter:
 | Terminal result and projector | `tts/tts_worker/result_projector.py`, `rss-audio/result_projector.py`, `meeting-summary/result_consumer.py` | Persist output before notification; recover delivery from the result instead of rerunning inference. |
 | Delivery outbox and dispatch | `shared/tg_tools_common/delivery_contract.py`; `docs/execution-contracts.md` | The controller queues deliveries; the gateway records dispatch ownership and provider receipts. Ambiguous sends stop automatic replay. |
 | Progress snapshot | `shared/tg_tools_common/progress.py`; `docs/shared-progress.md` | Workers emit typed facts; controller snapshots own ordering and lease fencing; gateway bindings own recipients and presentation. |
+| Enrichment model | `config/enrichment.json.example`; `shared/pi_harness/roles.py` | The model of each pipeline's transcript enrichment (`episodes`, `speech`, `surveillance`) comes from one file read per job. A missing or wrong entry fails the job before any paid call; there is no fallback tier. |
 | Episode publication | `shared/episode_enrichment/`; product publishers | Upload immutable objects before publishing metadata. An uncertain episode create is resolved by exact `slug` lookup, not a blind POST retry. |
 | RSS edge | [rss-edge](rss-edge/README.md) | D1 stores episode/feed metadata; B2 retains bytes. The Worker serves feeds and private-origin objects through public delivery URLs. |
 

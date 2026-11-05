@@ -96,6 +96,7 @@ class Edge:
         self.route("POST", r"/bot[^/]+/(\w+)$", self._telegram)
         self.route("GET", r"/api/episodes$", self._episodes_get)
         self.route("POST", r"/api/episodes$", self._episodes_post)
+        self.route("PUT", r"/api/episodes/\d+$", self._episodes_put)
         edge = self
 
         class _H(BaseHTTPRequestHandler):
@@ -152,12 +153,19 @@ class Edge:
     def sent(self, method: str | None = None) -> list[dict[str, Any]]:
         return [m for m in self.telegram if method is None or m["method"] == method]
 
-    # rss-edge episode API: POST creates, GET filters by feed/slug.
+    # rss-edge episode API: POST creates, GET filters by feed/slug, PUT changes the fields it names.
     def _episodes_post(self, req: EdgeRequest) -> tuple[int, Any]:
         body = req.json()
         row = {**body, "id": sum(len(v) for v in self.episodes.values()) + 1}
         self.episodes.setdefault(body["feed"], []).append(row)
         return 201, row
+
+    def _episodes_put(self, req: EdgeRequest) -> tuple[int, Any]:
+        episode_id = int(req.path.rsplit("/", 1)[1])
+        for row in (r for rows in self.episodes.values() for r in rows if r["id"] == episode_id):
+            row.update(req.json() or {})
+            return 200, row
+        return 404, {"error": "episode not found"}
 
     def _episodes_get(self, req: EdgeRequest) -> tuple[int, Any]:
         feed = req.query.get("feed", [""])[0]

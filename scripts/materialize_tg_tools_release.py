@@ -329,6 +329,10 @@ def main(argv=None):
     parser.add_argument("--current-link")
     parser.add_argument("--promote", action="store_true")
     arguments = parser.parse_args(argv)
+    if arguments.promote:
+        code = subprocess.run(["release-guard", "tg-tools", arguments.commit]).returncode
+        if code:
+            return code
     try:
         receipt = materialize(arguments.repo, arguments.commit,
                               arguments.releases_root, arguments.promote,

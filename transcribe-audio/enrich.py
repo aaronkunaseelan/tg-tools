@@ -5,7 +5,7 @@ Writes everything into a work directory and uploads nothing. Use this to review
 output before it can reach a feed, and to re-run tuning against fixtures.
 
     ./enrich.py --audio episode.mp3 --title 'Episode title' \
-        --workdir /tmp/enrich-check --published 2026-08-03
+        --workdir /tmp/enrich-check --published 2026-08-03 --pipeline episodes
 
 Re-running against the same work directory reuses completed stages, so a Luna
 failure does not re-pay for transcription.
@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shared"))
 
 from episode_enrichment import AudioSttSource, EnrichmentError, enrich  # noqa: E402
+from pi_harness import EnrichmentConfigError, enrichment_tier  # noqa: E402
 from episode_enrichment.stt import DEFAULT_STT_MODEL  # noqa: E402
 
 log = logging.getLogger("enrich")
@@ -49,6 +50,9 @@ def main() -> int:
     parser.add_argument("--stt-model", default=DEFAULT_STT_MODEL,
                         help="mini (default) or full")
     parser.add_argument("--jobs", type=int, default=4)
+    parser.add_argument("--pipeline", required=True,
+                        help="Enrichment pipeline whose model tier to use (a key of the enrichment tier "
+                             "file, e.g. episodes, speech, surveillance)")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO,
@@ -58,6 +62,12 @@ def main() -> int:
     audio = Path(args.audio).expanduser()
     if not audio.is_file():
         log.error("audio file not found: %s", audio)
+        return 2
+
+    try:
+        tier = enrichment_tier(args.pipeline)
+    except EnrichmentConfigError as exc:
+        log.error("enrichment configuration: %s", exc)
         return 2
 
     try:
@@ -75,6 +85,7 @@ def main() -> int:
             source_url=args.source_url,
             stt_model=args.stt_model,
             jobs=args.jobs,
+            tier=tier,
         )
     except EnrichmentError as exc:
         log.error("enrichment failed at %s: %s", exc.stage, exc)

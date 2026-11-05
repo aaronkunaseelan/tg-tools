@@ -1,0 +1,6 @@
+#!/bin/sh
+# Follow Surveillance episodes through the rss-audio pipe, read only (rss-audio/surveillance_tui.py).
+# Runs from this release with the live runtime, on the import path the rss-audio units use.
+here=$(cd "$(dirname "$0")/.." && pwd -P)
+PYTHONPATH="$here/rss-audio:$here/shared:$here/transcribe-audio:$here" \
+  exec "${TG_TOOLS_PYTHON:-$HOME/.local/lib/tg-tools/runtime/bin/python}" -P "$here/rss-audio/surveillance_tui.py" "$@"

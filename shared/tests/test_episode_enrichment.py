@@ -190,10 +190,11 @@ def test_episode_names_share_one_prefix():
 def stt_tool(self_hosted):
     return SimpleNamespace(
         _load_local_env=lambda: None, ensure_dependencies=lambda: None,
-        load_self_hosted_config=lambda: object(), transcribe_self_hosted=lambda config, path: self_hosted,
+        load_self_hosted_config=lambda: object(), transcribe_self_hosted=lambda config, path, vocab=None: self_hosted,
         load_azure_openai_config=lambda: None, fetch_azure_access_token=lambda config: "token",
         resolve_transcribe_model=lambda model, config: "chain-mini", prepare_chunks=lambda path, tmp: [path],
-        transcribe_all=lambda config, token, chunks, model, jobs: TRANSCRIPT, format_transcript=lambda raw: raw)
+        transcribe_chunk_texts=lambda config, token, chunks, model, jobs, on_progress: [TRANSCRIPT],
+        CHUNK_DURATION_SEC=600, probe=lambda path: {"format": {"duration": "75"}}, format_transcript=lambda raw: raw)
 
 
 class TextSource:
@@ -219,3 +220,17 @@ def test_stt_engine(tmp_path):
     assert ensure_script(work_dir=tmp_path, source=TextSource(local)).stt_engine == label
     assert ensure_script(work_dir=tmp_path, source=TextSource(None)).stt_engine == label
     assert ensure_script(work_dir=tmp_path / "azure", source=TextSource(azure)).stt_engine is None
+
+
+def test_enrichment_without_a_model_tier_fails_before_any_speech_to_text(tmp_path):
+    """No tier and no injected runner: the caller never checked its pipeline's configuration."""
+    from episode_enrichment import enrich
+    from pi_harness import EnrichmentConfigError
+
+    class Source:
+        kind, content_origin, topic_origin, summary_origin = "audio", "stt_transcript", "luna_topics", "luna_summary"
+
+        def transcript(self):
+            raise AssertionError("paid transcription ran")
+    with pytest.raises(EnrichmentConfigError):
+        enrich(source=Source(), work_dir=tmp_path, title="T")

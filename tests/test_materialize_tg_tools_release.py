@@ -30,6 +30,15 @@ class MaterializeTgToolsReleaseTests(unittest.TestCase):
         self.git("add", ".")
         self.git("commit", "-q", "-m", "initial")
         self.commit = self.git("rev-parse", "HEAD").stdout.decode().strip()
+        # A stub release-guard first on PATH: the real one admits only the supervisor's agent.
+        self.guard = self.base / "guard"
+        self.guard.mkdir()
+        self.stub(0)
+
+    def stub(self, code):
+        stub = self.guard / "release-guard"
+        stub.write_text("#!/bin/sh\nexit %d\n" % code)
+        stub.chmod(0o755)
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -63,6 +72,7 @@ class MaterializeTgToolsReleaseTests(unittest.TestCase):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            env=dict(os.environ, PATH=os.fspath(self.guard) + os.pathsep + os.environ["PATH"]),
         )
 
     def receipt(self, result):
@@ -118,6 +128,15 @@ class MaterializeTgToolsReleaseTests(unittest.TestCase):
                          os.fspath((self.releases / self.commit).resolve()))
         self.assertTrue(receipt["promoted"])
         self.assertTrue((self.releases / self.commit).is_dir())
+
+
+    def test_refusing_release_guard_stops_promote_before_any_change(self):
+        self.stub(3)
+        result = self.invoke(promote=True)
+        self.assertEqual(result.returncode, 3)
+        self.assertFalse(self.releases.exists())
+        self.assertFalse((self.releases.parent / "current").exists())
+        self.assertEqual(self.invoke().returncode, 0)  # no promote: no guard
 
 
 if __name__ == "__main__":

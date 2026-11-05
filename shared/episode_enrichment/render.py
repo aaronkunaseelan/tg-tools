@@ -51,12 +51,13 @@ def render_notes_markdown(
     script_url: str | None = None,
     source_url: str | None = None,
     source_kind: str = "audio",
+    sections: list | None = None,
 ) -> str:
-    """Render analysis only; the complete script lives in its own document."""
-    by_heading = {
-        normalize(topic.get("heading", "")): topic.get("mentions") or []
-        for topic in (mentions.get("topics") or [])
-    }
+    """Render analysis only; the complete script lives in its own document.
+
+    ``sections`` [(label, analysis, mentions)], from a segmented enrichment, gives one ``## label``
+    section per segment; without it the layout is the single-pass one.
+    """
     lines: list[str] = [f"# {title}".rstrip(), ""]
     facts = [f"- Original published: {published or UNKNOWN_DATE}"]
     duration = _format_duration(duration_seconds)
@@ -75,8 +76,23 @@ def render_notes_markdown(
     facts.append("- Analysis: Machine-generated from the transcript" if source_kind == "audio"
                  else "- Analysis: Machine-generated from the final reader script")
     lines.extend(facts)
-    lines.extend(["", "## Summary", "", str(analysis.get("summary", "")).strip(), ""])
-    lines.extend(["## Topics", ""])
+    if sections:
+        for label, part_analysis, part_mentions in sections:
+            lines.extend(["", f"## {label}", "", str(part_analysis.get("summary", "")).strip(), ""])
+            _analysis_lines(lines, part_analysis, part_mentions, "###")
+    else:
+        lines.extend(["", "## Summary", "", str(analysis.get("summary", "")).strip(), ""])
+        _analysis_lines(lines, analysis, mentions, "##")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _analysis_lines(lines: list[str], analysis: dict, mentions: dict, level: str) -> None:
+    """The topic list and each topic's references, under ``level`` headings."""
+    by_heading = {
+        normalize(topic.get("heading", "")): topic.get("mentions") or []
+        for topic in (mentions.get("topics") or [])
+    }
+    lines.extend([f"{level} Topics", ""])
     for topic in analysis.get("topics") or []:
         lines.append(
             f"- **{topic['heading']}** — {topic['startParagraphId']} to "
@@ -86,7 +102,7 @@ def render_notes_markdown(
         topic_mentions = by_heading.get(normalize(topic["heading"]), [])
         if not topic_mentions:
             continue
-        lines.extend(["", f"## {topic['heading']}", ""])
+        lines.extend(["", f"{level} {topic['heading']}", ""])
         for mention in topic_mentions:
             entry = f"- **{_label(mention['type'])}: {mention['displayText']}**"
             referenced = str(mention.get("referencedAs") or "").strip()
@@ -95,8 +111,6 @@ def render_notes_markdown(
             lines.append(entry)
             lines.append(
                 f"  - Evidence ({mention['paragraphId']}): “{mention['evidenceQuote']}”")
-
-    return "\n".join(lines).rstrip() + "\n"
 
 
 def build_feed_description(
@@ -132,6 +146,8 @@ def build_manifest(
     roles: dict | None = None, source_kind: str = "audio",
     content_origin: str = "stt_transcript", topic_origin: str = "luna_topics",
     summary_origin: str = "luna_summary", script_sha256: str | None = None,
+    timing: dict | None = None, segments_url: str | None = None, segments: list | None = None,
+    feed_description: str | None = None,
 ) -> str:
     disclaimer = (
         "Summary, topic headings, and reference notes are machine-generated from "
@@ -156,6 +172,7 @@ def build_manifest(
             "mp3Url": mp3_url,
             "scriptUrl": script_url,
             "notesUrl": notes_url,
+            **({"segmentsUrl": segments_url} if segments_url else {}),
         },
         "script": {
             "paragraphs": len(stream),
@@ -164,6 +181,9 @@ def build_manifest(
             "scriptSha256": script_sha256,
             "sttModel": stt_model,
             "contentOrigin": content_origin,
+            # When each paragraph was spoken: basis words | segments | chunks (Azure, per 10-min chunk), or
+            # null with the reason. The times are in artifacts.segmentsUrl.
+            **({"timing": timing} if timing is not None else {}),
         },
         "transcript": {
             "paragraphs": len(stream),
@@ -185,10 +205,14 @@ def build_manifest(
             "mentionCount": sum(
                 len(topic.get("mentions") or [])
                 for topic in mentions.get("topics") or []),
+            # The parts the notes were enriched in (episode_enrichment.segments); one for a single pass.
+            **({"segments": segments} if segments is not None else {}),
         },
         "gates": reports,
         "disclaimer": disclaimer,
     }
+    if feed_description is not None:   # the episode row's description, so a later attempt can finish this one
+        payload["feedDescription"] = feed_description
     if source_kind == "script":
         payload.update({
             "sourceKind": source_kind,

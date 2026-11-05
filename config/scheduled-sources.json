@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "sources": [
+    {
+      "id": "surveillance-tv",
+      "kind": "youtube_playlist",
+      "feed": "surveillance",
+      "since": "2026-11-03",
+      "playlistId": "PLGaYlBJIOoa-qaI1saEniG3cR9V0Mu-PE",
+      "titleRegex": "^Bloomberg Surveillance \\d{1,2}/\\d{1,2}/\\d{4}$",
+      "title": "Bloomberg Surveillance TV {date}",
+      "lookbackDays": 5,
+      "preferredRoute": "oci_mullvad",
+      "segmenter": "surveillance-tv"
+    },
+    {
+      "id": "surveillance-radio",
+      "kind": "youtube_live_window",
+      "feed": "surveillance",
+      "since": "2026-11-03",
+      "videoId": "f39oHo6vFLg",
+      "timezone": "America/New_York",
+      "weekdays": [1, 2, 3, 4, 5],
+      "start": "07:00",
+      "seconds": 10800,
+      "expectOpening": "Bloomberg Surveillance",
+      "title": "Bloomberg Surveillance Radio {date}",
+      "lookbackDays": 4,
+      "settleMinutes": 15,
+      "segmenter": "surveillance-radio"
+    }
+  ]
+}

@@ -41,6 +41,14 @@ def test_publication_config_and_notification(monkeypatch):
     assert render_notification("succeeded", {"ok": True, "title": "Title", "publicAudioUrl": "audio",
                                            "scriptUrl": "script", "notesUrl": "notes", "feedUrl": "feed"}) == (
         "Posted to Example TTS:\nTitle\naudio\nScript: script\nNotes: notes\nFeed: feed")
+    root = "https://rss-feeds.stations.work/speech-" + "K" * 22
+    monkeypatch.setenv("TTS_PUBLIC_ROOT", root)
+    stored = "https://rss-feeds.stations.work/tts/episodes/ab/"
+    assert render_notification("succeeded", {"ok": True, "title": "Title", "publicAudioUrl": stored + "a.mp3",
+                                           "scriptUrl": stored + "a.script.md", "notesUrl": stored + "a.notes.md",
+                                           "feedUrl": root + "/podcast.xml"}) == (
+        f"Posted to Example TTS:\nTitle\n{root}/episodes/ab/a.mp3\nScript: {root}/episodes/ab/a.script.md\n"
+        f"Notes: {root}/episodes/ab/a.notes.md\nFeed: {root}/podcast.xml")
 
 
 @pytest.mark.parametrize("missing", [None, "", "   "])

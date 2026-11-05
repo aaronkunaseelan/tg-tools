@@ -25,7 +25,7 @@ TOPICS_ROLE = "transcript_topics"
 MENTIONS_ROLE = "transcript_mentions"
 # Calibrated worst case (1h43m episode): pass 1 108s, pass 2 448s. Headroom
 # for a slower model day, but bounded so a hung call cannot hold a job lease.
-TOPICS_TIMEOUT_S = 600
+TOPICS_TIMEOUT_S = 1800  # a 3 h Surveillance transcript (~36k tokens) on Sonnet timed out at 600 s (4 Nov)
 MENTIONS_TIMEOUT_S = 1800
 
 _FENCE_RE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.IGNORECASE)

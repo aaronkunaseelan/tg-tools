@@ -15,6 +15,8 @@ from typing import Any
 
 from telegram import Bot
 
+from tg_tools_common.lease import AttemptLease
+
 from config import Settings, load_settings, validate_settings, TRANSCRIBE_LEASE_SECONDS, transcribe_worker_id
 from download_names import _safe_download_name
 from mtproto_dl import download_file as mtproto_download
@@ -315,11 +317,24 @@ async def _finalize_unexpected(
         logger.exception("Could not finalize unmodelled failure for job %s", job_id)
 
 
-async def process_claim(*, client: RuntimeClient, settings: Settings, bot: Bot, claim: dict[str, Any]) -> None:
-    """Run one claim, guaranteeing the attempt is always finalized."""
+async def process_claim(
+    *, client: RuntimeClient, settings: Settings, bot: Bot, claim: dict[str, Any], worker_id: str | None = None,
+) -> None:
+    """Run one claim, guaranteeing the attempt is always finalized.
+
+    The attempt lease is renewed for the whole claim (it was never renewed, so
+    a job over TRANSCRIBE_LEASE_SECONDS lost it) and the same thread keeps the
+    worker's own heartbeat fresh, which the idle loop cannot do mid-job.
+    """
     tracking = _FinalizeTracking(client)
     attempt = dict(claim["attempt"])
     job = dict(claim["job"])
+    lease = AttemptLease(
+        client=client, job_id=str(job["jobId"]), attempt_id=str(attempt["attemptId"]),
+        lease_token=str(attempt["leaseToken"]), lease_seconds=TRANSCRIBE_LEASE_SECONDS,
+        worker_beat=None if worker_id is None else lambda: client.heartbeat_worker(
+            worker_id=worker_id, metadata_json={"phase": "busy", "jobId": str(job["jobId"])}),
+    ).start()
     try:
         await _execute_claim(client=tracking, settings=settings, bot=bot, claim=claim)
     except BaseException as exc:
@@ -335,6 +350,8 @@ async def process_claim(*, client: RuntimeClient, settings: Settings, bot: Bot, 
                 exc=exc,
             )
         raise
+    finally:
+        lease.close()
 
 
 async def _execute_claim(*, client: RuntimeClient, settings: Settings, bot: Bot, claim: dict[str, Any]) -> None:
@@ -511,7 +528,7 @@ async def worker_loop(settings: Settings) -> None:
                 workload_types=("transcribe_audio",),
             )
             if claim:
-                await process_claim(client=client, settings=settings, bot=bot, claim=claim)
+                await process_claim(client=client, settings=settings, bot=bot, claim=claim, worker_id=worker_id)
                 continue
         except RuntimeClientError:
             logger.exception("Runtime API unavailable; transcribe worker will retry")

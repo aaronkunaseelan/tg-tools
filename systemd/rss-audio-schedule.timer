@@ -1,0 +1,10 @@
+[Unit]
+Description=Submit scheduled rss-audio sources once a night (quiet time)
+
+[Timer]
+OnCalendar=*-*-* 01:30:00 UTC
+RandomizedDelaySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

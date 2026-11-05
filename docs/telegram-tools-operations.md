@@ -10,6 +10,7 @@ when something goes wrong.
 | rss-audio | publish topic, scribe (transcribe) topic | `tg-gateway-rss`, `rss-audio-runtime-worker`, `rss-audio-transcribe-runtime-worker` | runtime jobs/results/outbox, scribe SQLite, B2 episodes |
 | tts / x-tts | TTS topic, X-TTS topic | `tg-gateway-rss`, `tts-worker`, `tts-result-projector` | runtime jobs/results/outbox, `TTS_WORK_DIR`, B2 episodes |
 | meeting-summary | meeting topic, review replies and Accept button | `tg-gateway-ms`, `meeting-summary-runtime-worker`, `meeting-summary-result-consumer` | runtime jobs/results/outbox, `tg_meeting_summary.*` |
+| rss-audio scheduled sources (Surveillance) | none (`delivery: none`) | `rss-audio-schedule.service`, `rss-audio-schedule.timer` (01:30 UTC), same worker `rss-audio-runtime-worker` | runtime jobs/results, `config/scheduled-sources.json`, B2 `surveillance/episodes/` |
 | health (all products) | supervisor watch and mech-d | `tg-tools-telemetry.service`, `tg-tools-telemetry.timer` (5 min) | `~/.local/state/telemetry/tg-tools.json` (`telemetry/1`) |
 
 One gateway process serves one bot identity and owns all of its Telegram
@@ -58,12 +59,28 @@ git worktree add --detach /tmp/tg-release <commit>      # the script needs a cle
 python3 scripts/materialize_tg_tools_release.py --repo /tmp/tg-release \
   --commit <full-sha> --releases-root ~/.local/lib/tg-tools/releases --promote
 git worktree remove /tmp/tg-release
-cp systemd/*.service ~/.config/systemd/user/           # only if units changed
+cp systemd/*.service ~/.config/systemd/user/           # only if units changed (not the timers: see below)
 systemctl --user daemon-reload
 systemctl --user restart tg-gateway-rss tg-gateway-ms rss-audio-runtime-worker \
   rss-audio-transcribe-runtime-worker meeting-summary-runtime-worker \
   meeting-summary-result-consumer tts-worker tts-result-projector
 ```
+
+**Preconditions of a release that changes enrichment or adds a unit.** Each must hold before the
+workers restart on the new code; otherwise every rss-audio and TTS job fails terminally with
+`enrichment_config` (Telegram jobs included, and X-TTS reader roles).
+
+1. `~/.config/tg-tools/enrichment.json` is installed (`config/enrichment.json.example`). The workers
+   read it per job and there is no fallback tier; check with `ls ~/.config/tg-tools/enrichment.json`.
+2. No live `TTS_PI_ROLES_FILE` sets `tier`, `provider` or `model` on `transcript_topics` or
+   `transcript_mentions`, and none redefines the tier the enrichment file chooses in its `models`
+   object. Remove them from the roles files (if a file name is a content hash, repoint the
+   `TTS_PI_ROLES_FILE` line in the env file). No tier may resolve to `openai-codex`.
+3. A `.timer` is copied by hand (`cp systemd/rss-audio-schedule.timer ~/.config/systemd/user/`, then
+   `daemon-reload`): the `cp systemd/*.service` line above does not copy it, and neither the release
+   script nor a restart enables it. Enable it as its own, deliberate step, after one real window has
+   run by hand in daylight (`systemctl --user start rss-audio-schedule.service`).
+4. `lane-alert@.service` is installed (see rss-audio scheduled sources below).
 
 Apply new `tg-gateway/migrations/*.sql` (numbered, each applied once) with
 `psql -d runtime_controller -f` before restarting. Back up the affected schema
@@ -221,8 +238,9 @@ route bindings), `/feed`, `/list`, `/delete <slug>`, `/queue`,
 
 - **Publish topic**: a URL or audio becomes an `rss_publish` job: source audio
   (service-host proxy route first, remote download host as fallback), MP3, B2 upload,
-  episode row on rss-edge. Enrichment (script and notes) is optional unless
-  `RSS_AUDIO_ENRICHMENT_REQUIRED=true`; without it the audio still publishes.
+  episode row on rss-edge, with the speech-to-text script when there is one (the
+  confirmation links it). Notes follow in a separate notes job that adds them to the
+  live episode and sends nothing. Speech-to-text failing still publishes the audio.
 - **Scribe topic**: a non-reply URL or audio starts a document and returns
   `v001` as `.md`. Replying to any linked message (source, append, status or a
   returned document) with text, audio or a URL appends and returns the next
@@ -234,6 +252,27 @@ Source routes have no defaults: a missing `RSS_AUDIO_MULLVAD_PROXY`,
 startup. If downloads fail, check `yt-dlp`, `ffmpeg`, the proxy container and
 the remote download route; if publication fails, check `rclone`, `RSS_AUDIO_API_TOKEN` and
 the fail log.
+
+### Scheduled sources (Surveillance)
+
+`rss-audio-schedule.service` (timer 01:30 UTC) submits what is due and prints one line per item (see
+`rss-audio/README.md`). It exits nonzero when a source cannot be listed or an item failed, and then
+`OnFailure=lane-alert@%n.service` raises the alert.
+
+- **A skipped day wakes the supervisor, who checks it (X-75).** `window_not_show` (the stream carried
+  another programme) prints `skipped (window_not_show: <what was heard>)` and the scheduler exits 0;
+  the dead job turns tg-tools telemetry red for its 6 h window, which wakes the supervisor. Read the
+  heard text (`journalctl --user -u rss-audio-schedule -n 20`) to tell a holiday from an STT or intro
+  change.
+- **One alert per lost item.** A dead item is a failure only on the first run that sees it dead (it
+  ended within 36 h); later runs print it as `(reported by an earlier run)` and exit 0. A skipped night
+  of the timer (Persistent catches up once) can therefore miss that alert: the line is still printed.
+- **`lane-alert@` is not tg-tools'.** `lane-alert@.service` is installed by the reading lane in
+  `~/.config/systemd/user/` and runs `~/.local/lib/reading/current/bin/alert`, which messages the agent
+  named in `project-folder/reading/supervisor.id`. tg-tools neither ships nor tests that unit
+  (its test only checks the `OnFailure=` text). If the reading lane changes its release layout or gets
+  its own agent id, scheduled-source failures go to the wrong agent or nowhere: change the
+  `OnFailure=` of `rss-audio-schedule.service` in the same step.
 
 ## meeting-summary
 
@@ -290,6 +329,9 @@ speech spend, and the user is asked to upload the file.
   `shared/pi_harness/roles.py`, overridden by the JSON profile in
   `TTS_PI_ROLES_FILE`; a role resolves to `claude -p` (subscription login, API
   keys stripped) or `pi -p` (Codex OAuth). Startup checks every provider's auth.
+  The notes model (transcript topics and mentions) is the `speech` tier of
+  `~/.config/tg-tools/enrichment.json`, read per job; a missing entry fails the job
+  (`enrichment_config`) and startup logs it as a warning.
 - **Projector**: `tts-result-projector` is the only consumer of `tts`/`x-tts`
   results: it appends one stable-key delivery, then consumes the result.
 - **Work state**: `TTS_WORK_DIR` holds per-source retry state

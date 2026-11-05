@@ -22,6 +22,7 @@ from tts_common.materialise import materialise
 from tts_common.speech_text import artifact_to_speech_text
 from tts_common import typed_fetch
 
+from pi_harness import EnrichmentConfigError, enrichment_tier
 from .acquire import AcquireError, acquire_source
 from episode_enrichment import (EpisodeNamingMetadata, PlainScriptSource,
                                 ScriptSource, build_episode_names, enrich,
@@ -164,6 +165,12 @@ def _execute_job_in_root(
             validate_voice(engine, voice)
         except ValueError as exc:
             raise TTSJobError("admission", "voice_invalid", str(exc)) from exc
+        # The notes model comes from the enrichment tier file, read once for this job and checked
+        # here, before any download or paid call. A problem is terminal, never a quiet fallback.
+        try:
+            notes_tier = enrichment_tier("speech")
+        except EnrichmentConfigError as exc:
+            raise TTSJobError("admission", "enrichment_config", str(exc)) from exc
         _cancel()
         stage = "acquire"
         try:
@@ -440,6 +447,7 @@ def _execute_job_in_root(
                 script_url=f"{public_root}/{names.script_name}",
                 source_url=str(input_json.get("sourceUrl") or acquired.source_ref),
                 runner_factory=(lambda role: pi_runner_factory(role)) if pi_runner_factory else None,
+                tier=notes_tier,
             )
         except LeaseLost:
             raise
@@ -484,6 +492,7 @@ def _execute_job_in_root(
                 script_url=f"{public_root}/{names.script_name}",
                 source_url=str(input_json.get("sourceUrl") or acquired.source_ref),
                 runner_factory=(lambda role: pi_runner_factory(role)) if pi_runner_factory else None,
+                tier=notes_tier,
             )
             script_document = work / names.script_name
             notes_document = work / names.notes_name

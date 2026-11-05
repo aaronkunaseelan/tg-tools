@@ -11,9 +11,10 @@ from pathlib import Path
 from typing import Any
 from tg_tools_common.progress import current_progress, tracked_stage
 
-from . import render
+from . import render, timing as timing_mod
 from .luna import EnrichmentModelError, MENTIONS_ROLE, TOPICS_ROLE, run_mentions, run_topics
 from .paragraphs import ParagraphStream, build_stream, stream_from_json
+from .segments import Segment, check_segments, single_segment, substream
 from .source import AudioSttSource, TranscriptSource
 from .stt import DEFAULT_STT_MODEL, TranscriptionError
 from .validate import validate_topics
@@ -24,6 +25,10 @@ SCRIPT_FILE = "script.md"
 SCRIPT_HASH_FILE = "script.sha256"
 # The self-hosted engine that wrote script.md, so a resumed job still records it.
 STT_ENGINE_FILE = "stt-engine.txt"
+# What speech-to-text said about when words were spoken (episode_enrichment.timing), so a resumed job
+# still publishes the timed transcript, and that artifact itself (uploaded as <prefix>.segments.json).
+TIMING_FILE = "timing.json"
+TIMED_FILE = "segments.json"
 PARAGRAPHS_FILE = "paragraphs.json"
 ANALYSIS_FILE = "analysis.json"
 MENTIONS_FILE = "mentions.json"
@@ -47,6 +52,8 @@ class PreparedScript:
     sha256: str
     source: TranscriptSource
     stt_engine: str | None = None
+    timed_transcript: str | None = None   # segments.json text, None without timings
+    timing: dict = field(default_factory=lambda: timing_mod.no_timing("not speech-to-text"))  # manifest summary
 
 
 @dataclass
@@ -59,6 +66,7 @@ class EnrichmentResult:
     analysis: dict
     mentions: dict
     reports: dict = field(default_factory=dict)
+    timed_transcript: str | None = None
 
     @property
     def topic_count(self) -> int:
@@ -91,6 +99,37 @@ def _sha256(text: str) -> str:
 def _invalidate_dependents(work_dir: Path) -> None:
     for name in _DEPENDENT_CHECKPOINTS:
         (work_dir / name).unlink(missing_ok=True)
+    for pattern in ("topics-*.json", "mentions-*.json"):   # per-segment call caches
+        for path in work_dir.glob(pattern):
+            path.unlink(missing_ok=True)
+
+
+def checkpointed_script(work_dir: str | Path) -> str | None:
+    """The script a work dir holds when its checkpoint is whole (script.md matches script.sha256), else None.
+
+    A failed enrichment still publishes this script: the transcript cost a paid or slow STT run, and the
+    work dir is swept.
+    """
+    work = Path(work_dir)
+    try:
+        text = (work / SCRIPT_FILE).read_text(encoding="utf-8")
+        digest = (work / SCRIPT_HASH_FILE).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return text if text.strip() and _sha256(text) == digest else None
+
+
+def checkpointed_timed_transcript(work_dir: str | Path) -> str | None:
+    """segments.json when it belongs to the work dir's whole script checkpoint, else None."""
+    work = Path(work_dir)
+    if checkpointed_script(work) is None:
+        return None
+    try:
+        text = (work / TIMED_FILE).read_text(encoding="utf-8")
+        digest = (work / SCRIPT_HASH_FILE).read_text(encoding="utf-8").strip()
+        return text if json.loads(text).get("scriptSha256") == digest else None
+    except (OSError, ValueError, AttributeError):
+        return None
 
 
 @tracked_stage("transcript_ready", lambda r: {"words": len(r.text.split())})
@@ -115,6 +154,9 @@ def ensure_script(*, work_dir: str | Path, source: TranscriptSource | None = Non
         text = existing
         engine_path = work / STT_ENGINE_FILE
         stt_engine = engine_path.read_text(encoding="utf-8").strip() if engine_path.is_file() else None
+        timing = (_read_json(work / TIMING_FILE) or timing_mod.no_timing("the timing checkpoint is unreadable")) \
+            if (work / TIMING_FILE).is_file() else \
+            timing_mod.no_timing("the script checkpoint has no timings (transcribed before they were kept)")
     else:
         try:
             text = source.transcript()
@@ -123,6 +165,8 @@ def ensure_script(*, work_dir: str | Path, source: TranscriptSource | None = Non
         except (TypeError, ValueError, OSError) as exc:
             raise EnrichmentError("script", str(exc)) from exc
         stt_engine = getattr(text, "stt_engine", None)
+        timing = (getattr(text, "timing", None) or timing_mod.no_timing("speech-to-text returned no timings")) \
+            if getattr(source, "kind", "audio") == "audio" else None
     if not isinstance(text, str) or not text.strip():
         raise EnrichmentError("script", "script contains no text")
 
@@ -137,7 +181,18 @@ def ensure_script(*, work_dir: str | Path, source: TranscriptSource | None = Non
         _atomic_write(work / STT_ENGINE_FILE, stt_engine + "\n")
     else:
         (work / STT_ENGINE_FILE).unlink(missing_ok=True)
-    return PreparedScript(text=text, path=script_path, sha256=digest, source=source, stt_engine=stt_engine)
+    if timing is None:   # a script source (reader speech): nothing was spoken to time
+        (work / TIMING_FILE).unlink(missing_ok=True)
+        timed, summary = None, timing_mod.no_timing("not speech-to-text")
+    else:
+        _atomic_write(work / TIMING_FILE, json.dumps(timing, ensure_ascii=False))
+        timed, summary = timing_mod.build(text, timing)
+    if timed:
+        _atomic_write(work / TIMED_FILE, timed)
+    else:
+        (work / TIMED_FILE).unlink(missing_ok=True)
+    return PreparedScript(text=text, path=script_path, sha256=digest, source=source, stt_engine=stt_engine,
+                          timed_transcript=timed, timing=summary)
 
 
 @tracked_stage("prepare_paragraphs")
@@ -158,9 +213,8 @@ def _stage_stream(work_dir: Path, script: PreparedScript) -> ParagraphStream:
 
 
 @tracked_stage("topic_analysis", lambda r: {"topics": len(r[0].get("topics") or [])})
-def _stage_topics(work_dir: Path, stream: ParagraphStream, runner_factory,
+def _stage_topics(path: Path, stream: ParagraphStream, runner_factory,
                   source: TranscriptSource, preknown_topics=None) -> tuple[dict, dict]:
-    path = work_dir / ANALYSIS_FILE
     cached = _read_json(path) if path.exists() else None
     if cached and cached.get("topics") and validate_topics(stream, cached).ok:
         current_progress().emit("topic_checkpoint", "reused", reason="checkpoint_reused")
@@ -192,9 +246,8 @@ def _stage_topics(work_dir: Path, stream: ParagraphStream, runner_factory,
 
 
 @tracked_stage("reference_extraction", lambda r: {"references": sum(len(t.get("mentions") or []) for t in r[0].get("topics") or [])})
-def _stage_mentions(work_dir: Path, stream: ParagraphStream, analysis: dict,
+def _stage_mentions(path: Path, stream: ParagraphStream, analysis: dict,
                     runner_factory, source_kind="audio") -> tuple[dict, dict]:
-    path = work_dir / MENTIONS_FILE
     cached = _read_json(path) if path.exists() else None
     if cached and isinstance(cached.get("topics"), list):
         current_progress().emit("reference_checkpoint", "reused", reason="checkpoint_reused")
@@ -213,10 +266,43 @@ def _stage_mentions(work_dir: Path, stream: ParagraphStream, analysis: dict,
     return mentions, payload
 
 
-def default_runner_factory(work_dir: Path):
+def _segments(stream: ParagraphStream, script: PreparedScript, segmenter, context, topics) -> list[Segment]:
+    """The segmenter's segments, checked to cover the stream once, in order."""
+    if segmenter is None:
+        return single_segment(stream, None, context or {})
+    timed = json.loads(script.timed_transcript) if script.timed_transcript else None
+    try:
+        segments = segmenter(stream, timed, dict(context or {}))
+    except (TypeError, ValueError, KeyError) as exc:
+        raise EnrichmentError("segments", f"segmenter failed: {exc}") from exc
+    errors = check_segments(stream, segments)
+    if errors:
+        raise EnrichmentError("segments", "; ".join(errors))
+    if len(segments) > 1 and (topics or getattr(script.source, "has_preknown_topics", False)):
+        raise EnrichmentError("segments", "a script with preknown topics is enriched in one segment")
+    return segments
+
+
+def _assemble(parts) -> tuple[dict, dict]:
+    """One analysis and one mentions document from the segments' (one segment: unchanged)."""
+    if len(parts) == 1:
+        return parts[0][1], parts[0][2]
+    summary = "\n\n".join(f"{seg.label}: {str(a.get('summary', '')).strip()}" for seg, a, _, _, _ in parts)
+    topics = [topic for _, a, _, _, _ in parts for topic in a.get("topics") or []]
+    mentions = [topic for _, _, m, _, _ in parts for topic in m.get("topics") or []]
+    return {"summary": summary, "topics": topics}, {"topics": mentions}
+
+
+def default_runner_factory(work_dir: Path, tier: str | None):
+    """Runners for the two transcript roles on ``tier`` (from ``pi_harness.enrichment_tier``).
+
+    There is no default tier: a caller without one has not checked its pipeline's configuration.
+    """
     def factory(role: str):
-        from pi_harness import PiRunner
-        return PiRunner(role=role, cwd=str(work_dir))
+        from pi_harness import EnrichmentConfigError, PiRunner
+        if not tier:
+            raise EnrichmentConfigError("enrichment ran without a model tier")
+        return PiRunner(role=role, cwd=str(work_dir), tier=tier)
     return factory
 
 
@@ -227,20 +313,41 @@ def enrich_script(
     mp3_url: str | None = None, notes_url: str | None = None,
     script_url: str | None = None, source_url: str | None = None,
     stt_model: str = DEFAULT_STT_MODEL, topics: list | None = None,
-    runner_factory=None,
+    runner_factory=None, tier: str | None = None, segments_url: str | None = None,
+    segmenter=None, segment_context: dict | None = None,
 ) -> EnrichmentResult:
+    """Enrich ``script``. ``segmenter`` (episode_enrichment.segments) splits it into parts that are
+    enriched one at a time; the default is one segment, today's single pass."""
     work = Path(work_dir)
     work.mkdir(parents=True, exist_ok=True)
-    runner_factory = runner_factory or default_runner_factory(work)
+    runner_factory = runner_factory or default_runner_factory(work, tier)
     reports: dict[str, Any] = {"script": {
         "ok": True, "sha256": script.sha256,
         "origin": getattr(script.source, "content_origin", "unknown")}}
     stream = _stage_stream(work, script)
-    analysis, reports["topics"] = _stage_topics(
-        work, stream, runner_factory, script.source, topics)
     source_kind = getattr(script.source, "kind", "audio")
-    mentions, reports["mentions"] = _stage_mentions(
-        work, stream, analysis, runner_factory, source_kind)
+    segments = _segments(stream, script, segmenter, segment_context, topics)
+    parts = []
+    for segment in segments:
+        part = substream(stream, segment) if len(segments) > 1 else stream
+        # Each call is cached by the text it ran on, so a retry reuses every finished segment.
+        key = part.stream_sha256[:12]
+        where = f"{segment.label}: " if segment.label else ""
+        try:
+            seg_analysis, topic_report = _stage_topics(
+                work / f"topics-{key}.json", part, runner_factory, script.source, topics)
+            seg_mentions, mention_report = _stage_mentions(
+                work / f"mentions-{key}.json", part, seg_analysis, runner_factory, source_kind)
+        except EnrichmentError as exc:
+            raise EnrichmentError(exc.stage, where + str(exc)) from exc
+        parts.append((segment, seg_analysis, seg_mentions, topic_report, mention_report))
+    analysis, mentions = _assemble(parts)
+    if len(parts) == 1:
+        reports["topics"], reports["mentions"] = parts[0][3], parts[0][4]
+    else:
+        reports["segments"] = [{"label": seg.label, "topics": t, "mentions": m} for seg, _, _, t, m in parts]
+    _atomic_write(work / ANALYSIS_FILE, json.dumps(analysis, ensure_ascii=False, indent=1))
+    _atomic_write(work / MENTIONS_FILE, json.dumps(mentions, ensure_ascii=False, indent=1))
 
     script_markdown = render.render_script_markdown(script.text)
     if _sha256(script_markdown) != script.sha256:
@@ -248,7 +355,8 @@ def enrich_script(
     notes_markdown = render.render_notes_markdown(
         stream=stream, analysis=analysis, mentions=mentions, title=title,
         published=published, duration_seconds=duration_seconds, mp3_url=mp3_url,
-        script_url=script_url, source_url=source_url, source_kind=source_kind)
+        script_url=script_url, source_url=source_url, source_kind=source_kind,
+        sections=[(seg.label, a, m) for seg, a, m, _, _ in parts] if len(parts) > 1 else None)
     description = render.build_feed_description(
         analysis=analysis, published=published, duration_seconds=duration_seconds,
         mp3_url=mp3_url, notes_url=notes_url, script_url=script_url,
@@ -265,6 +373,10 @@ def enrich_script(
         topic_origin=getattr(script.source, "topic_origin", "luna_topics"),
         summary_origin=getattr(script.source, "summary_origin", "luna_summary"),
         script_sha256=script.sha256,
+        timing=script.timing,
+        segments_url=segments_url if script.timed_transcript else None,
+        segments=[segment.to_json() for segment in segments],
+        feed_description=description,
     )
     _atomic_write(work / SCRIPT_FILE, script_markdown)
     _atomic_write(work / NOTES_FILE, notes_markdown)
@@ -273,7 +385,8 @@ def enrich_script(
     return EnrichmentResult(
         script_markdown=script_markdown, notes_markdown=notes_markdown,
         manifest=manifest, description=description, stream=stream,
-        analysis=analysis, mentions=mentions, reports=reports)
+        analysis=analysis, mentions=mentions, reports=reports,
+        timed_transcript=script.timed_transcript)
 
 
 def enrich(
@@ -283,8 +396,14 @@ def enrich(
     mp3_url: str | None = None, notes_url: str | None = None,
     script_url: str | None = None, source_url: str | None = None,
     stt_model: str = DEFAULT_STT_MODEL, jobs: int = 4, topics: list | None = None, runner_factory=None,
+    tier: str | None = None, segments_url: str | None = None,
+    segmenter=None, segment_context: dict | None = None,
 ) -> EnrichmentResult:
     """Ensure a script, then enrich exactly that script."""
+    if runner_factory is None and not tier:
+        # Before the paid speech-to-text step, not after it.
+        from pi_harness import EnrichmentConfigError
+        raise EnrichmentConfigError("enrichment ran without a model tier")
     script = ensure_script(work_dir=work_dir, source=source, audio_path=audio_path,
                            stt_model=stt_model, jobs=jobs)
     return enrich_script(
@@ -292,4 +411,5 @@ def enrich(
         published=published, date_basis=date_basis,
         duration_seconds=duration_seconds, mp3_url=mp3_url,
         notes_url=notes_url, script_url=script_url, source_url=source_url,
-        stt_model=stt_model, topics=topics, runner_factory=runner_factory)
+        stt_model=stt_model, topics=topics, runner_factory=runner_factory, tier=tier,
+        segments_url=segments_url, segmenter=segmenter, segment_context=segment_context)

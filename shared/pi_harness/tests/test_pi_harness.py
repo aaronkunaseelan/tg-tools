@@ -27,7 +27,7 @@ from pi_harness.runner import LOG_OVERFLOW_EXIT, pruned_env, run_contained
 @pytest.mark.parametrize("override, role, expected", [
     (None, "write", {"provider": "claude"}),
     ({"write": {"model": "replacement"}}, "write", {"provider": "claude", "model": "replacement"}),
-    ({"models": {"haiku": {"model": "next-haiku"}}, "transcript_topics": {"tier": "haiku"}}, "transcript_topics",
+    ({"models": {"haiku": {"model": "next-haiku"}}, "review": {"tier": "haiku"}}, "review",
      {"provider": "claude", "model": "next-haiku"}),
     ({"review": {"tier": "opus"}}, "review", {"model": "claude-opus-5-5"}),
     ({"write": {"provider": "openai-codex", "model": "pinned"}}, "write", {"provider": "openai-codex", "model": "pinned"}),

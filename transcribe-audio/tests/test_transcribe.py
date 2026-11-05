@@ -7,7 +7,8 @@
 | ""                         | transcribe-full   | transcribe-full   |
 | custom-deployment          | -                 | custom-deployment |
 format_transcript: spacing before punctuation fixed, long text split into paragraphs, unpunctuated text wrapped
-self-hosted: no URL -> None | whole file posted with model + bearer -> (text, model@engine)
+self-hosted: no URL -> None | whole file posted with model + bearer + verbose_json -> (text, model@engine, timings)
+             | a server that sends no words/segments -> timings {"words": None, "segments": None}
              | HTTP 500, unreachable, over the size cap -> None (the caller falls back to Azure)
 """
 import http.server
@@ -47,14 +48,19 @@ def test_format_transcript():
     assert len(transcribe.format_transcript("word " * 220).split("\n\n")) == 3
 
 
+WORDS = [{"word": "Hello", "start": 0.4, "end": 0.7}, {"word": "there.", "start": 0.7, "end": 1.1}]
+
+
 class SelfHosted(http.server.BaseHTTPRequestHandler):
     seen: dict = {}
 
     def do_POST(self):
         body = self.rfile.read(int(self.headers["Content-Length"]))
         SelfHosted.seen = {"path": self.path, "auth": self.headers["Authorization"], "body": body}
-        code, reply = (500, {"error": "down"}) if b"fail" in body else (
-            200, {"text": " Hello there. ", "model": "parakeet-ultra", "engine": "fluidaudio-0.18.0"})
+        reply = {"text": " Hello there. ", "model": "parakeet-ultra", "engine": "fluidaudio-0.18.0"}
+        if b"verbose_json" in body and b"legacy" not in body:
+            reply.update(words=WORDS, segments=[{"id": 0, "start": 0.4, "end": 1.1, "text": "Hello there."}])
+        code, reply = (500, {"error": "down"}) if b"fail" in body else (200, reply)
         data = json.dumps(reply).encode()
         self.send_response(code)
         self.send_header("Content-Length", str(len(data)))
@@ -78,10 +84,18 @@ def test_self_hosted(monkeypatch, tmp_path):
     audio = tmp_path / "a.mp3"
     audio.write_bytes(b"\x00\xffaudio")
     try:
-        assert transcribe.transcribe_self_hosted(config, str(audio)) == ("Hello there.", "parakeet-ultra@fluidaudio-0.18.0")
+        text, label, timings = transcribe.transcribe_self_hosted(config, str(audio))
+        assert (text, label, timings["words"], len(timings["segments"])) == (
+            "Hello there.", "parakeet-ultra@fluidaudio-0.18.0", WORDS, 1)
+        assert b'name="response_format"\r\n\r\nverbose_json\r\n' in SelfHosted.seen["body"]
+        assert b'name="vocab"' not in SelfHosted.seen["body"]      # the CLI and meeting-summary keep the default
+        transcribe.transcribe_self_hosted(config, str(audio), vocab="none")
+        assert b'name="vocab"\r\n\r\nnone\r\n' in SelfHosted.seen["body"]
         assert (SelfHosted.seen["path"], SelfHosted.seen["auth"]) == ("/v1/audio/transcriptions", "Bearer tok")
         assert b'name="model"\r\n\r\nparakeet-ultra\r\n' in SelfHosted.seen["body"]
         assert b"\r\n\x00\xffaudio\r\n" in SelfHosted.seen["body"]
+        audio.write_bytes(b"legacy")
+        assert transcribe.transcribe_self_hosted(config, str(audio))[2] == {"words": None, "segments": None}
         audio.write_bytes(b"fail")
         assert transcribe.transcribe_self_hosted(config, str(audio)) is None
     finally:

@@ -4,7 +4,7 @@ import logging
 from tg_tools_common.runtime_contract import TERMINAL_RESULT_KINDS
 
 from pipeline import render_completion_message
-from runtime_jobs import confirmation_delivery_payload
+from runtime_jobs import confirmation_delivery_payload, delivery_disabled
 
 log = logging.getLogger(__name__)
 
@@ -29,6 +29,10 @@ class RSSResultProjector:
         job = self.client.get_job(job_id=result["jobId"])["job"]
         if job["resultOwner"] != "rss-audio" or job["jobId"] != result["jobId"]:
             raise ValueError("result/job owner mismatch")
+        if delivery_disabled(job.get("inputJson") or {}):
+            # Nothing to deliver; the result is still consumed so it does not come back every cycle.
+            self.client.consume_result(result_id=result["resultId"], result_owner="rss-audio")
+            return
         output = result.get("resultJson") or {}
         text = output.get("completionHtml") or self._fallback_text(result["resultKind"], output)
         self.client.append_delivery(confirmation_delivery_payload(

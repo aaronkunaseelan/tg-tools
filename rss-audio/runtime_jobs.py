@@ -22,6 +22,11 @@ class DeliveryTargetMissing(ValueError):
     """
 
 
+def delivery_disabled(input_json: dict[str, Any]) -> bool:
+    """A job submitted with ``"delivery": "none"`` (scheduled sources) has no Telegram confirmation."""
+    return input_json.get("delivery") == "none"
+
+
 def message_reference(input_json: dict[str, Any]) -> dict[str, Any]:
     """Validate and normalise the Telegram reply target.
 

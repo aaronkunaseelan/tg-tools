@@ -1,6 +1,10 @@
-# rss-edge recovered Worker
+# rss-feeds Worker (recovered rss-edge bundle)
 
-Cloudflare service `rss-b2-proxy` was renamed in place to `rss-edge` on 2026-08-29. The sole RSS delivery hostname is `https://rss-edge.05802.workers.dev`. The `rss.stations.work/*` Worker route was removed on 2026-09-26; existing subscriptions to that hostname now fail rather than redirect.
+Cloudflare service `rss-b2-proxy` was renamed in place to `rss-edge` on 2026-08-29, and to `rss-feeds` on 2026-11-03 (cloudflare P5b). Its one hostname is `https://rss-feeds.stations.work` (custom domain in `wrangler.toml`); `workers_dev` and preview URLs are off.
+
+**Podcasts are served only under a keyed path**, `/<name>-<key>/`: `/<name>-<key>/podcast.xml` is the feed and `/<name>-<key>/<path>` the B2 object `<prefix>/<path>`. An object whose path ends in `page.html` (an episode's reader page, X-76; its URL is the episode's `page_url`, which when set is the item's `<link>`, before `md_url` and the MP3) is passed through unchanged as `text/html; charset=utf-8` with `Content-Security-Policy: sandbox` (no scripts, opaque origin: `/admin` keeps its API token in this origin's `localStorage`). The table is `PODCASTS` in `src/index.js`: `episodes` (D1 feed `audio`, B2 `audio/`), `speech` (feed `tts`, B2 `tts/`) and `skeptic-tank` (a static `podcast.xml` in B2 `skeptic-tank/`). Keys live only in the Worker secret `FEED_KEYS` (`name=key` pairs, comma-separated, 22–64 URL-safe characters) and the owner's 0600 configs; a podcast without a valid key is not served. Bare storage paths (`/audio/…`, `/tts/…`, `/skeptic-tank/…`), `archive/`, `_thrptest/` and every other path are 404, with no redirect. Stored URLs on any of this Worker's past or present hosts, in fields and inside description text, are rewritten to the keyed path when a feed is rendered, so D1 doesn't change. Feeds carry `<itunes:block>yes</itunes:block>` so podcast directories don't list them. To rotate a key, change `FEED_KEYS` and resubscribe; the stored feed copies rebuild because their ETag includes a fingerprint of the key.
+
+On `rss-feeds.stations.work`, a single-segment path matching `[a-z0-9-]{8,80}` exactly (no `.xml` suffix) is a reader feed: the private bucket's `reader/<slug>` object, through the same authenticated origin proxy, with generated-feed caching (`public, s-maxage=300, max-age=60`). Besides the keyed podcasts, only `/webfeeds/…` and `/reader/…` come straight from B2; `/api/`, `/admin`, `/newsl` and `/healthz` are routed as below.
 
 The source was originally recovered from deployed Cloudflare Worker version `152dfe04-d088-4580-997c-48e6d9f6b263` on 2026-07-20 because the original source repository was unavailable.
 
@@ -81,12 +85,56 @@ in D1 `feed_gz` (migrations `0002`; `0001`'s plain `feed_xml` was dropped by `00
 decoding a 930 KB row cost 7–14 ms). A feed GET reads that one row and returns the stored
 bytes with the same ETag as before: as-is with `Content-Encoding: gzip` when the client
 accepts gzip, decompressed otherwise (`Vary: Accept-Encoding`). No per-request render over
-every episode row. Any successful API write (`POST`/`PUT`/`DELETE` under `/api/`) drops the stored
-copies and the next GET rebuilds. A copy older than a day, or from another presentation
+every episode row. A successful API episode write drops the stored copy of that episode's feed
+(both feeds, for an update that moves it) and a feed edit (`/api/feeds/<id>`) drops that feed's;
+the other feeds' copies stay, and the next GET rebuilds. A copy older than a day, or from another presentation
 version (`FEED_PRESENTATION`, the ETag's presentation key), is checked again: unchanged
 sources keep their bytes, so D1 edits made outside the API appear within a day.
 `<pubDate>`/`<lastBuildDate>` on the channel are the build time, not the request time.
 Publishers and the episode API are unchanged; `rss-episodes` stays the episode store.
+
+Generated feeds list every non-blocked episode, newest first (X-71 amendment, 2026-11-04: the
+40-item cap is gone). Each episode's `<item>` is rendered once, when the API creates or updates
+it, and stored in D1 `feed_items` (migration `0005`) with the presentation version, a fingerprint
+of what the item takes from its feed (keyed root, logo, author) and the episode's `updated_at`. A
+rebuild joins the stored items under a freshly built channel header; an item missing or differing
+on any of those three is rendered then and stored, so a key rotation, presentation bump or feed
+author/logo edit renders every item once, and an edit made in D1 outside the API is picked up as
+long as it bumps `updated_at`. `generateXml` (every item rendered now) is the reference the stored
+path must equal byte for byte. The API delete removes the episode's item; a row deleted outside the
+API leaves an unread `feed_items` row. The stored copy of the full Episodes feed (177 episodes,
+4 Nov) is 176 KB of base64 gzip, under a tenth of D1's 2 MB row limit, ~1 KB per item.
+
+The fragment step can never fail a write: after the episode row is committed, a failed fragment
+render or delete is logged and the fragment dropped (or left, where it no longer matches the row's
+`updated_at`), and the stored feed copy is dropped regardless. Fragments are upserted in chunks of
+about 200 KB (UTF-8 bytes of the JSON), so a first render that is killed keeps what it stored and the
+next one renders only the rest. An item's context also fingerprints every podcast's key, so any key
+rotation re-renders every fragment once.
+
+**Known race (accepted):** `updated_at` has one-second resolution. Two API writes to the same
+episode within the same second can leave the stored fragment holding the first write's render with
+a `source_updated_at` equal to the row's, so the rebuild does not see it as stale and the feed shows
+the first write's fields until the episode is next edited, the presentation version bumps or a key
+rotates. The notes job makes one write per episode; two writers to one episode in one second is
+the case. Closing it would take a monotonic `revision` column or a hash of the rendered fields.
+
+## Deploy: migration 0005 first
+
+Migration `0005-feed-items.sql` (the `feed_items` table and `episodes.page_url`) must be on the
+database before the Worker that reads it is deployed: without it every generated feed fails to
+rebuild (`no such table: feed_items`) and every API write hits the fragment step's error path.
+Apply it with `wrangler d1 execute rss-episodes --remote --file migrations/0005-feed-items.sql`
+(through `worker-deps.py wrangler`), not `migrations apply`: earlier migrations went in with
+`execute`, so `d1_migrations` doesn't list them, and `migrations apply` would replay 0001–0004 and
+asks for confirmation. Then verify both exist, and only then deploy:
+
+    SELECT name FROM sqlite_master WHERE name = 'feed_items';
+    SELECT page_url FROM episodes LIMIT 1;
+
+The migration is not idempotent (`ALTER TABLE ... ADD COLUMN`): if the execute fails after the
+`CREATE TABLE`, check whether `page_url` exists before running it again. Rolling back to the
+previous Worker after 0005 is safe: the old code ignores `feed_items` and `page_url`.
 
 ## Listener description layout
 
@@ -106,7 +154,7 @@ Publisher HTML outside the recognized generated contract is not summarized.
 `description` and `content:encoded` carry simple HTML; `itunes:summary` has a
 separately rendered plain-text fallback with labelled URLs, not stripped link labels.
 URLs deduplicate after legacy delivery-host canonicalization, preserving meaningful
-queries/fragments. The feed ETag includes `listener-description-v2`; increment this
+queries/fragments. The feed ETag includes the presentation key (`FEED_PRESENTATION` in `src/index.js`); increment this
 presentation key whenever output changes so unchanged D1 metadata cannot cause a
 stale 304. Pocket Casts' server-side/app cache may still delay existing episode updates.
 

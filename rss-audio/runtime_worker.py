@@ -12,7 +12,7 @@ import shutil
 import signal
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from urllib.parse import urlsplit, unquote
 from typing import Any
@@ -26,18 +26,27 @@ from download_names import _safe_download_name
 from exit_rotation import ExitRotator
 from mtproto_dl import download_file as mtproto_download
 from mtproto_dl import ensure_mtproto_ready, needs_mtproto
+import live_window
+import notes_job
+import rebuild
 from pipeline import (
+    DEFAULT_OPTIONS,
+    JobOptions,
     PipelineError,
+    enrichment_preflight,
     fetch_metadata,
     ingest_direct_audio_url,
+    ingest_live_window,
     ingest_local_audio,
     ingest_url_with_metadata,
+    job_options,
     render_completion_message,
 )
 from runtime_client import RuntimeClient, RuntimeClientError
 from runtime_jobs import (DeliveryTargetMissing, confirmation_delivery_payload,
-                          message_reference)
+                          delivery_disabled, message_reference)
 from source_audio import (
+    SourceAudioError,
     SourceFailureKind,
     SourceRoute,
     check_oci_mullvad_health,
@@ -79,6 +88,9 @@ class RuntimeExecutionResult:
     script_url: str | None = None
     notes_url: str | None = None
     manifest_url: str | None = None
+    segments_url: str | None = None
+    page_url: str | None = None
+    notes: dict | None = None   # the notes job to submit (pipeline.notes_input), when there is a script
 
 
 @contextlib.contextmanager
@@ -135,7 +147,7 @@ def _exit_rotator(settings: Settings) -> ExitRotator:
 
 
 def _execution_result(
-    published: Any, source_url: str
+    published: Any, source_url: str | None, feed: str = "audio"
 ) -> RuntimeExecutionResult:
     return RuntimeExecutionResult(
         slug=published.slug,
@@ -145,10 +157,13 @@ def _execution_result(
         completion_html=render_completion_message(
             published.title, published.public_url,
             notes_url=published.notes_url, script_url=published.script_url,
-            source_url=source_url),
+            source_url=source_url, feed=feed),
         script_url=published.script_url,
         notes_url=published.notes_url,
         manifest_url=published.manifest_url,
+        segments_url=getattr(published, "segments_url", None),
+        page_url=getattr(published, "page_url", None),
+        notes=getattr(published, "notes", None),
     )
 
 
@@ -157,6 +172,7 @@ def _attempt_mullvad_route(
     source_url: str,
     work_dir: Path | None,
     rotator: ExitRotator,
+    options: JobOptions = DEFAULT_OPTIONS,
 ) -> tuple[list[PipelineError], RuntimeExecutionResult | None]:
     """Try the proxy route up to ``rotator.attempts()`` times, rotating the
     Mullvad egress (with conservative jitter) between eligible failures.
@@ -174,8 +190,8 @@ def _attempt_mullvad_route(
             metadata = fetch_metadata(settings, source_url, route=SourceRoute.OCI_MULLVAD)
             published = ingest_url_with_metadata(
                 settings, source_url, metadata, route=SourceRoute.OCI_MULLVAD,
-                work_dir=work_dir)
-            return [], _execution_result(published, source_url)
+                work_dir=work_dir, options=options)
+            return [], _execution_result(published, source_url, options.feed)
         except PipelineError as exc:
             if exc.dependency != "source":
                 raise
@@ -199,9 +215,11 @@ def _fetch_and_publish_url(
     input_json: dict[str, Any],
     source_url: str,
     work_dir: Path | None = None,
+    options: JobOptions = DEFAULT_OPTIONS,
 ) -> RuntimeExecutionResult:
     failures: list[PipelineError] = []
     rotator = _exit_rotator(settings)
+    unattended = options.delivery == "none"
     for route in _candidate_routes(input_json):
         if route == SourceRoute.OCI_MULLVAD:
             health = check_oci_mullvad_health(_source_settings(settings))
@@ -209,7 +227,7 @@ def _fetch_and_publish_url(
                 failures.append(_route_health_error(route, health.reason, health.detail))
                 continue
             route_failures, result = _attempt_mullvad_route(
-                settings, source_url, work_dir, rotator)
+                settings, source_url, work_dir, rotator, options)
             failures.extend(route_failures)
             if result is not None:
                 return result
@@ -222,8 +240,8 @@ def _fetch_and_publish_url(
         try:
             metadata = fetch_metadata(settings, source_url, route=route)
             published = ingest_url_with_metadata(
-                settings, source_url, metadata, route=route, work_dir=work_dir)
-            return _execution_result(published, source_url)
+                settings, source_url, metadata, route=route, work_dir=work_dir, options=options)
+            return _execution_result(published, source_url, options.feed)
         except PipelineError as exc:
             if exc.dependency != "source":
                 raise
@@ -240,11 +258,11 @@ def _fetch_and_publish_url(
     # route that failed transiently -- if any route might succeed later, the
     # job as a whole is worth retrying.
     representative = next(
-        (failure for failure in failures if _is_retryable_pipeline_error(failure)),
+        (failure for failure in failures if _is_retryable_pipeline_error(failure, unattended)),
         failures[-1],
     )
     raise PipelineError("source", str(representative), detail,
-                        retryable=any(_is_retryable_pipeline_error(failure) for failure in failures))
+                        retryable=any(_is_retryable_pipeline_error(failure, unattended) for failure in failures))
 
 
 def _classified_source_url(input_json: dict[str, Any]) -> tuple[str, str] | None:
@@ -257,34 +275,102 @@ def _classified_source_url(input_json: dict[str, Any]) -> tuple[str, str] | None
     return classified
 
 
+def _transcribe_opening(settings: Settings, clip: Path) -> str:
+    """The opening clip's transcript, by the path enrichment uses (self-hosted first, Azure fallback)."""
+    from episode_enrichment import transcribe_audio
+    try:
+        return str(transcribe_audio(clip, model=settings.enrichment_stt_model, jobs=settings.enrichment_jobs))
+    except Exception as exc:
+        raise live_window.LiveWindowError("window_transcribe", f"opening check could not transcribe: {exc}",
+                                          retryable=True) from exc
+
+
+def _publish_live_window(
+    settings: Settings,
+    input_json: dict[str, Any],
+    options: JobOptions,
+    work_dir: Path | None,
+) -> RuntimeExecutionResult:
+    """Publish a window of a live stream. OCI Mullvad route only: the stream URL is bound to its egress."""
+    try:
+        window = live_window.parse_window(input_json["liveWindow"])
+    except live_window.LiveWindowError as exc:
+        raise PipelineError("input", str(exc)) from exc
+    if input_json.get("preferredRoute") not in (None, "", SourceRoute.OCI_MULLVAD.value):
+        raise PipelineError("input", "liveWindow is only available on the oci_mullvad route")
+    health = check_oci_mullvad_health(_source_settings(settings))
+    if not health.ok:
+        raise _route_health_error(SourceRoute.OCI_MULLVAD, health.reason, health.detail)
+
+    rotator = _exit_rotator(settings)
+
+    def fetch_audio(staging: Path) -> Path:
+        # Like a URL job, an IP-shaped refusal from yt-dlp (bot check, rate limit) rotates the Mullvad exit and
+        # tries again. Only the stream lookup is retried that way: its URL is bound to the exit that resolved it.
+        for attempt in range(rotator.attempts()):
+            try:
+                with current_progress().stage("download_audio"):
+                    path, _duration = live_window.fetch_live_window(
+                        _source_settings(settings), window, staging, ffprobe_bin=settings.ffprobe_bin,
+                        transcribe_clip=lambda clip: _transcribe_opening(settings, clip),
+                        check=current_progress().check)
+                return path
+            except live_window.LiveWindowError as exc:
+                raise PipelineError(exc.error_class, str(exc), exc.stderr, retryable=exc.retryable) from exc
+            except SourceAudioError as exc:
+                if (exc.stage == "metadata" and attempt + 1 < rotator.attempts()
+                        and rotator.eligible(f"{exc}\n{exc.stderr}") and rotator.rotate(attempt)):
+                    delay = random.uniform(*rotator.jitter_sec)
+                    logger.info("mullvad egress rotated after %s; retrying the stream lookup in %.1fs", exc.stage, delay)
+                    with current_progress().stage("source_retry", retrySeconds=delay, reason="source_retry"):
+                        time.sleep(delay)
+                    continue
+                raise PipelineError(exc.stage, str(exc), exc.stderr) from exc
+        raise PipelineError("source", "No stream lookup was attempted")
+
+    published = ingest_live_window(
+        settings, source_url=window.source_url, identity_text=window.identity,
+        fetch_audio=fetch_audio, work_dir=work_dir, options=options)
+    return _execution_result(published, window.source_url, options.feed)
+
+
 async def execute_runtime_job(
     settings: Settings,
     bot: Bot,
     input_json: dict[str, Any],
     work_dir: Path | None = None,
 ) -> RuntimeExecutionResult:
+    options = job_options(input_json)
+    # Configuration is checked before any download or paid call, and read once for this job.
+    options = replace(options, enrichment_tier=enrichment_preflight(settings, options.feed))
+    if input_json.get("inputKind") == notes_job.INPUT_KIND:
+        published = await asyncio.to_thread(
+            notes_job.run_notes, settings, input_json, work_dir or job_work_dir(settings.work_dir, "notes"),
+            options.enrichment_tier)
+        return _execution_result(published, None, options.feed)
+    if input_json.get("inputKind") == notes_job.PAGE_KIND:
+        published = await asyncio.to_thread(
+            notes_job.run_page, settings, input_json, work_dir or job_work_dir(settings.work_dir, "page"))
+        return _execution_result(published, None, options.feed)
+    if input_json.get("inputKind") == rebuild.INPUT_KIND:
+        published = await asyncio.to_thread(
+            rebuild.run_rebuild, settings, input_json, work_dir or job_work_dir(settings.work_dir, "rebuild"),
+            options.enrichment_tier)
+        return _execution_result(published, None, options.feed)
     classified = _classified_source_url(input_json)
+    if "liveWindow" in input_json:
+        if classified:
+            raise PipelineError("input", "A job takes either sourceUrl or liveWindow, not both")
+        return await asyncio.to_thread(_publish_live_window, settings, input_json, options, work_dir)
     if classified:
         kind, source_url = classified
         if kind == "direct_audio_url":
             published = await asyncio.to_thread(
-                ingest_direct_audio_url, settings, source_url, work_dir=work_dir)
+                ingest_direct_audio_url, settings, source_url, work_dir=work_dir, options=options)
         else:
-            published = await asyncio.to_thread(
-                _fetch_and_publish_url, settings, input_json, source_url, work_dir)
-        return RuntimeExecutionResult(
-            slug=published.slug,
-            title=published.title,
-            public_url=published.public_url,
-            file_size_bytes=published.file_size_bytes,
-            completion_html=render_completion_message(
-                published.title, published.public_url,
-                notes_url=published.notes_url, script_url=published.script_url,
-                source_url=source_url),
-            script_url=published.script_url,
-            notes_url=published.notes_url,
-            manifest_url=published.manifest_url,
-        )
+            return await asyncio.to_thread(
+                _fetch_and_publish_url, settings, input_json, source_url, work_dir, options)
+        return _execution_result(published, source_url, options.feed)
 
     local_source = input_json.get("localSourcePath")
     telegram_file_id = input_json.get("telegramFileId")
@@ -333,22 +419,18 @@ async def execute_runtime_job(
             target,
             str(input_json.get("titleHint") or target.stem),
             work_dir=work_dir,
+            options=options,
         )
-    return RuntimeExecutionResult(
-        slug=published.slug,
-        title=published.title,
-        public_url=published.public_url,
-        file_size_bytes=published.file_size_bytes,
-        completion_html=render_completion_message(
-            published.title, published.public_url,
-            notes_url=published.notes_url, script_url=published.script_url),
-        script_url=published.script_url,
-        notes_url=published.notes_url,
-        manifest_url=published.manifest_url,
-    )
+    return _execution_result(published, None, options.feed)
 
 
-def _is_retryable_pipeline_error(exc: PipelineError) -> bool:
+def _is_retryable_pipeline_error(exc: PipelineError, unattended: bool = False) -> bool:
+    """Whether a failed attempt should be retried.
+
+    ``unattended`` (a job with ``delivery: none``, i.e. a scheduled source) treats a sign-in/bot wall as
+    transient: nobody is waiting to be told, a dead job is never resubmitted (its idempotency key is
+    spent), and this route sends no cookies, so the wall belongs to the proxy exit, not the source.
+    """
     if exc.retryable is not None:
         return exc.retryable
     if exc.dependency != "source":
@@ -356,6 +438,8 @@ def _is_retryable_pipeline_error(exc: PipelineError) -> bool:
     if exc.stage == "input":
         return False
     kind = classify_source_failure(f"{exc}\n{exc.stderr}")
+    if kind == SourceFailureKind.AUTH_REQUIRED and unattended:
+        return True
     if kind in {
         SourceFailureKind.AUTH_REQUIRED,
         SourceFailureKind.SOURCE_UNAVAILABLE,
@@ -380,13 +464,15 @@ def _source_url_display(input_json: dict[str, Any]) -> str | None:
     return stable_url_for_display(classified[1]) if classified else None
 
 
-async def process_claim(*, client, settings, bot, claim):
+async def process_claim(*, client, settings, bot, claim, worker_id=None):
     job, attempt = claim["job"], claim["attempt"]
     remaining = 7200
     if attempt.get("leaseExpiresAt"):
         remaining = max(0, (datetime.fromisoformat(attempt["leaseExpiresAt"].replace("Z", "+00:00")) - datetime.now(timezone.utc)).total_seconds())
     lease = AttemptLease(client=client, job_id=job["jobId"], attempt_id=attempt["attemptId"],
-                         lease_token=attempt["leaseToken"], lease_seconds=7200, initial_remaining=remaining)
+                         lease_token=attempt["leaseToken"], lease_seconds=7200, initial_remaining=remaining,
+                         worker_beat=None if worker_id is None else lambda: client.heartbeat_worker(
+                             worker_id=worker_id, metadata_json={"phase": "busy", "jobId": job["jobId"]}))
     lease.start()
     enabled = os.environ.get("TG_TOOLS_PROGRESS_ENABLED") == "1"
     reporter = ProgressReporter(send=client.append_progress, job_id=job["jobId"], attempt_id=attempt["attemptId"],
@@ -431,9 +517,13 @@ async def _process_claim_inner(
     try:
         try:
             result = await execute_runtime_job(settings, bot, input_json, work_dir)
+            notes_job_id = None
+            if result.notes is not None:
+                notes_job_id = await asyncio.to_thread(_submit_notes, client, job, input_json, result.notes)
         except PipelineError as exc:
             current_progress().check()
-            outcome = "retryable_error" if _is_retryable_pipeline_error(exc) else "terminal_error"
+            outcome = "retryable_error" if _is_retryable_pipeline_error(
+                exc, unattended=delivery_disabled(input_json)) else "terminal_error"
             finalized = await asyncio.to_thread(
                 client.finalize,
                 {
@@ -456,7 +546,8 @@ async def _process_claim_inner(
 
         artifacts = []
         if os.environ.get("TG_TOOLS_PROGRESS_ENABLED") == "1":
-            artifacts = await asyncio.to_thread(_register_published_artifacts, client, result, work_dir, job_id, attempt_id)
+            artifacts, registrable = await asyncio.to_thread(
+                _register_published_artifacts, client, result, work_dir, job_id, attempt_id)
         if hasattr(current_progress(), "flush"):
             await asyncio.to_thread(current_progress().flush)
         current_progress().check()
@@ -478,6 +569,9 @@ async def _process_claim_inner(
                     "scriptUrl": result.script_url,
                     "notesUrl": result.notes_url,
                     "manifestUrl": result.manifest_url,
+                    "segmentsUrl": result.segments_url,
+                    "pageUrl": result.page_url,
+                    "notesJobId": notes_job_id,
                     "artifactIds": artifacts,
                 },
             },
@@ -487,8 +581,7 @@ async def _process_claim_inner(
             html_text=result.completion_html)
         # Retain source/checkpoints if registration is degraded; publication
         # and notification success must not depend on the optional catalog.
-        expected_artifacts = sum(bool(url) for url in [result.public_url,result.script_url,result.notes_url,result.manifest_url])
-        if os.environ.get("TG_TOOLS_PROGRESS_ENABLED") != "1" or len(artifacts) == expected_artifacts:
+        if os.environ.get("TG_TOOLS_PROGRESS_ENABLED") != "1" or len(artifacts) == registrable:
             shutil.rmtree(work_dir, ignore_errors=True)
     except LeaseLost:
         raise
@@ -502,16 +595,36 @@ async def _process_claim_inner(
         raise
 
 
+def _submit_notes(client, job: dict[str, Any], input_json: dict[str, Any], notes: dict[str, Any]) -> str:
+    """Submit the episode's notes job (notes_job.py); the job's own segmenter and context ride along.
+
+    A failure is retryable: the retry reads the published episode back and submits the same key again.
+    """
+    request = dict(notes)
+    for key in ("segmenter", "segmentContext"):
+        if input_json.get(key):
+            request[key] = input_json[key]
+    try:
+        submitted = client.submit_job(notes_job.notes_job_payload(job, request))
+    except Exception as exc:
+        raise PipelineError("notes_submit", f"could not submit the notes job: {exc}", retryable=True) from exc
+    return str(((submitted or {}).get("job") or {}).get("jobId") or "")
+
+
 def _register_published_artifacts(client, result, work_dir, job_id, attempt_id):
-    registered = []
+    """(registered artifact ids, how many of the result's documents this job holds in its work dir)."""
+    registered, registrable = [], 0
     for url, kind, mime in [(result.public_url,"rss_audio","audio/mpeg"),
                             (result.script_url,"rss_script","text/markdown"),
+                            (result.segments_url,"rss_segments","application/json"),
+                            (result.page_url,"rss_page","text/html"),
                             (result.notes_url,"rss_notes","text/markdown"),
                             (result.manifest_url,"rss_manifest","application/json")]:
         if not url: continue
         name = unquote(urlsplit(url).path.rsplit("/",1)[-1])
         path = work_dir / name
         if Path(name).name != name or not path.is_file(): continue
+        registrable += 1
         current_progress().check()
         digest = hashlib.sha256()
         with path.open("rb") as stream:
@@ -523,7 +636,7 @@ def _register_published_artifacts(client, result, work_dir, job_id, attempt_id):
             registered.append(response["artifact"]["artifactId"])
         except Exception:
             logger.warning("published artifact catalog registration deferred job=%s kind=%s",job_id,kind)
-    return registered
+    return registered, registrable
 
 
 async def _finalize_unexpected(
@@ -580,6 +693,9 @@ async def _deliver(
     when the job simply has no reply target, log and move on rather than
     letting the delivery failure escape into the unmodelled path.
     """
+    if delivery_disabled(input_json):
+        logger.info("Job %s finalized; no delivery requested (delivery=none)", job_id)
+        return
     try:
         delivery = confirmation_delivery_payload(
             job_id=job_id,
@@ -658,7 +774,7 @@ async def worker_loop(settings: Settings) -> None:
                 claim = await asyncio.to_thread(client.claim_job, worker_id=worker_id, lease_duration_sec=PUBLISH_LEASE_SECONDS)
                 consecutive_failures = 0
                 if claim:
-                    await process_claim(client=client, settings=settings, bot=bot, claim=claim)
+                    await process_claim(client=client, settings=settings, bot=bot, claim=claim, worker_id=worker_id)
                     continue
             except RuntimeClientError as exc:
                 consecutive_failures += 1

@@ -1,10 +1,12 @@
 import { episodeDescription } from './episode-description.js';
+import { PODCASTS, STORED_HOSTS } from './podcasts.js';
 
 var __defProp = Object.defineProperty;
 var __name = (target, value) => __defProp(target, "name", { value, configurable: true });
 
 // src/helpers.ts
-var FEED_IDS = ["audio", "tts"];
+// Generated feeds are the podcasts with a D1 feed id (src/podcasts.js): one list, not two.
+var FEED_IDS = PODCASTS.filter((podcast) => podcast.feed).map((podcast) => podcast.feed);
 function isFeedId(value) {
   return FEED_IDS.includes(value);
 }
@@ -179,7 +181,8 @@ var EPISODE_FIELDS = [
   "md_url",
   "speech_text_url",
   "manifest_url",
-  "source_md_url"
+  "source_md_url",
+  "page_url"
 ];
 async function readJsonBody(request) {
   try {
@@ -220,7 +223,7 @@ function normalizeEpisodeInput(input, partial = false) {
   const feed = asString(input.feed);
   if (feed !== void 0) {
     if (!isFeedId(feed)) {
-      throw new Error("feed must be 'audio' or 'tts'");
+      throw new Error(`feed must be one of ${FEED_IDS.join(", ")}`);
     }
     result.feed = feed;
   } else if (!partial) {
@@ -316,7 +319,7 @@ function normalizeEpisodeInput(input, partial = false) {
       result[field] = null;
     }
   }
-  for (const field of ["md_url", "speech_text_url", "manifest_url", "source_md_url"]) {
+  for (const field of ["md_url", "speech_text_url", "manifest_url", "source_md_url", "page_url"]) {
     if (input[field] !== void 0) {
       result[field] = normalizeNullableAbsoluteUrl(input[field], field) ?? null;
     } else if (!partial) {
@@ -389,12 +392,15 @@ async function createEpisode(request, env) {
     VALUES (${placeholders})
     RETURNING *;
   `;
+  let row;
   try {
-    const row = await env.DB.prepare(sql).bind(...fields.map((field) => input[field])).first();
-    return json(row, { status: 201 });
+    row = await env.DB.prepare(sql).bind(...fields.map((field) => input[field])).first();
   } catch (error) {
     return json({ error: error instanceof Error ? error.message : "insert failed" }, { status: 400 });
   }
+  await storeEpisodeItem(env, row);
+  await dropStoredFeeds(env, [row.feed]);
+  return json(row, { status: 201 });
 }
 __name(createEpisode, "createEpisode");
 async function updateEpisode(id, request, env) {
@@ -409,6 +415,8 @@ async function updateEpisode(id, request, env) {
     return json({ error: "no fields to update" }, { status: 400 });
   }
   const values = assignments.map((field) => input[field]);
+  // An update that moves the episode to another feed changes both feeds.
+  const before = input.feed !== void 0 ? await env.DB.prepare("SELECT feed FROM episodes WHERE id = ?1").bind(id).first() : null;
   const sql = `
     UPDATE episodes
     SET ${assignments.map((field, index) => `${field} = ?${index + 1}`).join(", ")},
@@ -420,6 +428,8 @@ async function updateEpisode(id, request, env) {
   if (!row) {
     return json({ error: "episode not found" }, { status: 404 });
   }
+  await storeEpisodeItem(env, row);
+  await dropStoredFeeds(env, [row.feed, before?.feed]);
   return json(row);
 }
 __name(updateEpisode, "updateEpisode");
@@ -428,6 +438,13 @@ async function deleteEpisode(id, env) {
   if (!row) {
     return json({ error: "episode not found" }, { status: 404 });
   }
+  // The write is done; the fragment is only a cache (an orphan is never read), so it cannot fail the delete.
+  try {
+    await env.DB.prepare("DELETE FROM feed_items WHERE episode_id = ?1").bind(id).run();
+  } catch (error) {
+    console.error("feed item delete failed", id, error);
+  }
+  await dropStoredFeeds(env, [row.feed]);
   return json({ ok: true, deleted: row });
 }
 __name(deleteEpisode, "deleteEpisode");
@@ -487,6 +504,7 @@ async function updateFeed(id, request, env) {
   if (!row) {
     return json({ error: "feed not found" }, { status: 404 });
   }
+  await dropStoredFeeds(env, [row.id]);
   return json(row);
 }
 __name(updateFeed, "updateFeed");
@@ -1054,35 +1072,79 @@ function episodeKeywords(episode) {
   return [keywords, ...additions].filter(Boolean).join(",");
 }
 __name(episodeKeywords, "episodeKeywords");
-const PUBLIC_BASE = "https://rss-edge.05802.workers.dev";
-const LEGACY_HOSTS = new Set(["rss-b2-proxy.aaronkuna.workers.dev", "rss.stations.work", "rss-b2-proxy.05802.workers.dev"]);
-function publicUrl(value) {
-  if (!value) return value;
-  try {
-    const url = new URL(value);
-    if (LEGACY_HOSTS.has(url.hostname) || url.hostname === "rss-edge.05802.workers.dev") {
-      return `${PUBLIC_BASE}${url.pathname}${url.search}${url.hash}`;
-    }
-  } catch { /* Preserve non-URL metadata. */ }
-  return value;
+// The one public hostname (P5, 2026-11-03). Stored URLs on it or any older host are rewritten, so D1 doesn't change.
+const PUBLIC_BASE = "https://rss-feeds.stations.work";
+// Hosts and podcasts: src/podcasts.js. The secret FEED_KEYS holds "name=key" pairs, comma-separated; a podcast
+// without a valid key is not served.
+const STORED_HOST = new RegExp(`https?:\\/\\/(?:${STORED_HOSTS.map((host) => host.replace(/\./g, "\\.")).join("|")})`);
+const FEED_KEY = /^[A-Za-z0-9_-]{22,64}$/;
+function feedKeys(env) {
+  const keys = new Map();
+  for (const pair of String(env.FEED_KEYS || "").split(",")) {
+    const [name, key] = pair.trim().split("=");
+    if (PODCASTS.some((podcast) => podcast.name === name) && FEED_KEY.test(key || "")) keys.set(name, key);
+  }
+  return keys;
 }
-function generateXml(feed, episodes) {
-  const now = toRfc822(/* @__PURE__ */ new Date());
+__name(feedKeys, "feedKeys");
+function podcastRoot(podcast, keys) {
+  return `${PUBLIC_BASE}/${podcast.name}-${keys.get(podcast.name)}`;
+}
+__name(podcastRoot, "podcastRoot");
+// Every stored URL (and every URL inside stored text) on a known host: podcast storage paths become their keyed
+// public path, everything else just takes PUBLIC_BASE. A podcast without a key keeps no public path at all.
+function publicize(text, keys) {
+  const pattern = new RegExp(`${STORED_HOST.source}(\\/(?:${PODCASTS.map((podcast) => podcast.prefix).join("|")})(?=[/"'<\\s)?#]|$))?`, "g");
+  return String(text).replace(pattern, (match, storage) => {
+    if (!storage) return PUBLIC_BASE;
+    const podcast = PODCASTS.find((candidate) => `/${candidate.prefix}` === storage);
+    return keys.has(podcast.name) ? podcastRoot(podcast, keys) : `${PUBLIC_BASE}/_unpublished`;
+  });
+}
+__name(publicize, "publicize");
+function keyFingerprint(key) {
+  let hash = 2166136261;
+  for (const char of key) hash = Math.imul(hash ^ char.charCodeAt(0), 16777619) >>> 0;
+  return hash.toString(36);
+}
+__name(keyFingerprint, "keyFingerprint");
+function sameKey(a, b) {
+  if (typeof a !== "string" || typeof b !== "string" || a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+__name(sameKey, "sameKey");
+// What every item of a feed shares: its keyed root, the URL rewriter, the logo and the author. An item's stored
+// fragment records `context`, a fingerprint of these and of every podcast's key (an item can link another podcast's
+// storage URL, which publicize turns into that podcast's keyed root), so any key rotation or a feed edit re-renders it.
+function feedContext(feed, keys) {
+  const podcast = PODCASTS.find((candidate) => candidate.feed === feed.id);
+  const root = podcastRoot(podcast, keys);
+  const publicUrl = (value) => value ? publicize(value, keys) : value;
   const siteUrl = publicUrl(feed.site_url);
   const logoUrl = `${siteUrl.replace(/\/$/, "")}/${feed.logo_path}`;
-  const categories = categoriesXml(parseCategories(feed.categories));
-  // Do not publish an enclosure pointing outside the sole delivery hostname.
-  // The external pscrb.fm episode remains in D1 until its media can be licensed/imported.
-  const items = episodes.filter((episode) => {
-    try { return new URL(publicUrl(episode.mp3_url)).origin === PUBLIC_BASE; }
-    catch { return false; }
-  }).map((episode) => {
-    const keywords = episodeKeywords(episode);
-    const presentation = episodeDescription(episode, publicUrl);
-    const summary = presentation.plain;
-    const content = presentation.html;
-    const link = publicUrl(episode.md_url || episode.mp3_url);
-    return `        <item>
+  return { feed, keys, root, publicUrl, siteUrl, logoUrl, context: keyFingerprint([root, logoUrl, feed.author, [...keys].map(([name, key]) => `${name}=${key}`).sort().join(",")].join("\n")) };
+}
+__name(feedContext, "feedContext");
+// Stored hostnames left anywhere in the output (a URL inside text) take their public form.
+function publicizeAll(xml, keys) {
+  return xml.replace(new RegExp(STORED_HOST.source + "[^\\s\"'<]*", "g"), (url) => publicize(url, keys));
+}
+__name(publicizeAll, "publicizeAll");
+// The one item renderer. "" for an episode the feed does not publish: an enclosure outside the sole delivery
+// hostname (the external pscrb.fm episode remains in D1 until its media can be licensed/imported).
+function renderItem(ctx, episode) {
+  const { feed, keys, publicUrl, logoUrl } = ctx;
+  try { if (new URL(publicUrl(episode.mp3_url)).origin !== PUBLIC_BASE) return ""; }
+  catch { return ""; }
+  const keywords = episodeKeywords(episode);
+  const presentation = episodeDescription(episode, publicUrl);
+  const summary = presentation.plain;
+  const content = presentation.html;
+  // The episode's reader page (X-76: Surveillance notes + script) when it has one, else its notes, else the audio.
+  const link = publicUrl(episode.page_url || episode.md_url || episode.mp3_url);
+  return publicizeAll(`        <item>
             <title>${xmlEscape(episode.title)}</title>
             <itunes:title>${xmlEscape(episode.title)}</itunes:title>
             <description>${cdata(content)}</description>
@@ -1101,16 +1163,25 @@ function generateXml(feed, episodes) {
             <itunes:image href="${xmlEscape(logoUrl)}" />
             <itunes:explicit>${xmlEscape(episode.explicit)}</itunes:explicit>
             <itunes:block>${xmlEscape(episode.block)}</itunes:block>
-        </item>`;
-  }).join("\n");
-  return `<?xml version="1.0" encoding="UTF-8"?>
+        </item>`, keys);
+}
+__name(renderItem, "renderItem");
+// The channel around already-rendered items (newest first).
+function feedXml(ctx, items) {
+  const { feed, keys, root, siteUrl, logoUrl } = ctx;
+  const selfUrl = `${root}/podcast.xml`;
+  const now = toRfc822(/* @__PURE__ */ new Date());
+  const categories = categoriesXml(parseCategories(feed.categories));
+  return publicizeAll(`<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0"
     xmlns:content="http://purl.org/rss/1.0/modules/content/"
     xmlns:atom="http://www.w3.org/2005/Atom"
     xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd"
     xml:lang="${xmlEscape(feed.language)}">
     <channel>
-        <atom:link href="${xmlEscape(`${PUBLIC_BASE}/${feed.id}/podcast.xml`)}" rel="self" type="application/rss+xml" />
+        <atom:link href="${xmlEscape(selfUrl)}" rel="self" type="application/rss+xml" />
+        <itunes:new-feed-url>${xmlEscape(selfUrl)}</itunes:new-feed-url>
+        <itunes:block>yes</itunes:block>
         <title>${xmlEscape(feed.title)}</title>
         <description>${cdata(feed.description)}</description>
         <link>${xmlEscape(siteUrl)}</link>
@@ -1136,17 +1207,28 @@ function generateXml(feed, episodes) {
 ${categories}
         <itunes:type>episodic</itunes:type>
         <itunes:explicit>${xmlEscape(feed.explicit)}</itunes:explicit>
-${items}
+`, keys) + `${items.filter(Boolean).join("\n")}
     </channel>
 </rss>
-`.replace(/https?:\/\/(?:rss\.stations\.work|rss-b2-proxy\.aaronkuna\.workers\.dev|rss-b2-proxy\.05802\.workers\.dev)/g, PUBLIC_BASE);
+`;
+}
+__name(feedXml, "feedXml");
+// A whole feed from episode rows, every item rendered now. The stored path (storedFeed) gives the same bytes from
+// stored fragments; this is what it is measured against.
+function generateXml(feed, episodes, keys) {
+  const ctx = feedContext(feed, keys);
+  return feedXml(ctx, episodes.map((episode) => renderItem(ctx, episode)));
 }
 __name(generateXml, "generateXml");
-// Feeds are rendered once per change and stored gzip-compressed in feed_gz; a GET returns the
-// stored bytes (one small row read instead of every episode row and a 20+ ms render; the XML
-// itself is ~5x larger to decode). API writes drop the stored copies. A copy older than a day, or from another presentation version, is rebuilt,
-// which also picks up D1 edits made outside the API.
-var FEED_PRESENTATION = "listener-description-v2";
+// Feeds are rendered once per change and stored gzip-compressed in feed_gz; a GET returns the stored bytes (one
+// small row read instead of every episode row and a render; the XML itself is ~5x larger to decode). API writes
+// drop the stored copies. A copy older than a day, or from another presentation version, is checked again, which
+// also picks up D1 edits made outside the API.
+// Each episode's <item> is rendered once, when it is written, and stored in feed_items (migration 0005); a rebuild
+// joins the stored items under a fresh channel header. A fragment from another presentation version or context, or
+// older than its episode's updated_at (an edit outside the API), is rendered again at the rebuild and stored, so the
+// result always equals generateXml over the same rows. Every non-blocked episode is listed (owner, X-71 amendment).
+var FEED_PRESENTATION = "listener-description-v6-all-items";
 var FEED_STORE_MAX_AGE_S = 86400;
 function toBase64(bytes) {
   if (bytes.toBase64) return bytes.toBase64();
@@ -1160,10 +1242,86 @@ function fromBase64(text) {
 async function gzip(text) {
   return new Uint8Array(await new Response(new Blob([text]).stream().pipeThrough(new CompressionStream("gzip"))).arrayBuffer());
 }
-async function storedFeed(env, feedId) {
+// Render rows' items and store them; returns the rendered XML by episode id. The Workers free plan allows 50 D1
+// queries per invocation, so fragments go in as one JSON parameter per statement, about 200 KB of it (UTF-8 bytes of
+// the JSON), not one each: a first render that is killed keeps the chunks it stored, and the next one resumes.
+var ITEM_UPSERT_BYTES = 2e5;
+const utf8 = new TextEncoder();
+async function storeItems(env, ctx, episodes) {
+  const rendered = new Map();
+  let chunk = [], size = 0;
+  const flush = async () => {
+    if (chunk.length === 0) return;
+    await env.DB.prepare(
+      `INSERT OR REPLACE INTO feed_items (episode_id, version, context, source_updated_at, xml)
+       SELECT json_extract(value, '$[0]'), ?1, ?2, json_extract(value, '$[1]'), json_extract(value, '$[2]') FROM json_each(?3)`
+    ).bind(FEED_PRESENTATION, ctx.context, JSON.stringify(chunk)).run();
+    chunk = [];
+    size = 0;
+  };
+  for (const episode of episodes) {
+    const xml = renderItem(ctx, episode);
+    rendered.set(episode.id, xml);
+    const entry = [episode.id, episode.updated_at ?? null, xml];
+    const bytes = utf8.encode(JSON.stringify(entry)).length + 1;
+    if (size + bytes > ITEM_UPSERT_BYTES) await flush();
+    chunk.push(entry);
+    size += bytes;
+  }
+  await flush();
+  return rendered;
+}
+__name(storeItems, "storeItems");
+// After an API create or update: render that one episode's item now, so the next rebuild renders nothing. A failure
+// here leaves the write done and the fragment stale (dropped), and the rebuild renders it.
+async function storeEpisodeItem(env, episode) {
+  try {
+    const feed = await env.DB.prepare("SELECT * FROM feeds WHERE id = ?1").bind(episode.feed).first();
+    if (!feed) return;
+    await storeItems(env, feedContext(feed, feedKeys(env)), [episode]);
+  } catch (error) {
+    console.error("feed item render failed", episode.id, error);
+    // Drop the fragment so the rebuild renders it; this runs after the write has committed, so it cannot throw.
+    try {
+      await env.DB.prepare("DELETE FROM feed_items WHERE episode_id = ?1").bind(episode.id).run();
+    } catch (dropError) {
+      console.error("feed item drop failed", episode.id, dropError);
+    }
+  }
+}
+__name(storeEpisodeItem, "storeEpisodeItem");
+// After a successful API write: drop the stored copy of each feed it touched (not every feed's); the next GET rebuilds.
+async function dropStoredFeeds(env, feedIds) {
+  const ids = [...new Set(feedIds.filter(Boolean))];
+  if (ids.length === 0) return;
+  await env.DB.prepare("DELETE FROM feed_gz WHERE feed IN (SELECT value FROM json_each(?1))").bind(JSON.stringify(ids)).run();
+}
+__name(dropStoredFeeds, "dropStoredFeeds");
+// The feed's items, newest first, from stored fragments; only missing or stale ones are rendered (and stored).
+async function feedItems(env, ctx) {
+  const listed = await env.DB.prepare(
+    `SELECT e.id, e.updated_at, i.version, i.context, i.source_updated_at, i.xml FROM episodes e
+     LEFT JOIN feed_items i ON i.episode_id = e.id WHERE e.feed = ?1 AND e.block != 'yes' ORDER BY e.pub_date DESC, e.id DESC`
+  ).bind(ctx.feed.id).all();
+  const rows = listed.results ?? [];
+  const stale = rows.filter((row) => row.xml === null || row.version !== FEED_PRESENTATION ||
+    row.context !== ctx.context || row.source_updated_at !== row.updated_at).map((row) => row.id);
+  let rendered = new Map();
+  if (stale.length > 0) {
+    const episodes = await env.DB.prepare("SELECT * FROM episodes WHERE id IN (SELECT value FROM json_each(?1))")
+      .bind(JSON.stringify(stale)).all();
+    rendered = await storeItems(env, ctx, episodes.results ?? []);
+  }
+  return { items: rows.map((row) => rendered.has(row.id) ? rendered.get(row.id) : row.xml), rendered: rendered.size };
+}
+__name(feedItems, "feedItems");
+async function storedFeed(env, feedId, keys) {
   const row = await env.DB.prepare("SELECT version, etag, gz, built_at FROM feed_gz WHERE feed = ?1").bind(feedId).first();
   const now = Math.floor(Date.now() / 1e3);
-  if (row && row.version === FEED_PRESENTATION && now - row.built_at < FEED_STORE_MAX_AGE_S) {
+  const fingerprint = keyFingerprint(podcastRoot(PODCASTS.find((podcast) => podcast.feed === feedId), keys));
+  // The ETag's fourth part is the key fingerprint: a rotated key must not be served the old key's URLs for a day.
+  if (row && row.version === FEED_PRESENTATION && row.etag.split(":")[3] === fingerprint &&
+    now - row.built_at < FEED_STORE_MAX_AGE_S) {
     return row;
   }
   const [feed, meta] = await Promise.all([
@@ -1176,7 +1334,7 @@ async function storedFeed(env, feedId) {
     return null;
   }
   const etag = etagFor([
-    "workers-dev-private-v1", FEED_PRESENTATION, feedId,
+    "workers-dev-private-v1", FEED_PRESENTATION, feedId, fingerprint,
     feed.updated_at,
     meta?.latest_updated,
     meta?.count ?? 0
@@ -1184,21 +1342,24 @@ async function storedFeed(env, feedId) {
   // Unchanged sources keep the stored body (and its build date); only the age resets.
   let gz = row && row.version === FEED_PRESENTATION && row.etag === etag ? row.gz : null;
   if (gz === null) {
-    const episodes = await env.DB.prepare(
-      "SELECT * FROM episodes WHERE feed = ?1 AND block != 'yes' ORDER BY pub_date DESC"
-    ).bind(feedId).all();
-    gz = toBase64(await gzip(generateXml(feed, episodes.results ?? [])));
+    const ctx = feedContext(feed, keys);
+    gz = toBase64(await gzip(feedXml(ctx, (await feedItems(env, ctx)).items)));
   }
   await env.DB.prepare("INSERT OR REPLACE INTO feed_gz (feed, version, etag, gz, built_at) VALUES (?1, ?2, ?3, ?4, ?5)")
     .bind(feedId, FEED_PRESENTATION, etag, gz, now).run();
   return { etag, gz };
 }
 __name(storedFeed, "storedFeed");
-async function generateFeedResponse(request, env, feedId) {
-  const stored = await storedFeed(env, feedId);
+async function generateFeedResponse(request, env, feedId, keys) {
+  const stored = await storedFeed(env, feedId, keys);
   if (!stored) {
     return new Response("Feed not found", { status: 404 });
   }
+  return storedFeedResponse(request, stored);
+}
+__name(generateFeedResponse, "generateFeedResponse");
+// A stored feed copy ({etag, gz}) as the response: 304 on a matching ETag, the gzip bytes as-is when accepted.
+function storedFeedResponse(request, stored) {
   if (request.headers.get("if-none-match") === stored.etag) {
     return new Response(null, {
       status: 304,
@@ -1221,7 +1382,53 @@ async function generateFeedResponse(request, env, feedId) {
   }
   return new Response(new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip")), { status: 200, headers });
 }
-__name(generateFeedResponse, "generateFeedResponse");
+__name(storedFeedResponse, "storedFeedResponse");
+// A static podcast.xml in B2 (Skeptic Tank, 1.8 MB) holds stored hostnames and storage paths. Rewriting it costs
+// ~25 ms CPU (X-68), so it is rewritten once and stored in feed_gz like a generated feed ("static:<name>"), and B2
+// is asked at most every STATIC_CHECK_S with its ETag (or Last-Modified) whether it changed. The stored ETag
+// carries the key fingerprint and the origin validator; a key or presentation change rebuilds it. If B2 fails and
+// a copy exists, the copy is served.
+var STATIC_CHECK_S = 300;
+function staticFeedXml(xml, keys) {
+  let out = publicizeAll(xml, keys);
+  // Keep it out of podcast directories, like the generated feeds.
+  if (!/<itunes:block>\s*yes\s*<\/itunes:block>/i.test(out.split(/<item[\s>]/)[0])) {
+    out = out.replace(/<channel>/, "<channel>\n    <itunes:block>yes</itunes:block>");
+  }
+  return out;
+}
+__name(staticFeedXml, "staticFeedXml");
+async function staticFeedResponse(request, env, podcast, keys) {
+  const feed = `static:${podcast.name}`;
+  const fingerprint = keyFingerprint(podcastRoot(podcast, keys));
+  const now = Math.floor(Date.now() / 1e3);
+  const row = await env.DB.prepare("SELECT version, etag, gz, built_at FROM feed_gz WHERE feed = ?1").bind(feed).first();
+  const parsed = row && row.version === FEED_PRESENTATION && row.etag.match(/^W\/"static-v1:([a-z0-9]+):(.*)"$/);
+  let stored = parsed && parsed[1] === fingerprint ? row : null;
+  if (stored && now - stored.built_at < STATIC_CHECK_S) return storedFeedResponse(request, stored);
+  const validator = stored ? decodeURIComponent(parsed[2]) : "";
+  const conditional = validator.startsWith("etag:") ? { "if-none-match": validator.slice(5) }
+    : validator.startsWith("lm:") ? { "if-modified-since": validator.slice(3) } : {};
+  let origin;
+  try { origin = await fetchRssObject(env, `${podcast.prefix}/podcast.xml`, "GET", conditional); }
+  catch (error) { if (stored) return storedFeedResponse(request, stored); throw error; }
+  if (origin.status === 304 && stored) {
+    await env.DB.prepare("UPDATE feed_gz SET built_at = ?1 WHERE feed = ?2").bind(now, feed).run();
+    return storedFeedResponse(request, stored);
+  }
+  if (!origin.ok) {
+    if (stored) return storedFeedResponse(request, stored);
+    return new Response(null, { status: origin.status, headers: { "Cache-Control": "no-store" } });
+  }
+  const originEtag = origin.headers.get("etag"), lastModified = origin.headers.get("last-modified");
+  const next = originEtag ? `etag:${originEtag}` : lastModified ? `lm:${lastModified}` : "";
+  const etag = `W/"static-v1:${fingerprint}:${encodeURIComponent(next)}"`;
+  const gz = toBase64(await gzip(staticFeedXml(await origin.text(), keys)));
+  await env.DB.prepare("INSERT OR REPLACE INTO feed_gz (feed, version, etag, gz, built_at) VALUES (?1, ?2, ?3, ?4, ?5)")
+    .bind(feed, FEED_PRESENTATION, etag, gz, now).run();
+  return storedFeedResponse(request, { etag, gz });
+}
+__name(staticFeedResponse, "staticFeedResponse");
 
 // src/proxy.ts
 // Public RSS storage must never be fetched anonymously. Newsl uses separate credentials.
@@ -1314,6 +1521,15 @@ async function authorizeRssB2(env, force = false) {
   };
   return rssB2Authorization;
 }
+// One object from the private RSS bucket (path already URL-encoded per segment).
+async function fetchRssObject(env, path, method, forwarded = {}) {
+  const attempt = (account) => fetch(
+    `${account.downloadUrl}/file/${encodeURIComponent(env.B2_RSS_BUCKET)}/${path}`,
+    { method, headers: { ...forwarded, Authorization: account.authorizationToken } }
+  );
+  return withFreshB2Auth((force) => authorizeRssB2(env, force), attempt);
+}
+__name(fetchRssObject, "fetchRssObject");
 async function proxyToB2(request, env) {
   if (request.method !== "GET" && request.method !== "HEAD") return text("Method Not Allowed", { status: 405 });
   const url = new URL(request.url);
@@ -1324,11 +1540,7 @@ async function proxyToB2(request, env) {
     const value = request.headers.get(name);
     if (value) forwarded[name] = value;
   }
-  const attempt = (account) => fetch(
-    `${account.downloadUrl}/file/${encodeURIComponent(env.B2_RSS_BUCKET)}/${path}`,
-    { method: request.method, headers: { ...forwarded, Authorization: account.authorizationToken } }
-  );
-  const response = await withFreshB2Auth((force) => authorizeRssB2(env, force), attempt);
+  const response = await fetchRssObject(env, path, request.method, forwarded);
   const headers = new Headers();
   for (const name of ["content-type", "content-length", "content-range", "accept-ranges", "etag", "last-modified", "content-encoding"]) {
     const value = response.headers.get(name);
@@ -1336,16 +1548,6 @@ async function proxyToB2(request, env) {
   }
   headers.set("Access-Control-Allow-Origin", "*");
   headers.set("Cache-Control", response.ok ? "public, max-age=3600" : "no-store");
-  // Stored skeptic-tank XML can contain obsolete enclosure hostnames.
-  if (url.pathname === "/skeptic-tank/podcast.xml" && response.ok && request.method === "GET") {
-    const xml = (await response.text()).replace(/https?:\/\/(?:rss\.stations\.work|rss-b2-proxy\.aaronkuna\.workers\.dev|rss-b2-proxy\.05802\.workers\.dev)/g, PUBLIC_BASE);
-    headers.delete("content-length");
-    headers.delete("etag");
-    headers.delete("content-encoding");
-    headers.set("Content-Type", "application/rss+xml; charset=utf-8");
-    headers.set("Cache-Control", "public, max-age=60");
-    return new Response(xml, { status: response.status, headers });
-  }
   return new Response(request.method === "HEAD" ? null : response.body, { status: response.status, headers });
 }
 __name(proxyToB2, "proxyToB2");
@@ -1374,10 +1576,6 @@ var index_default = {
   async fetch(request, env) {
     const response = await route(request, env);
     const pathname = new URL(request.url).pathname;
-    // Any successful API write may change a feed: drop the stored copies; the next GET rebuilds.
-    if (pathname.startsWith("/api/") && ["POST", "PUT", "DELETE"].includes(request.method) && response.ok) {
-      await env.DB.prepare("DELETE FROM feed_gz").bind().run();
-    }
     if (isPrivatePath(pathname)) {
       const headers = new Headers(response.headers);
       headers.set("Cache-Control", "private, no-store");
@@ -1386,10 +1584,47 @@ var index_default = {
     return response;
   }
 };
+const READER_HOST = "rss-feeds.stations.work";
+const READER_PREFIX = "/reader/";
 var router_default = {
   async fetch(request, env) {
     const url = new URL(request.url);
     const pathname = url.pathname;
+    // A podcast: /<name>-<key>/podcast.xml is its feed, /<name>-<key>/<path> its B2 object <prefix>/<path>.
+    const podcast = PODCASTS.find((candidate) => pathname.startsWith(`/${candidate.name}-`));
+    const keyed = podcast && pathname.slice(podcast.name.length + 2).match(/^([A-Za-z0-9_-]{22,64})(\/.*)?$/);
+    if (keyed) {
+      const keys = feedKeys(env);
+      const [, key, rest = ""] = keyed;
+      let parts;
+      try { parts = rest.split("/").map(decodeURIComponent); } catch { parts = [".."]; }
+      if (!sameKey(key, keys.get(podcast.name)) || parts.some((part) => part === ".." || part === ".")) {
+        return text("Not Found", { status: 404 });
+      }
+      // The keyed root is the feed's <link>: send it to the feed.
+      if (rest === "" || rest === "/") return new Response(null, { status: 302, headers: { Location: `${podcastRoot(podcast, keys)}/podcast.xml`, "Cache-Control": "no-store" } });
+      if (rest === "/podcast.xml") {
+        return podcast.feed ? generateFeedResponse(request, env, podcast.feed, keys) : staticFeedResponse(request, env, podcast, keys);
+      }
+      url.pathname = `/${podcast.prefix}${rest}`;
+      const response = await proxyToB2(new Request(url, request), env);
+      // Everything a podcast prefix serves shares this origin with /admin, whose API token sits in localStorage, so every
+      // passthrough is sandboxed (an opaque origin, no scripts; audio, images and XML are unaffected) and not sniffed. An
+      // episode's reader page (X-76) is passed through as HTML, decided on the decoded last segment B2 is asked for.
+      const headers = new Headers(response.headers);
+      if (response.ok && parts.at(-1).endsWith("page.html")) headers.set("Content-Type", "text/html; charset=utf-8");
+      headers.set("Content-Security-Policy", "sandbox allow-popups allow-popups-to-escape-sandbox");
+      headers.set("X-Content-Type-Options", "nosniff");
+      return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+    }
+    // On the public host a single-segment slug is a reader feed (reader/<slug>); every other path routes as below.
+    if (url.hostname === READER_HOST && /^\/[a-z0-9-]{8,80}$/.test(pathname)) {
+      url.pathname = READER_PREFIX + pathname.slice(1);
+      const response = await proxyToB2(new Request(url, request), env);
+      const headers = new Headers(response.headers);
+      if (response.ok) headers.set("Cache-Control", "public, s-maxage=300, max-age=60");
+      return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+    }
     if (pathname === "/newsl" || pathname.startsWith("/newsl/")) {
       if (!authorizeNewsl(request, env)) {
         return unauthorizedNewsl();
@@ -1403,13 +1638,6 @@ var router_default = {
           "Access-Control-Allow-Methods": "GET,POST,PUT,DELETE,OPTIONS"
         }
       });
-    }
-    if (pathname === "/podcast.xml") {
-      return new Response("Not Found", { status: 404 });
-    }
-    const feedMatch = pathname.match(/^\/([^/]+)\/podcast\.xml$/);
-    if (feedMatch && isFeedId(feedMatch[1])) {
-      return generateFeedResponse(request, env, feedMatch[1]);
     }
     if (pathname === "/admin" || pathname.startsWith("/admin/")) {
       return renderAdmin();
@@ -1452,7 +1680,9 @@ var router_default = {
     if (pathname === "/newsl" || pathname.startsWith("/newsl/")) {
       return proxyPrivateNewsl(request, env);
     }
-    return proxyToB2(request, env);
+    // Straight from B2 only: webfeeds and reader feeds. Podcast storage, archive/ and anything else is not served.
+    if (pathname.startsWith("/webfeeds/") || pathname.startsWith(READER_PREFIX)) return proxyToB2(request, env);
+    return text("Not Found", { status: 404 });
   }
 };
 function route(request, env) {

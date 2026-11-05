@@ -10,6 +10,7 @@ from .luna import EnrichmentModelError, run_mentions, run_topics
 from .source import (AudioSttSource, LayoutSpan, PlainScriptSource, ScriptLayout,
                      ScriptSource, TranscriptSource)
 from .paragraphs import ParagraphStream, build_stream, normalize
+from .segments import Segment, single_segment
 from .pipeline import (EnrichmentError, EnrichmentResult, PreparedScript, enrich,
                        enrich_script, ensure_script)
 from .naming import (EpisodeNames, EpisodeNamingMetadata, build_episode_names,
@@ -28,6 +29,7 @@ __all__ = [
     "EpisodeNamingMetadata",
     "LayoutSpan",
     "ScriptLayout",
+    "Segment",
     "ScriptSource",
     "TranscriptSource",
     "GateReport",
@@ -47,6 +49,7 @@ __all__ = [
     "render_notes_markdown",
     "run_mentions",
     "run_topics",
+    "single_segment",
     "transcribe_audio",
     "validate_mentions",
     "validate_topics",

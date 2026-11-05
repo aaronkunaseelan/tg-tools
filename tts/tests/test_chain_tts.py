@@ -185,7 +185,11 @@ def test_xtts_document_upload_runs_reader_and_publishes(stack, monkeypatch):
     assert "Philosophy and the practice of Bayesian statistics" in _exact_get(stack, episode["source_md_url"]).decode()
     assert "Heating water in a polypropylene bottle" in script and "The finding" in notes
     calls = model_calls(stack.root / "models.jsonl")
-    reader = [c for c in calls if c["cli"] == "claude"]
+    reader = [c for c in calls if c["cli"] == "claude" and c["step"] in ("write", "review", "revise")]
     assert [c["step"] for c in reader] == ["write", "review", "revise"]
+    # the notes ran on the `speech` tier of the enrichment tier file (haiku, through claude)
+    notes = [c for c in calls if c["step"] in ("topics", "mentions")]
+    assert "mentions" in {c["step"] for c in notes}      # x-tts takes its topics from the reader's plan
+    assert all(c["cli"] == "claude" and "claude-haiku-5-5" in c["argv"] for c in notes)
     session = reader[0]["argv"][reader[0]["argv"].index("--session-id") + 1]
     assert reader[2]["argv"][reader[2]["argv"].index("--resume") + 1] == session

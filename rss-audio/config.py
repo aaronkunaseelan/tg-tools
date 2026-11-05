@@ -50,10 +50,11 @@ class Settings:
     # When enrichment fails (e.g. the model hits a usage limit) the audio still
     # publishes without script/notes links. Set true to fail the job instead,
     # so no feed item lacks a transcript.
-    enrichment_required: bool = False
     enrichment_stt_model: str = "mini"
     mac_cookies_from_browser: str = "safari"
     enrichment_jobs: int = 4
+    # rss-edge origin the public episode URLs of the non-audio feeds are built from.
+    base_url: str = ""
 
 
 PUBLISH_LEASE_SECONDS = 7200
@@ -62,6 +63,19 @@ TRANSCRIBE_LEASE_SECONDS = 1800
 
 def transcribe_worker_id(worker_id: str) -> str:
     return f"{worker_id}-transcribe"
+
+
+WORKER_UNIT = "rss-audio-runtime-worker"
+
+
+def worker_settings() -> tuple[Settings, dict]:
+    """The running worker unit's effective settings and environment, for operator tools.
+
+    Never display the environment or exception text: it holds credentials.
+    """
+    from tg_tools_cli.telemetry import unit_environment
+    env, pid = unit_environment(WORKER_UNIT)
+    return load_settings(env, pid=pid), env
 
 
 def load_settings(environ=None, *, pid=None) -> Settings:
@@ -98,9 +112,9 @@ def load_settings(environ=None, *, pid=None) -> Settings:
         mullvad_control_url=env("RSS_AUDIO_MULLVAD_CONTROL_URL", "http://127.0.0.1:8000"),
         mullvad_control_token=env("RSS_AUDIO_MULLVAD_CONTROL_TOKEN", ""),
         enrichment_enabled=_flag("RSS_AUDIO_ENRICHMENT_ENABLED", True, source),
-        enrichment_required=_flag("RSS_AUDIO_ENRICHMENT_REQUIRED", False, source),
         enrichment_stt_model=env("RSS_AUDIO_ENRICHMENT_STT_MODEL", "mini"),
         enrichment_jobs=max(1, int(env("RSS_AUDIO_ENRICHMENT_JOBS", "4"))),
+        base_url=base_url,
     )
 
 

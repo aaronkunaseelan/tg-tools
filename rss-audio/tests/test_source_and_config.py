@@ -99,3 +99,16 @@ def test_validate_settings(change, named):
     with pytest.raises(RuntimeError) as err:
         validate_settings(settings(**change))
     assert all(name in str(err.value) for name in named)
+
+
+def test_completion_message_links_take_the_keyed_root(monkeypatch):
+    from pipeline import render_completion_message
+    stored = "https://rss-feeds.stations.work/audio/episodes/"
+    assert f'href="{stored}a.mp3"' in render_completion_message("A", stored + "a.mp3")
+    root = "https://rss-feeds.stations.work/episodes-" + "K" * 22
+    monkeypatch.setenv("RSS_AUDIO_PUBLIC_ROOT", root)
+    message = render_completion_message("A", stored + "a.mp3", notes_url=stored + "a.notes.md", script_url=stored + "a.script.md",
+                                        source_url="https://example.com/watch")
+    assert f'href="{root}/episodes/a.mp3"' in message
+    assert f'href="{root}/episodes/a.notes.md"' in message and f'href="{root}/episodes/a.script.md"' in message
+    assert "stations.work/audio/" not in message and "https://example.com/watch" in message

@@ -34,6 +34,8 @@ class EpisodeNames:
     script_name: str
     notes_name: str
     manifest_name: str
+    segments_name: str   # timed transcript (episode_enrichment.timing)
+    page_name: str       # the readable page: notes, then script (episode_enrichment.page)
 
 
 def _ascii(value: str) -> str:
@@ -128,7 +130,7 @@ def build_episode_names(metadata: EpisodeNamingMetadata) -> EpisodeNames:
     return names_from_prefix(prefix)
 
 
-def names_from_prefix(prefix: str) -> EpisodeNames:
+def names_from_prefix(prefix: str, version: int | None = None) -> EpisodeNames:
     """Derive the artifact name set from an already-decided prefix.
 
     Retries must reuse the prefix pinned by the first attempt's publish
@@ -137,12 +139,30 @@ def names_from_prefix(prefix: str) -> EpisodeNames:
     can disagree with the keys the publisher actually uploads under. Callers
     that hold a pinned slug build their names through this function so the
     in-document URLs and the uploaded keys share one source of truth.
+
+    ``version`` n >= 2 names a rebuilt document set, ``<prefix>.v<n>.script.md`` and so on: uploads are
+    immutable, so a rebuild never overwrites what an episode points at (X-76 D1). The audio is never
+    versioned.
     """
     prefix = (prefix or "").strip().strip("/") or "episode"
+    stem = f"{prefix}.v{version}" if version and version > 1 else prefix
     return EpisodeNames(
         prefix=prefix,
         audio_name=f"{prefix}.mp3",
-        script_name=f"{prefix}.script.md",
-        notes_name=f"{prefix}.notes.md",
-        manifest_name=f"{prefix}.manifest.json",
+        script_name=f"{stem}.script.md",
+        notes_name=f"{stem}.notes.md",
+        manifest_name=f"{stem}.manifest.json",
+        segments_name=f"{stem}.segments.json",
+        page_name=f"{stem}.page.html",
     )
+
+
+def document_version(prefix: str, url_or_name: str | None) -> int | None:
+    """The version of a document of ``prefix`` from its URL or file name: 1 unversioned, n for .v<n>.,
+    None when it is not one of this prefix's documents."""
+    name = str(url_or_name or "").rsplit("/", 1)[-1]
+    if not name.startswith(prefix + "."):
+        return None
+    rest = name[len(prefix) + 1:]
+    match = re.match(r"v(\d+)\.", rest)
+    return int(match.group(1)) if match else 1

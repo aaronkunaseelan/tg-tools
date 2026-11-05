@@ -198,6 +198,18 @@ class RuntimeClient:
     def get_job(self, *, job_id: str):
         return self._request("GET", f"/v1/jobs/{job_id}", timeout=5)
 
+    def list_jobs(self, *, producer_system: str = "rss-audio", status: tuple[str, ...] = (), limit: int = 100,
+                  producer_ref_prefix: str | None = None) -> dict[str, Any]:
+        """Newest first: ``{"items": [...], "count": <all matching>}`` (read only)."""
+        return self._request(
+            "GET", "/v1/jobs",
+            query={"producerSystem": producer_system, "status": tuple(status), "limit": limit,
+                   "producerRefPrefix": producer_ref_prefix}, timeout=10,
+        )
+
+    def list_workers(self, *, limit: int = 100) -> dict[str, Any]:
+        return self._request("GET", "/v1/workers", query={"limit": limit}, timeout=10)
+
     def consume_result(self, *, result_id: str, result_owner: str):
         return self._request("POST", "/v1/results/consume", body={"resultId": result_id, "resultOwner": result_owner}, timeout=5)
 

@@ -1,7 +1,11 @@
-name = "rss-edge"
+# Renamed in place from rss-edge (P5b, 2026-11-03) to match its one hostname. Secret FEED_KEYS: podcast keys.
+name = "rss-feeds"
 main = "src/index.js"
 compatibility_date = "2026-03-01"
-workers_dev = true
+workers_dev = false
+routes = [{ pattern = "rss-feeds.stations.work", custom_domain = true }]
+# Old versions answer on their preview URLs with the bindings and code they were uploaded with (cloudflare state 3 Nov).
+preview_urls = false
 
 [vars]
 # Set to the verified private copy before deployment. RSS credentials are Worker secrets.

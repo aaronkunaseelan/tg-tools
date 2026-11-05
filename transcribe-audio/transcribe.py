@@ -110,9 +110,9 @@ TRANSCRIBE_AUDIO_SELF_HOSTED_MODEL_ENV = "TRANSCRIBE_AUDIO_SELF_HOSTED_MODEL"
 SELF_HOSTED_MODEL_DEFAULT = "parakeet-ultra"
 SELF_HOSTED_PROVIDER = "self-hosted"
 # The whole source file is uploaded (the endpoint converts it): an hour of mp3
-# is ~60 MB, and re-encoding here costs more than sending it. Larger inputs,
+# is ~60 MB, and re-encoding here costs more than sending it. A 3 h radio show is ~213 MB (X-76). Larger inputs,
 # usually video, go to Azure's compact chunks instead.
-SELF_HOSTED_MAX_BYTES = 200 * 1024 * 1024
+SELF_HOSTED_MAX_BYTES = 400 * 1024 * 1024
 SELF_HOSTED_TIMEOUT_SEC = 600
 
 TRANSCRIBE_AUDIO_MODEL_ENV = "TRANSCRIBE_AUDIO_MODEL"
@@ -606,6 +606,19 @@ def transcribe_all(
     on_progress=None,
 ) -> str | None:
     """Transcribe all chunks and concatenate in source order."""
+    parts = transcribe_chunk_texts(config, access_token, chunks, model, jobs=jobs, on_progress=on_progress)
+    return None if parts is None else "\n\n".join(part for part in parts if part)
+
+
+def transcribe_chunk_texts(
+    config: AzureOpenAIConfig,
+    access_token: str,
+    chunks: list[str],
+    model: str,
+    jobs: int = DEFAULT_JOBS,
+    on_progress=None,
+) -> list[str] | None:
+    """Each chunk's text in source order (chunk i starts at i * CHUNK_DURATION_SEC), or None if any failed."""
     if not chunks:
         return None
 
@@ -620,7 +633,7 @@ def transcribe_all(
             parts.append(text)
             if on_progress:
                 on_progress(len(parts), len(chunks))
-        return "\n\n".join(part for part in parts if part)
+        return parts
 
     parts: list[str | None] = [None] * len(chunks)
     with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as pool:
@@ -639,23 +652,28 @@ def transcribe_all(
             if on_progress:
                 on_progress(completed, len(chunks))
 
-    return "\n\n".join(part for part in parts if part)
+    return parts
 
 
 # ── Self-hosted transcription ────────────────────────────────────────────────
 
-def transcribe_self_hosted(config: SelfHostedConfig, audio_path: str) -> tuple[str, str] | None:
+def transcribe_self_hosted(config: SelfHostedConfig, audio_path: str,
+                           vocab: str | None = None) -> tuple[str, str, dict] | None:
     """Transcribe a whole file on the self-hosted endpoint.
 
-    Returns (raw transcript, model label such as parakeet-ultra@fluidaudio-0.18.0),
-    or None after logging why, so the caller falls back to Azure.
+    Returns (raw transcript, model label such as parakeet-ultra@fluidaudio-0.18.0, timings), or None
+    after logging why, so the caller falls back to Azure. It asks for verbose_json: timings is
+    {"words": [{word, start, end}] | None, "segments": [{id, start, end, text}] | None} in seconds
+    from the file start (both None from a server that sends no timings). ``vocab`` names m3-asr's custom
+    vocabulary (``none`` turns the dictation list off); None leaves the server's default.
     """
     size = os.path.getsize(audio_path)
     if size > SELF_HOSTED_MAX_BYTES:
         log.warning("Self-hosted transcription skipped: %.0f MB is over %d MB",
                     size / 1024 / 1024, SELF_HOSTED_MAX_BYTES // 1024 // 1024)
         return None
-    body, content_type = _multipart_body(audio_path, {"model": config.model, "response_format": "json"})
+    fields = {"model": config.model, "response_format": "verbose_json", **({"vocab": vocab} if vocab else {})}
+    body, content_type = _multipart_body(audio_path, fields)
     req = urllib.request.Request(
         f"{config.url}/audio/transcriptions",
         data=body,
@@ -679,8 +697,10 @@ def transcribe_self_hosted(config: SelfHostedConfig, audio_path: str) -> tuple[s
         return None
     model = str(data.get("model") or config.model)
     label = f"{model}@{data['engine']}" if data.get("engine") else model
-    log.info(f"  → {len(text)} chars from {label} in {time.monotonic() - started:.1f}s")
-    return text, label
+    timings = {key: data.get(key) if isinstance(data.get(key), list) else None for key in ("words", "segments")}
+    log.info(f"  → {len(text)} chars from {label} in {time.monotonic() - started:.1f}s, "
+             f"{len(timings['words'] or [])} timed words")
+    return text, label, timings
 
 
 # ── Local formatting ──────────────────────────────────────────────────────────
@@ -805,7 +825,7 @@ def main():
         self_hosted = load_self_hosted_config()
         result = transcribe_self_hosted(self_hosted, audio_path) if self_hosted else None
         if result:
-            transcript, engine_model = result
+            transcript, engine_model = result[0], result[1]
             engine_provider = SELF_HOSTED_PROVIDER
         else:
             if self_hosted:

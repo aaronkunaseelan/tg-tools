@@ -19,6 +19,10 @@ PRIVATE_TEXT_KEYS = frozenset({
 SOURCE_KEYS = frozenset({"sourceText", "sourceUrl"})
 # runtime-controller src/types/runtime.ts RESULT_KINDS (not attempt statuses).
 TERMINAL_RESULT_KINDS = frozenset({"succeeded", "dead", "cancelled"})
+# A scheduled live window whose stream carried another programme that day. The job ends terminal
+# (the controller has no "skipped" outcome); the scheduler reports it as a skip and telemetry does
+# not count it as a failure. Both read this one name.
+SKIPPED_ERROR_CLASS = "window_not_show"
 
 
 def telegram_source_key(bot_identity: str, chat_id: int, message_id: int) -> str:

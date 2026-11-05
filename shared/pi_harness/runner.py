@@ -250,8 +250,8 @@ class PiRunner:
     """Run one prompt headlessly and return its stdout."""
 
     def __init__(self, role: str, cwd: str, mock: bool = False,
-                 session_dir: str | None = None):
-        config = resolve_role(role)
+                 session_dir: str | None = None, tier: str | None = None):
+        config = resolve_role(role, tier=tier)
         self.provider = config["provider"]
         self.model = config["model"]
         self.thinking = config["thinking"]

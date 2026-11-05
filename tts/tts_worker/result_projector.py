@@ -21,6 +21,7 @@ from typing import Any
 
 from tg_tools_common import runtime_contract
 from tg_tools_common.delivery_contract import telegram_reply_text
+from tg_tools_common.podcast_urls import display_url_from_env
 
 from .config import feed_title
 from .notifications import render_failure_notification
@@ -35,10 +36,12 @@ def render_notification(result_kind: str, result_json: dict[str, Any]) -> str:
         return "Request cancelled."
     if result_kind == "succeeded" and result_json.get("ok"):
         label = "Existing episode in" if result_json.get("existingEpisode") else "Posted to"
+        # Links in messages take the podcast's keyed path; stored URLs keep the storage form.
+        link = lambda name: display_url_from_env(result_json.get(name, ''), "tts", "TTS_PUBLIC_ROOT") or ''
         text = (f"{label} {feed_title()}:\n{result_json.get('title', '')}\n"
-                f"{result_json.get('publicAudioUrl', '')}\n"
-                f"Script: {result_json.get('scriptUrl', '')}\n"
-                f"Notes: {result_json.get('notesUrl', '')}\n"
+                f"{link('publicAudioUrl')}\n"
+                f"Script: {link('scriptUrl')}\n"
+                f"Notes: {link('notesUrl')}\n"
                 f"Feed: {result_json.get('feedUrl', '')}")
         if result_json.get("xMode"):
             usage = result_json.get("modelUsage") or {}

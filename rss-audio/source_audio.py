@@ -423,6 +423,31 @@ def fetch_source_metadata_for_route(
     )
 
 
+def fetch_source_json_for_route(
+    settings: SourceToolSettings,
+    url: str,
+    route: SourceRoute,
+    *,
+    playlist_end: int | None = None,
+    timeout: int | None = None,
+) -> dict:
+    """yt-dlp's JSON for ``url`` by ``route``, downloading nothing: one video (the metadata step's own
+    command), or with ``playlist_end`` a flat listing of a playlist's first entries (one call, no video read)."""
+    validate_source_url(url)
+    command = (_metadata_command_for_route(settings, url, route) if playlist_end is None
+               else _flat_listing_command_for_route(settings, url, route, playlist_end))
+    result = run_command(command, stage="metadata",
+                         timeout=timeout if timeout is not None else _default_metadata_timeout(route),
+                         env=sanitized_source_subprocess_env())
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise SourceAudioError("metadata", "yt-dlp returned invalid JSON", result.stdout[:500]) from exc
+    if not isinstance(data, dict):
+        raise SourceAudioError("metadata", "yt-dlp returned JSON that is not an object", result.stdout[:500])
+    return data
+
+
 def download_source_to_mp3(
     settings: SourceToolSettings,
     source: str,
@@ -590,6 +615,17 @@ def _local_metadata_command(settings: SourceToolSettings, url: str) -> list[str]
         ]
     )
     return command
+
+
+def _flat_listing_command_for_route(settings: SourceToolSettings, url: str, route: SourceRoute,
+                                    playlist_end: int) -> list[str]:
+    flat = ["--flat-playlist", "--dump-single-json", "--playlist-end", str(int(playlist_end))]
+    if route == SourceRoute.MAC_SSH:
+        remote = ("export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; "
+                  f"{shlex.quote(settings.mac_ytdlp_path)} {' '.join(flat)} {_mac_cookie_args(settings)}"
+                  f"{_remote_component_shell_args(settings)} {shlex.quote(url)}")
+        return ["ssh", settings.mac_ssh_target, remote]
+    return [settings.yt_dlp_bin, "--proxy", settings.mullvad_proxy, *flat, *_remote_component_argv(settings), url]
 
 
 def _mac_stage_download_command(settings: SourceToolSettings, url: str, remote_output_template: str) -> list[str]:

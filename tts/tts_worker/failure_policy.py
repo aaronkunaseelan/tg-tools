@@ -30,6 +30,8 @@ TERMINAL_CLASSES = {
     "invalid_input",
     "audio_pace_implausible",
     "service_configuration_failure",
+    # The enrichment tier file (or a roles file) is missing or wrong: nothing a retry fixes.
+    "enrichment_config",
     "source_too_large_for_reader",
     "source_shape_unsupported",
     "model_budget_exhausted",

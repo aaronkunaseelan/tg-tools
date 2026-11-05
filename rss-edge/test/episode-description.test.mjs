@@ -2,8 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { episodeDescription } from '../src/episode-description.js';
 import worker from '../src/index.js';
+import { FEED_KEYS, EPISODES, SPEECH, SKEPTIC } from './keys.mjs';
 
-const base = 'https://rss-edge.05802.workers.dev';
+const base = 'https://rss-feeds.stations.work';
 const notes = `${base}/audio/test.notes.md`;
 const script = `${base}/audio/test.script.md`;
 const episode = {
@@ -77,13 +78,14 @@ test('non-generated publisher HTML is preserved, not summarized or reinterpreted
 test('RSS fields render top links with stable GUID/enclosure and explicit plain fallback', async () => {
   const feed = { id: 'audio', site_url: base, logo_path: 'logo.png', categories: '[]', author: 'Author', email: 'a@example.com', title: 'Title', description: 'Feed', language: 'en', copyright: 'Copyright', explicit: 'no', updated_at: '1' };
   const DB = { prepare: (sql) => ({ bind: () => ({ first: async () => sql.includes('MAX(') ? { count: 1, latest_updated: '1' } : feed, all: async () => ({ results: [episode] }), run: async () => ({}) }) }) };
-  const response = await worker.fetch(new Request(`${base}/audio/podcast.xml`), { DB });
+  const response = await worker.fetch(new Request(`${EPISODES}/podcast.xml`), { DB, FEED_KEYS });
   const xml = await response.text();
   assert.match(xml, /<description><!\[CDATA\[<p><a href=/);
   assert.match(xml, /<content:encoded><!\[CDATA\[<p><a href=/);
   assert.match(xml, /<itunes:summary><!\[CDATA\[Notes: https:/);
   assert.match(xml, /<guid isPermaLink="false">test\.md<\/guid>/);
-  assert.match(xml, /<enclosure url="https:\/\/rss-edge\.05802\.workers\.dev\/audio\/test\.mp3" length="42"/);
+  assert.ok(xml.includes(`<enclosure url="${EPISODES}/test.mp3" length="42"`));
+  assert.doesNotMatch(xml, /stations\.work\/audio\//);
   assert.doesNotMatch(xml, /artifact-links|test\.manifest\.json/);
   assert.match(response.headers.get('cache-control'), /s-maxage=300/);
 });

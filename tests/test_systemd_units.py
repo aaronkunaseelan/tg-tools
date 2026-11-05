@@ -39,7 +39,7 @@ def pythonpath(d: dict[str, list[str]]) -> str:
 def test_units_shipped():
     assert [unit.stem for unit in UNITS] == [
         "meeting-summary-result-consumer", "meeting-summary-runtime-worker", "rss-audio-runtime-worker",
-        "rss-audio-transcribe-runtime-worker", "tg-gateway-ms", "tg-gateway-rss", "tg-tools-telemetry", "tts-result-projector",
+        "rss-audio-schedule", "rss-audio-transcribe-runtime-worker", "tg-gateway-ms", "tg-gateway-rss", "tg-tools-telemetry", "tts-result-projector",
         "tts-worker"]
 
 
@@ -70,3 +70,14 @@ def test_unit_entrypoint_imports(unit):
                             cwd=d["WorkingDirectory"][0].replace(CURRENT, f"{REPO}/"), env=env,
                             capture_output=True, text=True, timeout=60)
     assert result.returncode == 0, result.stderr[-2000:]
+
+
+def test_schedule_unit_and_timer():
+    """The nightly scheduler: oneshot like the worker (same env files), alerting on failure, in quiet time."""
+    service, timer = directives(REPO / "systemd/rss-audio-schedule.service"), directives(REPO / "systemd/rss-audio-schedule.timer")
+    worker = directives(REPO / "systemd/rss-audio-runtime-worker.service")
+    assert service["Type"] == ["oneshot"] and service["OnFailure"] == ["lane-alert@%n.service"]
+    assert service["EnvironmentFile"] == worker["EnvironmentFile"] and pythonpath(service) == pythonpath(worker)
+    assert service["ExecStart"] == [PYTHON + " scheduled_sources.py"]
+    assert timer["OnCalendar"] == ["*-*-* 01:30:00 UTC"] and timer["RandomizedDelaySec"] == ["10min"]
+    assert timer["Persistent"] == ["true"] and timer["WantedBy"] == ["timers.target"]

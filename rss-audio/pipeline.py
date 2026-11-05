@@ -11,7 +11,7 @@ import os
 import re
 import shlex
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib import error as urlerror
@@ -19,10 +19,12 @@ from urllib import request as urlrequest
 from urllib.parse import urlencode
 
 from config import Settings
+from tg_tools_common.podcast_urls import display_url_from_env
 from tg_tools_common.progress import current_progress, tracked_stage
 from tg_tools_common.rclone_upload import immutable_copy_argv
 from episode_enrichment import (EpisodeNames, EpisodeNamingMetadata,
                                 build_episode_names, names_from_prefix)
+from episode_enrichment.naming import document_version
 from source_audio import (
     SourceAudioError,
     SourceMetadata,
@@ -192,6 +194,98 @@ class PipelineError(RuntimeError):
                 "errorCode": self.error_code}
 
 
+# The feeds rss-audio may publish: feed id -> (B2 prefix, env var holding the keyed public root).
+# The prefix is also the Worker's `feed` id and the first path segment of every stored URL.
+FEEDS = {
+    "audio": ("audio", "RSS_AUDIO_PUBLIC_ROOT"),
+    "surveillance": ("surveillance", "SURVEILLANCE_PUBLIC_ROOT"),
+}
+# Which enrichment pipeline (a key of the enrichment tier file) each feed's episodes belong to.
+ENRICHMENT_PIPELINES = {"audio": "episodes", "surveillance": "surveillance"}
+SCHEDULED_DATE_BASIS = "scheduled_source"
+
+
+def feed_spec(feed: str) -> tuple[str, str]:
+    try:
+        return FEEDS[feed]
+    except (KeyError, TypeError):
+        raise PipelineError("input", f"Unknown feed {feed!r}; known feeds: {', '.join(sorted(FEEDS))}") from None
+
+
+@dataclass(frozen=True)
+class JobOptions:
+    """Optional job inputs that apply to every source kind (absent = today's behaviour)."""
+    feed: str = "audio"
+    published_at: str | None = None   # ISO 8601 UTC, normalised to ...Z
+    title: str | None = None
+    delivery: str = "telegram"
+    # Model tier of this job's enrichment, resolved once at job start (enrichment_preflight).
+    enrichment_tier: str | None = None
+
+
+def job_options(input_json: dict) -> JobOptions:
+    feed = input_json.get("feed", "audio")
+    feed_spec(feed)
+    published_at = input_json.get("publishedAt")
+    if published_at is not None:
+        published_at = _utc_iso(published_at)
+    title = input_json.get("title")
+    if title is not None:
+        if not isinstance(title, str) or not " ".join(title.split()):
+            raise PipelineError("input", "title must be a non-empty string")
+        title = " ".join(title.split())
+    delivery = input_json.get("delivery", "telegram")
+    if delivery not in {"telegram", "none"}:
+        raise PipelineError("input", f"Unknown delivery {delivery!r}; expected 'none' or absent")
+    return JobOptions(feed=feed, published_at=published_at, title=title, delivery=delivery)
+
+
+def enrichment_preflight(settings: Settings, feed: str) -> str | None:
+    """The enrichment model tier of ``feed``'s pipeline, read from the tier file now.
+
+    Called once at the start of a job, before any download or paid call. A configuration problem
+    fails the job (terminal, errorClass ``enrichment_config``); it is never the optional
+    "enrichment failed, audio published anyway" outcome. None when enrichment is switched off.
+    """
+    if not settings.enrichment_enabled:
+        return None
+    feed_spec(feed)
+    pipeline = ENRICHMENT_PIPELINES[feed]
+    try:
+        from pi_harness import EnrichmentConfigError, enrichment_tier
+    except ImportError as exc:
+        raise PipelineError("enrichment_config", f"enrichment model configuration is unavailable: {exc}",
+                            retryable=False) from exc
+    try:
+        return enrichment_tier(pipeline)
+    except EnrichmentConfigError as exc:
+        raise PipelineError("enrichment_config", str(exc), retryable=False) from exc
+
+
+def _utc_iso(value) -> str:
+    try:
+        moment = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (AttributeError, ValueError):
+        raise PipelineError("input", f"publishedAt must be an ISO 8601 UTC time, got {value!r}") from None
+    if moment.tzinfo is None or moment.utcoffset() is None:
+        raise PipelineError("input", f"publishedAt must carry a UTC offset, got {value!r}")
+    return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def apply_options(metadata: "EpisodeMetadata", options: JobOptions) -> "EpisodeMetadata":
+    """Feed, title and date the job asked for. A given title is the whole episode title, so the
+    source's channel, creators and series (which would prefix it and the slug) are dropped."""
+    changes: dict = {"feed": options.feed}
+    if options.title:
+        changes.update(title=options.title, channel="", creators=(), series="")
+    if options.published_at:
+        changes.update(source_published_at=options.published_at, date_basis=SCHEDULED_DATE_BASIS,
+                       pub_date=options.published_at,
+                       published_human=datetime.fromisoformat(options.published_at.replace("Z", "+00:00"))
+                       .strftime("%b %d, %Y"))
+    return replace(metadata, **changes)
+
+
 @dataclass(frozen=True)
 class EpisodeMetadata:
     title: str
@@ -207,6 +301,9 @@ class EpisodeMetadata:
     source_published_at: str | None = None
     date_basis: str = "unknown"
     enclosure_url: str | None = None
+    feed: str = "audio"
+    # Feed ordering time the job supplied; None = ingestion time.
+    pub_date: str | None = None
 
 
 @dataclass(frozen=True)
@@ -218,6 +315,10 @@ class PublishResult:
     script_url: str | None = None
     notes_url: str | None = None
     manifest_url: str | None = None
+    segments_url: str | None = None
+    page_url: str | None = None
+    # The notes job to submit (pipeline.notes_input) when the episode has a script and no notes yet.
+    notes: dict | None = None
 
 
 def _episode_names(metadata: EpisodeMetadata, identity: str,
@@ -233,13 +334,19 @@ def _episode_names(metadata: EpisodeMetadata, identity: str,
     ))
 
 
-def _names_with_prefix(names: EpisodeNames, prefix: str) -> EpisodeNames:
-    return EpisodeNames(prefix, f"{prefix}.mp3", f"{prefix}.script.md",
-                        f"{prefix}.notes.md", f"{prefix}.manifest.json")
+def _public_bases(settings: Settings, feed: str) -> tuple[str, str]:
+    """(audio base, document base) of one feed's public episode URLs."""
+    prefix, _ = feed_spec(feed)
+    if feed == "audio":
+        return settings.public_audio_base_url, settings.public_md_base_url
+    if not settings.base_url:
+        raise PipelineError("config", "Missing RSS audio base URL")
+    base = f"{settings.base_url}/{prefix}/episodes"
+    return base, base
 
 
-def build_public_audio_url(settings: Settings, slug: str) -> str:
-    return f"{settings.public_audio_base_url}/{slug}.mp3"
+def build_public_audio_url(settings: Settings, slug: str, feed: str = "audio") -> str:
+    return f"{_public_bases(settings, feed)[0]}/{slug}.mp3"
 
 
 def render_completion_message(
@@ -248,7 +355,12 @@ def render_completion_message(
     notes_url: str | None = None,
     script_url: str | None = None,
     source_url: str | None = None,
+    feed: str = "audio",
 ) -> str:
+    # Links in messages take the podcast's keyed path; stored URLs keep the storage form.
+    prefix, root_variable = feed_spec(feed)
+    public_url, notes_url, script_url = (display_url_from_env(url, prefix, root_variable)
+                                         for url in (public_url, notes_url, script_url))
     safe_label = html.escape(title_or_slug, quote=False)
     safe_url = html.escape(public_url, quote=True)
     message = f'Posted: <a href="{safe_url}">{safe_label}</a>'
@@ -302,31 +414,32 @@ def list_recent_episodes(settings: Settings, limit: int = 10) -> list[tuple[str,
     return [(row["slug"], row["title"]) for row in rows[:limit]]
 
 
-def delete_episode(settings: Settings, slug: str) -> None:
+def delete_episode(settings: Settings, slug: str, feed: str | None = None) -> None:
+    """Delete an episode's row and every object it owns, in whichever feed holds it (or ``feed``)."""
     slug = _validate_slug(slug)
-    episode = _get_episode_by_slug(settings, slug)
-    if episode is None:
+    feeds = [feed] if feed else list(FEEDS)
+    found = next(((name, row) for name in feeds if (row := _get_episode_by_slug(settings, slug, name))), None)
+    if found is None:
         raise PipelineError("delete", f"No episode found for slug `{slug}`")
-
+    feed, episode = found
     _api_json(settings, "DELETE", f"/api/episodes/{episode['id']}")
-    # Every artifact the publisher uploaded for this slug, not just the audio.
-    # Since the script/notes split an episode owns four objects; deleting only
-    # the mp3 left three orphans in the bucket per deletion.
-    names = names_from_prefix(slug)
-    failures: list[str] = []
-    for file_name in (names.audio_name, names.script_name,
-                      names.notes_name, names.manifest_name):
-        remote = f"{settings.b2_remote}:{settings.b2_bucket}/audio/episodes/{file_name}"
-        try:
-            _run([settings.rclone_bin, "delete", remote], stage="delete")
-        except PipelineError as exc:
-            # Older episodes predate some of these artifacts, and the API row
-            # is already gone. Collect and report rather than aborting
-            # part-way through and leaving a worse mess than we started with.
-            failures.append(f"{file_name}: {exc}")
-    if failures:
-        logger.warning("delete_episode(%s) left artifacts behind: %s",
-                       slug, "; ".join(failures))
+    # Every object named <slug>.*: the mp3 and each version of the script, segments, notes and manifest
+    # (a slug ends in a 12-hex identity, so the pattern holds only this episode's objects).
+    delete_documents(settings, slug, feed)
+
+
+def delete_documents(settings: Settings, slug: str, feed: str, *, below_version: int | None = None) -> None:
+    """Delete ``slug``'s objects in ``feed``: all of them, or only the documents of versions below n."""
+    slug = _validate_slug(slug)
+    remote = f"{settings.b2_remote}:{settings.b2_bucket}/{feed_spec(feed)[0]}/episodes/"
+    if below_version is None:
+        patterns = [f"{slug}.*"]
+    else:
+        listed = _run([settings.rclone_bin, "lsf", "--include", f"{slug}.*", remote], stage="delete").stdout.split()
+        patterns = [name for name in listed if not name.endswith(".mp3")
+                    and (document_version(slug, name) or below_version) < below_version]
+    for pattern in patterns:
+        _run([settings.rclone_bin, "delete", "--include", pattern, remote], stage="delete")
 
 
 @contextlib.contextmanager
@@ -345,6 +458,9 @@ def _staging_dir(work_dir: Path | None):
         yield Path(tmpdir)
 
 
+DEFAULT_OPTIONS = JobOptions()
+
+
 def ingest_url_with_metadata(
     settings: Settings,
     url: str,
@@ -352,18 +468,20 @@ def ingest_url_with_metadata(
     *,
     route: SourceRoute = SourceRoute.OCI_MULLVAD,
     work_dir: Path | None = None,
+    options: JobOptions = DEFAULT_OPTIONS,
 ) -> PublishResult:
+    metadata = apply_options(metadata, options)
     identity = hashlib.sha256(url.encode("utf-8")).hexdigest()
     names = _episode_names(metadata, identity)
-    published = already_published(settings, names.prefix)
+    published = already_published(settings, names.prefix, metadata.feed, metadata, work_dir)
     if published is not None:
         return published
-    names = _names_with_prefix(names, names.prefix)
+    names = names_from_prefix(names.prefix)
     with _staging_dir(work_dir) as staging:
         mp3_path = staging / names.audio_name
         if not mp3_path.exists() or mp3_path.stat().st_size == 0:
             _download_url_to_mp3(settings, url, mp3_path, route=route)
-        return _finalize_publish(settings, metadata, names, mp3_path, staging)
+        return _finalize_publish(settings, metadata, names, mp3_path, staging, options.enrichment_tier)
 
 
 def ingest_direct_audio_url(
@@ -371,21 +489,22 @@ def ingest_direct_audio_url(
     url: str,
     *,
     work_dir: Path | None = None,
+    options: JobOptions = DEFAULT_OPTIONS,
 ) -> PublishResult:
-    metadata = fetch_metadata(settings, url, route=SourceRoute.OCI_MULLVAD)
+    metadata = apply_options(fetch_metadata(settings, url, route=SourceRoute.OCI_MULLVAD), options)
     identity = hashlib.sha256(url.encode("utf-8")).hexdigest()
     names = _episode_names(metadata, identity)
-    published = already_published(settings, names.prefix)
+    published = already_published(settings, names.prefix, metadata.feed, metadata, work_dir)
     if published is not None:
         return published
-    names = _names_with_prefix(names, names.prefix)
+    names = names_from_prefix(names.prefix)
     with _staging_dir(work_dir) as staging:
         mp3_path = staging / names.audio_name
         if not mp3_path.exists() or mp3_path.stat().st_size == 0:
             # Never let ffmpeg fetch a remote URL directly: stage it through
             # the same explicit Mullvad yt-dlp route as extractor sources.
             _download_url_to_mp3(settings, url, mp3_path, route=SourceRoute.OCI_MULLVAD)
-        return _finalize_publish(settings, metadata, names, mp3_path, staging)
+        return _finalize_publish(settings, metadata, names, mp3_path, staging, options.enrichment_tier)
 
 
 def ingest_local_audio(
@@ -394,9 +513,10 @@ def ingest_local_audio(
     title_hint: str | None = None,
     *,
     work_dir: Path | None = None,
+    options: JobOptions = DEFAULT_OPTIONS,
 ) -> PublishResult:
     base_title = title_hint or source_path.stem or "audio"
-    metadata = EpisodeMetadata(
+    metadata = apply_options(EpisodeMetadata(
         title=base_title.replace("-", " ").strip() or "audio",
         channel="telegram",
         description="",
@@ -407,7 +527,7 @@ def ingest_local_audio(
         source_url=None,
         source_published_at=None,
         date_basis="unknown",
-    )
+    ), options)
     try:
         identity = hashlib.sha256(source_path.read_bytes()).hexdigest()
     except OSError:
@@ -415,15 +535,57 @@ def ingest_local_audio(
         # planning/test callers deterministic without pretending the bytes were read.
         identity = hashlib.sha256(str(source_path).encode("utf-8")).hexdigest()
     names = _episode_names(metadata, identity)
-    published = already_published(settings, names.prefix)
+    published = already_published(settings, names.prefix, metadata.feed, metadata, work_dir)
     if published is not None:
         return published
-    names = _names_with_prefix(names, names.prefix)
+    names = names_from_prefix(names.prefix)
     with _staging_dir(work_dir) as staging:
         mp3_path = staging / names.audio_name
         if not mp3_path.exists() or mp3_path.stat().st_size == 0:
             _convert_input_to_mp3(settings, str(source_path), mp3_path, stage="convert")
-        return _finalize_publish(settings, metadata, names, mp3_path, staging)
+        return _finalize_publish(settings, metadata, names, mp3_path, staging, options.enrichment_tier)
+
+
+def ingest_live_window(
+    settings: Settings,
+    *,
+    source_url: str,
+    identity_text: str,
+    fetch_audio,
+    work_dir: Path | None = None,
+    options: JobOptions = DEFAULT_OPTIONS,
+) -> PublishResult:
+    """Publish a window cut from a live stream.
+
+    The identity is the window (video id + start), not the bytes, so a retry or a re-run finds
+    its episode before paying for three hours of audio. ``fetch_audio(staging_dir)`` returns the
+    window's audio file and is called only when the episode does not exist yet.
+    """
+    metadata = apply_options(EpisodeMetadata(
+        title=options.title or "Live window", channel="", description="", duration_seconds=0,
+        published_human="Unknown", source_url=source_url, source_published_at=None, date_basis="unknown",
+    ), options)
+    names = _episode_names(metadata, hashlib.sha256(identity_text.encode("utf-8")).hexdigest())
+    published = already_published(settings, names.prefix, metadata.feed, metadata, work_dir)
+    if published is not None:
+        return published
+    names = names_from_prefix(names.prefix)
+    with _staging_dir(work_dir) as staging:
+        mp3_path = staging / names.audio_name
+        if not mp3_path.exists() or mp3_path.stat().st_size == 0:
+            audio_path = Path(fetch_audio(staging))
+            _convert_input_to_mp3(settings, str(audio_path), mp3_path, stage="convert")
+        metadata = replace(metadata, duration_seconds=_probe_duration_seconds(settings, mp3_path))
+        return _finalize_publish(settings, metadata, names, mp3_path, staging, options.enrichment_tier)
+
+
+def _probe_duration_seconds(settings: Settings, path: Path) -> int:
+    result = _run([settings.ffprobe_bin, "-v", "error", "-show_entries", "format=duration", "-of",
+                   "default=noprint_wrappers=1:nokey=1", str(path)], stage="validate", timeout=60)
+    try:
+        return max(0, round(float(result.stdout.strip())))
+    except ValueError:
+        return 0
 
 
 @tracked_stage("source_metadata", lambda r: {"title": " ".join(r.title.split())[:200], "audioDurationSeconds": max(0,r.duration_seconds)})
@@ -455,73 +617,78 @@ def _episode_metadata_from_source(metadata: SourceMetadata) -> EpisodeMetadata:
     )
 
 
-def build_public_notes_url(settings: Settings, names: EpisodeNames) -> str:
-    return f"{settings.public_md_base_url}/{names.notes_name}"
+def build_public_notes_url(settings: Settings, names: EpisodeNames, feed: str = "audio") -> str:
+    return f"{_public_bases(settings, feed)[1]}/{names.notes_name}"
 
 
-def build_public_script_url(settings: Settings, names: EpisodeNames) -> str:
-    return f"{settings.public_md_base_url}/{names.script_name}"
+def build_public_script_url(settings: Settings, names: EpisodeNames, feed: str = "audio") -> str:
+    return f"{_public_bases(settings, feed)[1]}/{names.script_name}"
 
 
-def build_public_md_url(settings: Settings, slug: str) -> str:
-    return f"{settings.public_md_base_url}/{slug}.notes.md"
+def build_public_segments_url(settings: Settings, names: EpisodeNames, feed: str = "audio") -> str:
+    return f"{_public_bases(settings, feed)[1]}/{names.segments_name}"
 
 
-def build_public_manifest_url(settings: Settings, names: EpisodeNames | str) -> str:
+def build_public_page_url(settings: Settings, names: EpisodeNames, feed: str = "audio") -> str:
+    return f"{_public_bases(settings, feed)[1]}/{names.page_name}"
+
+
+def build_public_md_url(settings: Settings, slug: str, feed: str = "audio") -> str:
+    return f"{_public_bases(settings, feed)[1]}/{slug}.notes.md"
+
+
+def build_public_manifest_url(settings: Settings, names: EpisodeNames | str, feed: str = "audio") -> str:
     name = names.manifest_name if isinstance(names, EpisodeNames) else f"{names}.manifest.json"
-    return f"{settings.public_md_base_url}/{name}"
+    return f"{_public_bases(settings, feed)[1]}/{name}"
 
 
-def _enrich_episode(
-    settings: Settings,
-    metadata: EpisodeMetadata,
-    names: EpisodeNames,
-    mp3_path: Path,
-    work_dir: Path | None,
-):
-    """Run transcript enrichment, or return None when it is not in play.
+def _transcribe(settings: Settings, mp3_path: Path, work_dir: Path | None, tier: str | None):
+    """The episode's script and timed transcript (a PreparedScript), or None for audio only.
 
-    Raises PipelineError('enrichment') when enrichment fails *and* is required,
-    so the episode is never installed pointing at a transcript that does not
-    exist.
+    Speech-to-text runs here; notes are the notes job's (notes_job.py), so nothing waits on them. A
+    configuration problem fails the job; any other failure publishes the audio alone, as before.
     """
     if not settings.enrichment_enabled:
         return None
-
-    try:
-        from episode_enrichment import AudioSttSource, enrich
-    except Exception as exc:
-        if settings.enrichment_required:
-            raise PipelineError(
-                "enrichment", f"transcript enrichment is unavailable: {exc}") from exc
-        logger.warning("enrichment unavailable; publishing audio only: %s", exc)
-        return None
-
+    if not tier:   # the notes job will need it: fail before the paid step, not after
+        raise PipelineError("enrichment_config", "enrichment ran without a model tier", retryable=False)
+    from episode_enrichment import AudioSttSource, ensure_script
     target = Path(work_dir) if work_dir else mp3_path.parent / "enrichment"
     try:
-        return enrich(
-            source=AudioSttSource(
-                mp3_path, stt_model=settings.enrichment_stt_model,
-                jobs=settings.enrichment_jobs),
-            work_dir=target,
-            title=metadata.title,
-            slug=names.prefix,
-            published=metadata.source_published_at,
-            date_basis=metadata.date_basis,
-            duration_seconds=metadata.duration_seconds,
-            mp3_url=build_public_audio_url(settings, names.prefix),
-            notes_url=build_public_notes_url(settings, names),
-            script_url=build_public_script_url(settings, names),
-            source_url=metadata.source_url,
-            stt_model=settings.enrichment_stt_model,
-            jobs=settings.enrichment_jobs,
-        )
+        return ensure_script(work_dir=target, source=AudioSttSource(
+            mp3_path, stt_model=settings.enrichment_stt_model, jobs=settings.enrichment_jobs))
     except Exception as exc:
-        if settings.enrichment_required:
-            stage = getattr(exc, "stage", "run")
-            raise PipelineError("enrichment", f"{stage}: {exc}") from exc
-        logger.warning("enrichment failed; publishing audio only: %s", exc)
+        if getattr(exc, "error_class", None) == "enrichment_config":
+            raise PipelineError("enrichment_config", str(exc), retryable=False) from exc
+        logger.warning("speech-to-text failed; publishing audio only: %s", exc)
         return None
+
+
+def notes_input(*, feed: str, slug: str, version: int, script_sha256: str | None, title: str,
+                published_at: str | None, date_basis: str, duration_seconds: int | float | None,
+                source_url: str | None, stt_engine: str | None, segmenter: str | None = None,
+                segment_context: dict | None = None) -> dict:
+    """The notes job's input (notes_job.py). Everything its manifest needs travels with it.
+
+    The original's link is ``originalUrl``: a ``sourceUrl`` would make the worker fetch it as a source.
+    """
+    payload = {"kind": "rss", "inputKind": "notes", "feed": feed, "slug": slug, "version": version,
+               "scriptSha256": script_sha256, "title": title, "publishedAt": published_at,
+               "dateBasis": date_basis, "durationSeconds": duration_seconds, "originalUrl": source_url,
+               "sttEngine": stt_engine, "delivery": "none"}
+    if segmenter:
+        payload["segmenter"] = segmenter
+    if segment_context:
+        payload["segmentContext"] = dict(segment_context)
+    return payload
+
+
+def _notes_for(metadata: EpisodeMetadata, slug: str, version: int, script_sha256: str | None,
+               stt_engine: str | None) -> dict:
+    return notes_input(feed=metadata.feed, slug=slug, version=version, script_sha256=script_sha256,
+                       title=metadata.title, published_at=metadata.source_published_at,
+                       date_basis=metadata.date_basis, duration_seconds=metadata.duration_seconds or None,
+                       source_url=metadata.source_url, stt_engine=stt_engine)
 
 
 def _finalize_publish(
@@ -530,44 +697,40 @@ def _finalize_publish(
     names: EpisodeNames | str,
     mp3_path: Path,
     work_dir: Path | None = None,
+    tier: str | None = None,
 ) -> PublishResult:
     _validate_mp3_artifact(settings, mp3_path)
     if isinstance(names, str):
-        names = _names_with_prefix(
-            EpisodeNames(names, "", "", "", ""), names)
+        names = names_from_prefix(names)
 
-    # Script and notes are complete before the first upload. A failed analysis
-    # can therefore never install an episode with missing documents.
-    enriched = _enrich_episode(settings, metadata, names, mp3_path, work_dir)
+    # The script and its timed transcript are complete before the first upload; notes follow in
+    # their own job, so the episode goes live as soon as speech-to-text is done.
+    script = _transcribe(settings, mp3_path, work_dir, tier)
     artifact_dir = Path(work_dir) if work_dir else mp3_path.parent
-    script_path = notes_path = manifest_path = None
-    if enriched is not None:
-        script_path = artifact_dir / names.script_name
-        notes_path = artifact_dir / names.notes_name
-        manifest_path = artifact_dir / names.manifest_name
-        script_path.write_text(enriched.script_markdown, encoding="utf-8")
-        notes_path.write_text(enriched.notes_markdown, encoding="utf-8")
-        manifest_path.write_text(enriched.manifest, encoding="utf-8")
+    documents: list[tuple[Path, str]] = []   # (local path, file name), uploaded in this order
+    if script is not None:
+        for text, file_name in ((script.text, names.script_name), (script.timed_transcript, names.segments_name)):
+            if text is not None:   # no timings, no segments file
+                (artifact_dir / file_name).write_text(text, encoding="utf-8")
+                documents.append((artifact_dir / file_name, file_name))
 
     uploaded_keys: list[str] = []
-    public_audio_url = build_public_audio_url(settings, names.prefix)
-    script_url = notes_url = manifest_url = None
+    feed = metadata.feed
+    prefix = feed_spec(feed)[0]
+    public_audio_url = build_public_audio_url(settings, names.prefix, feed)
+    script_url = segments_url = None
     try:
-        _upload_mp3(settings, mp3_path)
-        uploaded_keys.append(f"audio/episodes/{names.audio_name}")
-        if enriched is not None:
-            assert script_path is not None and notes_path is not None and manifest_path is not None
-            for local_path, file_name in (
-                (script_path, names.script_name),
-                (notes_path, names.notes_name),
-                (manifest_path, names.manifest_name),
-            ):
-                key = f"audio/episodes/{file_name}"
-                _upload_artifact(settings, local_path, key)
-                uploaded_keys.append(key)
-            script_url = build_public_script_url(settings, names)
-            notes_url = build_public_notes_url(settings, names)
-            manifest_url = build_public_manifest_url(settings, names)
+        _upload_mp3(settings, mp3_path, prefix)
+        uploaded_keys.append(f"{prefix}/episodes/{names.audio_name}")
+        for local_path, file_name in documents:
+            key = f"{prefix}/episodes/{file_name}"
+            _upload_artifact(settings, local_path, key)
+            uploaded_keys.append(key)
+        uploaded = {file_name for _, file_name in documents}
+        if names.script_name in uploaded:
+            script_url = build_public_script_url(settings, names, feed)
+        if names.segments_name in uploaded:
+            segments_url = build_public_segments_url(settings, names, feed)
 
         try:
             _create_episode(
@@ -576,10 +739,7 @@ def _finalize_publish(
                 slug=names.prefix,
                 public_audio_url=public_audio_url,
                 file_size_bytes=mp3_path.stat().st_size,
-                notes_url=notes_url,
                 script_url=script_url,
-                manifest_url=manifest_url,
-                description=enriched.description if enriched is not None else None,
             )
         except PipelineError as exc:
             # A lost response (or concurrent create conflict) is resolved by
@@ -587,7 +747,7 @@ def _finalize_publish(
             if exc.dependency == "publication" and exc.operation == "POST" and (
                 exc.retryable or exc.http_status in {400, 409} or exc.error_code == 1101
             ):
-                published = already_published(settings, names.prefix)
+                published = already_published(settings, names.prefix, feed, metadata, work_dir)
                 if published is not None:
                     return published
             raise
@@ -603,8 +763,8 @@ def _finalize_publish(
         public_url=public_audio_url,
         file_size_bytes=mp3_path.stat().st_size,
         script_url=script_url,
-        notes_url=notes_url,
-        manifest_url=manifest_url,
+        segments_url=segments_url,
+        notes=_notes_for(metadata, names.prefix, 1, script.sha256, script.stt_engine) if script_url else None,
     )
 
 
@@ -637,8 +797,8 @@ def _convert_input_to_mp3(
 
 
 @tracked_stage("upload_audio")
-def _upload_mp3(settings: Settings, mp3_path: Path) -> None:
-    remote = f"{settings.b2_remote}:{settings.b2_bucket}/audio/episodes/"
+def _upload_mp3(settings: Settings, mp3_path: Path, prefix: str = "audio") -> None:
+    remote = f"{settings.b2_remote}:{settings.b2_bucket}/{prefix}/episodes/"
     _run([settings.rclone_bin, "copy", str(mp3_path), remote], stage="upload", timeout=3600)
 
 
@@ -717,13 +877,14 @@ def _create_episode(
     # promotional text; fall back only when enrichment did not run.
     body = (description or "").strip() or metadata.description.strip() or metadata.title
     payload = {
-        "feed": "audio",
+        "feed": metadata.feed,
         "slug": slug,
         "title": title,
-        # Feed ordering stays on ingestion time. The original publication date
+        # Feed ordering stays on ingestion time unless the job supplied a
+        # publication time (scheduled sources). Otherwise the original date
         # lives in the Markdown and manifest, where it can be honest about
         # being unknown.
-        "pub_date": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "pub_date": metadata.pub_date or datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         "description": body,
         "mp3_url": public_audio_url,
         "mp3_size": file_size_bytes,
@@ -809,8 +970,9 @@ def _list_episodes(settings: Settings, search: str | None = None) -> list[dict]:
 
 
 @tracked_stage("check_publication")
-def _get_episode_by_slug(settings: Settings, slug: str) -> dict | None:
-    result = _api_json(settings, "GET", "/api/episodes?" + urlencode({"feed": "audio", "slug": slug}))
+def _get_episode_by_slug(settings: Settings, slug: str, feed: str = "audio") -> dict | None:
+    feed_spec(feed)
+    result = _api_json(settings, "GET", "/api/episodes?" + urlencode({"feed": feed, "slug": slug}))
     if not isinstance(result, list):
         raise PipelineError("api", "Episode lookup returned unexpected payload", operation="GET", retryable=True)
     for row in result:
@@ -882,7 +1044,17 @@ def _ensure_unique_slug(settings: Settings, slug: str) -> str:
     return candidate
 
 
-def already_published(settings: Settings, prefix: str) -> PublishResult | None:
+def _checkpointed_engine(work_dir: Path | None) -> str | None:
+    from episode_enrichment.pipeline import STT_ENGINE_FILE
+    path = Path(work_dir) / STT_ENGINE_FILE if work_dir else None
+    try:
+        return (path.read_text(encoding="utf-8").strip() or None) if path and path.is_file() else None
+    except OSError:
+        return None
+
+
+def already_published(settings: Settings, prefix: str, feed: str = "audio",
+                      metadata: EpisodeMetadata | None = None, work_dir: Path | None = None) -> PublishResult | None:
     """Return this source's existing episode, if a prior attempt installed it.
 
     Publication is not idempotent by itself: the runtime attempt is finalized
@@ -897,8 +1069,13 @@ def already_published(settings: Settings, prefix: str) -> PublishResult | None:
     this exact key is this same source's episode from an earlier attempt, not
     an unrelated collision. Recognising it and returning it converts the retry
     into a no-op that reports the original episode.
+
+    It reports what the row holds, nothing guessed. A row with a script and no notes yet carries the
+    same notes request the first attempt made (keyed on slug and version), so a lost submit is
+    resubmitted, idempotently. Its speech-to-text engine comes from this job's work dir checkpoint when
+    one survives, else it is unknown.
     """
-    episode = _get_episode_by_slug(settings, prefix)
+    episode = _get_episode_by_slug(settings, prefix, feed)
     if episode is None:
         return None
     logger.info(
@@ -913,14 +1090,14 @@ def already_published(settings: Settings, prefix: str) -> PublishResult | None:
         slug=prefix,
         title=str(episode.get("title") or names.prefix),
         public_url=(str(episode.get("audio_url") or episode.get("mp3_url") or "")
-                    or build_public_audio_url(settings, prefix)),
+                    or build_public_audio_url(settings, prefix, feed)),
         file_size_bytes=size,
-        script_url=(episode.get("speech_text_url") or episode.get("script_url")
-                    or build_public_script_url(settings, names)),
-        notes_url=(episode.get("md_url") or episode.get("notes_url")
-                   or build_public_notes_url(settings, names)),
-        manifest_url=(episode.get("manifest_url")
-                      or build_public_manifest_url(settings, names)),
+        script_url=episode.get("speech_text_url") or None,
+        notes_url=episode.get("md_url") or None,
+        manifest_url=episode.get("manifest_url") or None,
+        notes=(_notes_for(metadata, prefix, document_version(prefix, episode["speech_text_url"]) or 1, None,
+                          _checkpointed_engine(work_dir))
+               if metadata is not None and episode.get("speech_text_url") and not episode.get("md_url") else None),
     )
 
 

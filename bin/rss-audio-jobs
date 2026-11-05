@@ -1,0 +1,6 @@
+#!/bin/sh
+# The rss-audio jobs on the runtime controller, read only (rss-audio/jobs_view.py).
+# Runs from this release with the live runtime, on the import path the rss-audio units use.
+here=$(cd "$(dirname "$0")/.." && pwd -P)
+PYTHONPATH="$here/rss-audio:$here/shared:$here/transcribe-audio:$here" \
+  exec "${TG_TOOLS_PYTHON:-$HOME/.local/lib/tg-tools/runtime/bin/python}" -P "$here/rss-audio/jobs_view.py" "$@"

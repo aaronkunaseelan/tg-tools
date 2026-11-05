@@ -42,8 +42,11 @@ artifacts in a local work directory without uploading or publishing them:
 ```bash
 ~/tools/tg-tools/transcribe-audio/enrich.py \
   --audio episode.mp3 --title "Episode title" \
-  --workdir /tmp/enrich-review --published 2026-08-03
+  --workdir /tmp/enrich-review --published 2026-08-03 --pipeline episodes
 ```
+
+`--pipeline` names the enrichment pipeline whose model tier to use (a key of
+`~/.config/tg-tools/enrichment.json`).
 
 Reusing the same work directory resumes completed enrichment checkpoints.
 

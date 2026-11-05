@@ -71,13 +71,19 @@ def validate_startup(settings) -> tuple[list[str], list[str]]:
     if "x_tts_explain" in settings.workload_types:
         try:
             from pi_harness.preflight import assert_provider_auth
-            from pi_harness.roles import resolve_role
+            from pi_harness.roles import TRANSCRIPT_ROLES, EnrichmentConfigError, enrichment_tier, resolve_role
             from .fingerprint import reader_role_map
 
             role_map = reader_role_map()
-            assert_provider_auth(
-                [cfg["provider"] for name, cfg in role_map.items() if name != "_hash"] +
-                [resolve_role(r)["provider"] for r in ("transcript_topics", "transcript_mentions")])
+            providers = [cfg["provider"] for name, cfg in role_map.items() if name != "_hash"]
+            try:
+                notes_tier = enrichment_tier("speech")
+                providers += [resolve_role(r, tier=notes_tier)["provider"] for r in TRANSCRIPT_ROLES]
+            except EnrichmentConfigError as exc:
+                # The file is read per job, so it can be fixed without a restart; until then every job
+                # fails with errorClass enrichment_config.
+                warnings.append("x-tts notes enrichment is not configured, jobs will fail: " + str(exc))
+            assert_provider_auth(providers)
             warnings.append("x-tts reader role-map hash: " + str(role_map["_hash"]))
             warnings.append("x-tts reader roles: " + ", ".join(
                 "%s=%s/%s@%s" % (name, cfg["provider"], cfg["model"], cfg["thinking"])

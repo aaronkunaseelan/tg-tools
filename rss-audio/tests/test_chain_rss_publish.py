@@ -10,6 +10,8 @@ Case table
 | case             | input                      | proves                                                    |
 | audio upload     | 6 s mp3 in the rss topic   | staged sha, STT transcript as script, manifest names the  |
 |                  |                            | published script sha, reply links the mp3                 |
+| rebuild to v2    | the same, then a rebuild   | STT from the stored mp3; .v2. documents live; v1 documents |
+|                  | job by slug                | deleted, mp3 kept; still one Telegram message              |
 """
 import asyncio
 import hashlib
@@ -24,6 +26,7 @@ from chain_harness import (CHAT_ID, FakeTelegram, azure_stt, build_gateway, deli
 
 pytestmark = pytest.mark.chain
 RSS_THREAD = 9
+DOCUMENTS = ("script.md", "segments.json", "notes.md", "manifest.json", "page.html")   # Azure chunk timings give segments
 TRANSCRIPT = ("Researchers heated water in polypropylene bottles and counted the particles released.\n\n"
               "The count reached sixteen million particles per litre at seventy degrees.")
 
@@ -59,6 +62,17 @@ def _exact_get(stack, url):
     return (stack.bucket / url[len(prefix):]).read_bytes()
 
 
+async def _drain(stack):
+    """Run the worker until no job is runnable and every result is projected."""
+    from config import load_settings
+    from runtime_worker import worker_loop
+    jobs = lambda: stack.psql("select producer_ref || '=' || status from runtime.jobs order by created_at")
+    await run_until(lambda: worker_loop(load_settings()),
+                    lambda: not stack.psql("select 1 from runtime.jobs where status in ('pending','leased','retryable')")
+                    and not stack.api("GET", "/v1/results?resultOwner=rss-audio&limit=10"), describe=jobs)
+    return jobs().splitlines()
+
+
 async def _run(stack, monkeypatch, event, audio):
     from config import load_settings
     from runtime_worker import worker_loop
@@ -73,11 +87,16 @@ async def _run(stack, monkeypatch, event, audio):
     job_id = stack.psql("select job_id from tg_gateway.source_handoffs where state = 'submitted'")
     assert job_id, stack.psql("select state, last_error from tg_gateway.source_handoffs")
 
+    # The publish job, then the notes job it submits (two-job path); both projected.
     unprojected = lambda: stack.api("GET", "/v1/results?resultOwner=rss-audio&limit=10")
+    jobs = lambda: stack.psql("select producer_ref || '=' || status from runtime.jobs order by created_at")
     await run_until(lambda: worker_loop(load_settings()),
-                    lambda: stack.job(job_id)["job"]["status"] in {"succeeded", "dead", "failed"} and not unprojected())
+                    lambda: not stack.psql("select 1 from runtime.jobs where status in ('pending','leased','retryable')")
+                    and not unprojected(), describe=jobs)
     job = stack.job(job_id)["job"]
     assert job["status"] == "succeeded", json.dumps(job, default=str)[:4000]
+    assert jobs().splitlines() == [f"{job['producerRef']}=succeeded", f"{job['producerRef']}:notes=succeeded"], \
+        stack.psql("select last_error_class || ': ' || last_error_text from runtime.jobs where status = 'dead'")
     await deliver_all(runtime)
     return job
 
@@ -97,6 +116,8 @@ def test_audio_upload_publishes_episode_and_replies(stack, monkeypatch):
     assert payload["chat_id"] == CHAT_ID and payload["message_thread_id"] == RSS_THREAD
     assert payload["reply_parameters"] == {"message_id": 301}
     assert episode["mp3_url"] in payload["text"]
+    # One message, at publish, with the transcript link; the notes job sends nothing.
+    assert episode["speech_text_url"].rsplit("/", 1)[1] in payload["text"] and "Notes</a>" not in payload["text"]
     published = _exact_get(stack, episode["mp3_url"])
     assert len(published) == episode["mp3_size"]
     probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", "-"],
@@ -109,3 +130,33 @@ def test_audio_upload_publishes_episode_and_replies(stack, monkeypatch):
     manifest = json.loads(_exact_get(stack, episode["manifest_url"]))
     assert hashlib.sha256(script).hexdigest() in json.dumps(manifest)
     assert {c["step"] for c in model_calls(stack.root / "models.jsonl")} == {"topics", "mentions"}
+    page = _exact_get(stack, episode["page_url"]).decode()   # the notes job's page, linked from the row
+    assert episode["page_url"].endswith(".page.html") and "sixteen million particles per litre" in page
+    assert page.index('<h2 id="script">') > page.index("<h1>")
+
+
+def test_a_rebuild_replaces_the_documents_with_v2(stack, monkeypatch):
+    import rebuild
+    audio = tone_mp3(stack.root / "upload.mp3", seconds=6).read_bytes()
+    event = inbound(thread_id=RSS_THREAD, message_id=302, attachment={
+        "kind": "audio", "file_id": "audio-1", "file_name": "bottles.mp3", "mime_type": "audio/mpeg",
+        "file_size": len(audio), "display_name": "bottles.mp3"})
+    asyncio.run(_run(stack, monkeypatch, event, audio))
+    [before] = stack.edge.episodes["audio"]
+    slug = before["slug"]
+    payload = rebuild.rebuild_job_payload(rebuild.rebuild_input(before, "audio", version=rebuild.next_version(before)))
+    stack.api("POST", "/v1/submit", payload)
+    jobs = asyncio.run(_drain(stack))
+    assert jobs[-2:] == [f"rebuild:{slug}=succeeded", f"rebuild:{slug}:notes=succeeded"], jobs
+
+    [after] = stack.edge.episodes["audio"]
+    for key, kind in (("speech_text_url", "script.md"), ("md_url", "notes.md"), ("manifest_url", "manifest.json"),
+                      ("page_url", "page.html")):
+        assert after[key].endswith(f"/{slug}.v2.{kind}"), (key, after[key])
+    assert after["mp3_url"] == before["mp3_url"]
+    stored = sorted(p.name for p in stack.bucket.rglob(f"{slug}.*"))
+    assert stored == sorted([f"{slug}.mp3"] + [f"{slug}.v2.{kind}" for kind in DOCUMENTS]), stored
+    assert b"sixteen million particles per litre" in _exact_get(stack, after["speech_text_url"])
+    manifest = json.loads(_exact_get(stack, after["manifest_url"]))
+    assert hashlib.sha256(_exact_get(stack, after["speech_text_url"])).hexdigest() in json.dumps(manifest)
+    assert len(stack.edge.sent("sendMessage")) == 1   # the publish's; rebuild and notes send nothing

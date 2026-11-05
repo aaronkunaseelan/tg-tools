@@ -25,9 +25,14 @@ import tempfile
 from pathlib import Path
 from tg_tools_common.progress import current_progress
 
+from . import timing as timing_mod
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_STT_MODEL = "mini"
+# m3-asr's custom vocabulary for episode transcripts. The owner's dictation list rewrote 226 words in five
+# Surveillance shows, 225 of them wrongly ("past" -> Paseo); the owner switched it off for the feed (X-76, 4 Nov).
+STT_VOCAB = "none"
 _MODULE_NAME = "transcribe_audio_tool"
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_TRANSCRIBE_PATH = _REPOSITORY_ROOT / "transcribe-audio" / "transcribe.py"
@@ -79,19 +84,21 @@ class Transcript(str):
 
     ``stt_engine`` is the self-hosted model label (for example
     ``parakeet-ultra@fluidaudio-0.18.0``), or None when Azure produced it with
-    the requested model.
+    the requested model. ``timing`` is what ``episode_enrichment.timing`` needs
+    to publish when each paragraph was spoken.
     """
     stt_engine: str | None = None
+    timing: dict | None = None
 
 
-def _transcribe_self_hosted(tool, audio_path: str) -> tuple[str, str] | None:
-    """The self-hosted endpoint's (raw text, model label), or None to use Azure."""
+def _transcribe_self_hosted(tool, audio_path: str) -> tuple | None:
+    """The self-hosted endpoint's (raw text, model label, timings), or None to use Azure."""
     config = tool.load_self_hosted_config() if hasattr(tool, "load_self_hosted_config") else None
     if config is None:
         return None
     sink = current_progress()
     occurrence = sink.emit("transcribe_chunks", "started", completed=0, total=1, units="chunks")
-    result = tool.transcribe_self_hosted(config, audio_path)
+    result = tool.transcribe_self_hosted(config, audio_path, vocab=STT_VOCAB)
     if result:
         sink.emit("transcribe_chunks", "completed", occurrence=occurrence, completed=1, total=1, units="chunks")
     else:
@@ -122,7 +129,8 @@ def transcribe_audio(
         tool.ensure_dependencies()
         result = _transcribe_self_hosted(tool, audio_path)
         if result:
-            raw, engine = result
+            raw, engine = result[0], result[1]
+            timing = timing_mod.from_self_hosted(result[2] if len(result) > 2 else None)
         else:
             config = tool.load_azure_openai_config()
             access_token = tool.fetch_azure_access_token(config)
@@ -137,9 +145,10 @@ def transcribe_audio(
                 def on_chunk(completed, total):
                     sink.check()
                     sink.emit("transcribe_chunks", "advanced", occurrence=occurrence, completed=completed, total=total, units="chunks")
-                import inspect
-                extra = {"on_progress": on_chunk} if "on_progress" in inspect.signature(tool.transcribe_all).parameters else {}
-                raw = tool.transcribe_all(config, access_token, chunks, resolved, jobs=jobs, **extra)
+                parts = tool.transcribe_chunk_texts(config, access_token, chunks, resolved, jobs=jobs,
+                                                    on_progress=on_chunk)
+                raw = "\n\n".join(part for part in parts if part) if parts else None
+                timing = timing_mod.from_chunks(parts or [], tool.CHUNK_DURATION_SEC, _duration(tool, audio_path))
                 if raw and raw.strip():
                     sink.emit("transcribe_chunks", "completed", occurrence=occurrence, completed=len(chunks), total=len(chunks), units="chunks")
     except SystemExit as exc:
@@ -155,4 +164,13 @@ def transcribe_audio(
         raise TranscriptionError("transcript formatting produced no paragraphs")
     transcript = Transcript(formatted)
     transcript.stt_engine = engine
+    transcript.timing = timing
     return transcript
+
+
+def _duration(tool, audio_path: str) -> float | None:
+    """The file's duration, so the last Azure chunk ends where the audio does; None if unknown."""
+    try:
+        return float(tool.probe(audio_path)["format"]["duration"])
+    except (SystemExit, Exception):  # probe exits on failure; the chunk then keeps its nominal end
+        return None
