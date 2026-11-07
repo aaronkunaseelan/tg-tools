@@ -10,9 +10,8 @@ import os
 import random
 import shutil
 import signal
-import tempfile
 import time
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from pathlib import Path
 from urllib.parse import urlsplit, unquote
 from typing import Any
@@ -22,40 +21,15 @@ from tg_tools_common.lease import AttemptLease, LeaseLost
 from tg_tools_common.progress import ProgressReporter, NullProgress, current_progress, use_progress
 
 from config import Settings, load_settings, validate_settings, PUBLISH_LEASE_SECONDS
-from download_names import _safe_download_name
-from exit_rotation import ExitRotator
-from mtproto_dl import download_file as mtproto_download
-from mtproto_dl import ensure_mtproto_ready, needs_mtproto
-import live_window
+import episodes
 import notes_job
 import rebuild
-from pipeline import (
-    DEFAULT_OPTIONS,
-    JobOptions,
-    PipelineError,
-    enrichment_preflight,
-    fetch_metadata,
-    ingest_direct_audio_url,
-    ingest_live_window,
-    ingest_local_audio,
-    ingest_url_with_metadata,
-    job_options,
-    render_completion_message,
-)
+import surveillance
+from pipeline import (PIPELINES, PipelineError, RuntimeExecutionResult, enrichment_preflight, execution_result,
+                      is_retryable, job_options, source_link)
 from runtime_client import RuntimeClient, RuntimeClientError
-from runtime_jobs import (DeliveryTargetMissing, confirmation_delivery_payload,
-                          delivery_disabled, message_reference)
-from source_audio import (
-    SourceAudioError,
-    SourceFailureKind,
-    SourceRoute,
-    check_oci_mullvad_health,
-    classify_source_failure,
-    classify_text,
-    is_mac_reachable,
-    route_label,
-    stable_url_for_display,
-)
+from runtime_jobs import DeliveryTargetMissing, confirmation_delivery_payload, delivery_disabled
+from source_audio import stable_url_for_display
 from work_dirs import cleanup_work_dirs, job_work_dir
 
 logger = logging.getLogger(__name__)
@@ -78,375 +52,30 @@ def _retry_delay(consecutive_failures: int) -> float:
     return delay * (0.5 + random.random() / 2)
 
 
-@dataclass(frozen=True)
-class RuntimeExecutionResult:
-    slug: str
-    title: str
-    public_url: str
-    file_size_bytes: int
-    completion_html: str
-    script_url: str | None = None
-    notes_url: str | None = None
-    manifest_url: str | None = None
-    segments_url: str | None = None
-    page_url: str | None = None
-    notes: dict | None = None   # the notes job to submit (pipeline.notes_input), when there is a script
-
-
-@contextlib.contextmanager
-def _download_dir(work_dir: Path | None):
-    """Durable staging when a work dir is supplied, else a temp dir."""
-    if work_dir is not None:
-        target = Path(work_dir) / "download"
-        target.mkdir(parents=True, exist_ok=True)
-        yield target
-        return
-    with tempfile.TemporaryDirectory(prefix="rss-audio-runtime-telegram-") as tmpdir:
-        yield Path(tmpdir)
-
-
-def _source_settings(settings: Settings):
-    from source_audio import SourceToolSettings
-
-    return SourceToolSettings(
-        mac_ssh_target=settings.mac_ssh_target,
-        mac_ytdlp_path=settings.mac_ytdlp_path,
-        mac_cookies_from_browser=settings.mac_cookies_from_browser,
-        yt_dlp_bin=settings.yt_dlp_bin,
-        yt_dlp_format=settings.yt_dlp_format,
-        ffmpeg_bin=settings.ffmpeg_bin,
-        mullvad_proxy=settings.mullvad_proxy,
-        mullvad_control_url=settings.mullvad_control_url,
-        mullvad_control_token=settings.mullvad_control_token,
-        yt_dlp_remote_components=settings.yt_dlp_remote_components,
-    )
-
-
-def _route_health_error(route: SourceRoute, reason: str, detail: str = "") -> PipelineError:
-    message = f"{route_label(route)} route unhealthy"
-    if reason:
-        message = f"{message}: {reason}"
-    return PipelineError("route-health", message, detail)
-
-
-def _candidate_routes(input_json: dict[str, Any]) -> list[SourceRoute]:
-    preferred = input_json.get("preferredRoute")
-    if preferred:
-        return [SourceRoute(str(preferred))]
-    return [SourceRoute.OCI_MULLVAD, SourceRoute.MAC_SSH]
-
-
-def _exit_rotator(settings: Settings) -> ExitRotator:
-    """Exit rotation is opt-in: without a control-server token the Mullvad
-    route behaves exactly as before (a single attempt per job)."""
-    return ExitRotator(
-        control_url=settings.mullvad_control_url,
-        token=settings.mullvad_control_token,
-        proxy=settings.mullvad_proxy,
-    )
-
-
-def _execution_result(
-    published: Any, source_url: str | None, feed: str = "audio"
-) -> RuntimeExecutionResult:
-    return RuntimeExecutionResult(
-        slug=published.slug,
-        title=published.title,
-        public_url=published.public_url,
-        file_size_bytes=published.file_size_bytes,
-        completion_html=render_completion_message(
-            published.title, published.public_url,
-            notes_url=published.notes_url, script_url=published.script_url,
-            source_url=source_url, feed=feed),
-        script_url=published.script_url,
-        notes_url=published.notes_url,
-        manifest_url=published.manifest_url,
-        segments_url=getattr(published, "segments_url", None),
-        page_url=getattr(published, "page_url", None),
-        notes=getattr(published, "notes", None),
-    )
-
-
-def _attempt_mullvad_route(
-    settings: Settings,
-    source_url: str,
-    work_dir: Path | None,
-    rotator: ExitRotator,
-    options: JobOptions = DEFAULT_OPTIONS,
-) -> tuple[list[PipelineError], RuntimeExecutionResult | None]:
-    """Try the proxy route up to ``rotator.attempts()`` times, rotating the
-    Mullvad egress (with conservative jitter) between eligible failures.
-
-    Exit rotation is the middle rung between the pre-flight health gate and
-    the Mac fallback: it exists for IP-shaped refusals (bot checks, rate
-    limits) that a healthy-but-pinned exit can trigger.  It never fires for
-    proxy-unavailable or format failures, and never rotates more than
-    ``max_rotations`` times per job.
-    """
-    failures: list[PipelineError] = []
-    for attempt in range(rotator.attempts()):
-        current_progress().check()
-        try:
-            metadata = fetch_metadata(settings, source_url, route=SourceRoute.OCI_MULLVAD)
-            published = ingest_url_with_metadata(
-                settings, source_url, metadata, route=SourceRoute.OCI_MULLVAD,
-                work_dir=work_dir, options=options)
-            return [], _execution_result(published, source_url, options.feed)
-        except PipelineError as exc:
-            if exc.dependency != "source":
-                raise
-            failures.append(exc)
-            if attempt + 1 < rotator.attempts():
-                detail = f"{exc}\n{exc.stderr}"
-                if rotator.eligible(detail) and rotator.rotate(attempt):
-                    delay = random.uniform(*rotator.jitter_sec)
-                    logger.info(
-                        "mullvad egress rotated after %s; retrying route in %.1fs",
-                        exc.stage, delay)
-                    with current_progress().stage("source_retry", retrySeconds=delay, reason="source_retry"):
-                        time.sleep(delay)
-                    continue
-            break
-    return failures, None
-
-
-def _fetch_and_publish_url(
-    settings: Settings,
-    input_json: dict[str, Any],
-    source_url: str,
-    work_dir: Path | None = None,
-    options: JobOptions = DEFAULT_OPTIONS,
-) -> RuntimeExecutionResult:
-    failures: list[PipelineError] = []
-    rotator = _exit_rotator(settings)
-    unattended = options.delivery == "none"
-    for route in _candidate_routes(input_json):
-        if route == SourceRoute.OCI_MULLVAD:
-            health = check_oci_mullvad_health(_source_settings(settings))
-            if not health.ok:
-                failures.append(_route_health_error(route, health.reason, health.detail))
-                continue
-            route_failures, result = _attempt_mullvad_route(
-                settings, source_url, work_dir, rotator, options)
-            failures.extend(route_failures)
-            if result is not None:
-                return result
-            continue
-
-        if route == SourceRoute.MAC_SSH and not is_mac_reachable(_source_settings(settings)):
-            failures.append(_route_health_error(route, "mac_unavailable"))
-            continue
-
-        try:
-            metadata = fetch_metadata(settings, source_url, route=route)
-            published = ingest_url_with_metadata(
-                settings, source_url, metadata, route=route, work_dir=work_dir, options=options)
-            return _execution_result(published, source_url, options.feed)
-        except PipelineError as exc:
-            if exc.dependency != "source":
-                raise
-            failures.append(exc)
-            continue
-
-    if not failures:
-        raise PipelineError("source", "No source routes were attempted")
-    detail = "\n\n".join(f"{failure.stage}: {failure}\n{failure.stderr}" for failure in failures)
-    # Retryability is classified from the raised error, so surfacing only the
-    # last route's message let route ordering decide the outcome: a transient
-    # "mac unreachable" after a terminal auth failure looked retryable, and a
-    # terminal last route masked a genuinely retryable earlier one. Prefer a
-    # route that failed transiently -- if any route might succeed later, the
-    # job as a whole is worth retrying.
-    representative = next(
-        (failure for failure in failures if _is_retryable_pipeline_error(failure, unattended)),
-        failures[-1],
-    )
-    raise PipelineError("source", str(representative), detail,
-                        retryable=any(_is_retryable_pipeline_error(failure, unattended) for failure in failures))
-
-
-def _classified_source_url(input_json: dict[str, Any]) -> tuple[str, str] | None:
-    source = input_json.get("sourceUrl")
-    if not isinstance(source, str) or not source.strip():
-        return None
-    classified = classify_text(source)
-    if not classified:
-        raise PipelineError("input", "Send a supported URL or audio file")
-    return classified
-
-
-def _transcribe_opening(settings: Settings, clip: Path) -> str:
-    """The opening clip's transcript, by the path enrichment uses (self-hosted first, Azure fallback)."""
-    from episode_enrichment import transcribe_audio
-    try:
-        return str(transcribe_audio(clip, model=settings.enrichment_stt_model, jobs=settings.enrichment_jobs))
-    except Exception as exc:
-        raise live_window.LiveWindowError("window_transcribe", f"opening check could not transcribe: {exc}",
-                                          retryable=True) from exc
-
-
-def _publish_live_window(
-    settings: Settings,
-    input_json: dict[str, Any],
-    options: JobOptions,
-    work_dir: Path | None,
-) -> RuntimeExecutionResult:
-    """Publish a window of a live stream. OCI Mullvad route only: the stream URL is bound to its egress."""
-    try:
-        window = live_window.parse_window(input_json["liveWindow"])
-    except live_window.LiveWindowError as exc:
-        raise PipelineError("input", str(exc)) from exc
-    if input_json.get("preferredRoute") not in (None, "", SourceRoute.OCI_MULLVAD.value):
-        raise PipelineError("input", "liveWindow is only available on the oci_mullvad route")
-    health = check_oci_mullvad_health(_source_settings(settings))
-    if not health.ok:
-        raise _route_health_error(SourceRoute.OCI_MULLVAD, health.reason, health.detail)
-
-    rotator = _exit_rotator(settings)
-
-    def fetch_audio(staging: Path) -> Path:
-        # Like a URL job, an IP-shaped refusal from yt-dlp (bot check, rate limit) rotates the Mullvad exit and
-        # tries again. Only the stream lookup is retried that way: its URL is bound to the exit that resolved it.
-        for attempt in range(rotator.attempts()):
-            try:
-                with current_progress().stage("download_audio"):
-                    path, _duration = live_window.fetch_live_window(
-                        _source_settings(settings), window, staging, ffprobe_bin=settings.ffprobe_bin,
-                        transcribe_clip=lambda clip: _transcribe_opening(settings, clip),
-                        check=current_progress().check)
-                return path
-            except live_window.LiveWindowError as exc:
-                raise PipelineError(exc.error_class, str(exc), exc.stderr, retryable=exc.retryable) from exc
-            except SourceAudioError as exc:
-                if (exc.stage == "metadata" and attempt + 1 < rotator.attempts()
-                        and rotator.eligible(f"{exc}\n{exc.stderr}") and rotator.rotate(attempt)):
-                    delay = random.uniform(*rotator.jitter_sec)
-                    logger.info("mullvad egress rotated after %s; retrying the stream lookup in %.1fs", exc.stage, delay)
-                    with current_progress().stage("source_retry", retrySeconds=delay, reason="source_retry"):
-                        time.sleep(delay)
-                    continue
-                raise PipelineError(exc.stage, str(exc), exc.stderr) from exc
-        raise PipelineError("source", "No stream lookup was attempted")
-
-    published = ingest_live_window(
-        settings, source_url=window.source_url, identity_text=window.identity,
-        fetch_audio=fetch_audio, work_dir=work_dir, options=options)
-    return _execution_result(published, window.source_url, options.feed)
-
-
 async def execute_runtime_job(
     settings: Settings,
     bot: Bot,
     input_json: dict[str, Any],
     work_dir: Path | None = None,
 ) -> RuntimeExecutionResult:
+    """A publish runs its feed's pipeline (``episodes.run``, ``surveillance.run``); a notes, page or rebuild job
+    is a later step both share. The configuration and a named segmenter are checked before any paid step."""
     options = job_options(input_json)
-    # Configuration is checked before any download or paid call, and read once for this job.
     options = replace(options, enrichment_tier=enrichment_preflight(settings, options.feed))
-    if input_json.get("inputKind") == notes_job.INPUT_KIND:
+    kind = input_json.get("inputKind")
+    if kind not in (notes_job.INPUT_KIND, notes_job.PAGE_KIND, rebuild.INPUT_KIND):
+        pipeline = surveillance if PIPELINES[options.feed] == "surveillance" else episodes
+        return await pipeline.run(settings, bot, input_json, options, work_dir)
+    segmenter = surveillance.named_segmenter(input_json.get("segmenter"))
+    work = work_dir or job_work_dir(settings.work_dir, kind)
+    if kind == notes_job.INPUT_KIND:
         published = await asyncio.to_thread(
-            notes_job.run_notes, settings, input_json, work_dir or job_work_dir(settings.work_dir, "notes"),
-            options.enrichment_tier)
-        return _execution_result(published, None, options.feed)
-    if input_json.get("inputKind") == notes_job.PAGE_KIND:
-        published = await asyncio.to_thread(
-            notes_job.run_page, settings, input_json, work_dir or job_work_dir(settings.work_dir, "page"))
-        return _execution_result(published, None, options.feed)
-    if input_json.get("inputKind") == rebuild.INPUT_KIND:
-        published = await asyncio.to_thread(
-            rebuild.run_rebuild, settings, input_json, work_dir or job_work_dir(settings.work_dir, "rebuild"),
-            options.enrichment_tier)
-        return _execution_result(published, None, options.feed)
-    classified = _classified_source_url(input_json)
-    if "liveWindow" in input_json:
-        if classified:
-            raise PipelineError("input", "A job takes either sourceUrl or liveWindow, not both")
-        return await asyncio.to_thread(_publish_live_window, settings, input_json, options, work_dir)
-    if classified:
-        kind, source_url = classified
-        if kind == "direct_audio_url":
-            published = await asyncio.to_thread(
-                ingest_direct_audio_url, settings, source_url, work_dir=work_dir, options=options)
-        else:
-            return await asyncio.to_thread(
-                _fetch_and_publish_url, settings, input_json, source_url, work_dir, options)
-        return _execution_result(published, source_url, options.feed)
-
-    local_source = input_json.get("localSourcePath")
-    telegram_file_id = input_json.get("telegramFileId")
-    if not (isinstance(local_source, str) and Path(local_source).is_file()) and not (
-        isinstance(telegram_file_id, str) and telegram_file_id
-    ):
-        raise PipelineError("input", "Unsupported runtime RSS input")
-
-    # Only the MTProto branch needs it, but resolving here keeps the failure
-    # typed and attributable to the input rather than surfacing as a KeyError
-    # from inside the download.
-    message_ref: dict[str, Any] = {}
-    try:
-        message_ref = message_reference(input_json)
-    except DeliveryTargetMissing:
-        message_ref = {}
-    with _download_dir(work_dir) as tmpdir:
-        if isinstance(local_source, str) and Path(local_source).is_file():
-            target = Path(local_source)
-        else:
-            target = Path(tmpdir) / _safe_download_name(str(input_json.get("telegramFileName") or "telegram-audio"))
-            file_size = input_json.get("fileSize")
-            if needs_mtproto(file_size if isinstance(file_size, int) else None):
-                try:
-                    ensure_mtproto_ready()
-                except Exception as exc:
-                    raise PipelineError("download", f"Large Telegram file requires MTProto credentials: {exc}") from exc
-                if not message_ref:
-                    # Terminal: an oversized Telegram file can only be pulled
-                    # via MTProto, which needs the originating message.
-                    raise PipelineError(
-                        "input",
-                        "Large Telegram file requires a messageRef to download via MTProto")
-                await mtproto_download(
-                    chat_id=message_ref["chat_id"],
-                    message_id=message_ref["message_id"],
-                    dest_path=str(target),
-                )
-            else:
-                file_obj = await bot.get_file(telegram_file_id)
-                await file_obj.download_to_drive(custom_path=str(target))
-
-        published = await asyncio.to_thread(
-            ingest_local_audio,
-            settings,
-            target,
-            str(input_json.get("titleHint") or target.stem),
-            work_dir=work_dir,
-            options=options,
-        )
-    return _execution_result(published, None, options.feed)
-
-
-def _is_retryable_pipeline_error(exc: PipelineError, unattended: bool = False) -> bool:
-    """Whether a failed attempt should be retried.
-
-    ``unattended`` (a job with ``delivery: none``, i.e. a scheduled source) treats a sign-in/bot wall as
-    transient: nobody is waiting to be told, a dead job is never resubmitted (its idempotency key is
-    spent), and this route sends no cookies, so the wall belongs to the proxy exit, not the source.
-    """
-    if exc.retryable is not None:
-        return exc.retryable
-    if exc.dependency != "source":
-        return exc.stage != "input"
-    if exc.stage == "input":
-        return False
-    kind = classify_source_failure(f"{exc}\n{exc.stderr}")
-    if kind == SourceFailureKind.AUTH_REQUIRED and unattended:
-        return True
-    if kind in {
-        SourceFailureKind.AUTH_REQUIRED,
-        SourceFailureKind.SOURCE_UNAVAILABLE,
-        SourceFailureKind.FORMAT_UNAVAILABLE,
-    }:
-        return False
-    return True
+            notes_job.run_notes, settings, input_json, work, options.enrichment_tier, segmenter=segmenter)
+    elif kind == notes_job.PAGE_KIND:
+        published = await asyncio.to_thread(notes_job.run_page, settings, input_json, work)
+    else:
+        published = await asyncio.to_thread(rebuild.run_rebuild, settings, input_json, work, options.enrichment_tier)
+    return execution_result(published, None, options.feed)
 
 
 def _result_id(finalized: dict[str, Any]) -> str | None:
@@ -458,10 +87,10 @@ def _result_id(finalized: dict[str, Any]) -> str | None:
 
 def _source_url_display(input_json: dict[str, Any]) -> str | None:
     try:
-        classified = _classified_source_url(input_json)
+        link = source_link(input_json)
     except PipelineError:
         return None
-    return stable_url_for_display(classified[1]) if classified else None
+    return stable_url_for_display(link[1]) if link else None
 
 
 async def process_claim(*, client, settings, bot, claim, worker_id=None):
@@ -522,7 +151,7 @@ async def _process_claim_inner(
                 notes_job_id = await asyncio.to_thread(_submit_notes, client, job, input_json, result.notes)
         except PipelineError as exc:
             current_progress().check()
-            outcome = "retryable_error" if _is_retryable_pipeline_error(
+            outcome = "retryable_error" if is_retryable(
                 exc, unattended=delivery_disabled(input_json)) else "terminal_error"
             finalized = await asyncio.to_thread(
                 client.finalize,

@@ -48,10 +48,6 @@ class Settings:
     api_token: str
     feed_url: str
     feed_title: str
-    azure_chat_base_url: str
-    azure_chat_api_key: str
-    azure_chat_key_cmd: str
-    title_model: str
 
 
 DEFAULT_VOICES = {"azure": "nova", "self-hosted": "af_heart"}
@@ -104,9 +100,4 @@ def load_settings(env: dict[str, str] | None = None) -> Settings:
         api_token=e.get("TTS_API_TOKEN", ""),
         feed_url=required_env("TTS_FEED_URL", e),
         feed_title=feed_title(e),
-        # Title naming for faithful reads only; not an x-tts reader backend.
-        azure_chat_base_url=required_env("TTS_AZURE_CHAT_BASE_URL", e).rstrip("/"),
-        azure_chat_api_key=e.get("TTS_AZURE_CHAT_API_KEY", ""),
-        azure_chat_key_cmd=required_env("TTS_AZURE_CHAT_KEY_CMD", e),
-        title_model=e.get("TTS_TITLE_MODEL", ""),
     )

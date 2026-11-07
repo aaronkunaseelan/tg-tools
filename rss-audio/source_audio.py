@@ -139,8 +139,6 @@ class SourceToolSettings:
     yt_dlp_bin: str
     ffmpeg_bin: str
     mullvad_proxy: str
-    mullvad_control_url: str = "http://127.0.0.1:8000"
-    mullvad_control_token: str = ""
     yt_dlp_remote_components: str = ""
     yt_dlp_format: str = "ba"
     # Browser whose cookies yt-dlp reads on the Mac route; empty sends none.

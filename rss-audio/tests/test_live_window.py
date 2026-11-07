@@ -22,9 +22,10 @@ import pytest
 
 import live_window
 import runtime_worker
+import surveillance
 from live_window import (LiveWindow, LiveWindowError, SegmentResponse, fetch_live_window, head_from_headers,
                          parse_window, plan_window)
-from pipeline import PipelineError
+from pipeline import JobOptions, PipelineError, is_retryable
 from source_audio import SourceToolSettings
 
 HEADERS = {"X-Head-Seqnum": "1677546", "X-Head-Time-Millis": "8387729278", "X-Walltime-Ms": "1793742841578"}
@@ -230,18 +231,18 @@ def test_worker_turns_window_errors_into_the_jobs_error_class(tmp_path, monkeypa
                                mac_ssh_target="", mac_ytdlp_path="", mac_cookies_from_browser="", yt_dlp_bin="yt-dlp",
                                yt_dlp_format="ba", ffmpeg_bin="ffmpeg", mullvad_control_url="", mullvad_control_token="",
                                yt_dlp_remote_components="")
-    monkeypatch.setattr(runtime_worker, "check_oci_mullvad_health", lambda tools: SimpleNamespace(ok=True))
+    monkeypatch.setattr(surveillance, "check_oci_mullvad_health", lambda tools: SimpleNamespace(ok=True))
     for error, retryable in ((LiveWindowError("window_not_show", "not the show", retryable=False), False),
                              (LiveWindowError("window_pending", "not over", retryable=True), True)):
         def fail(*args, **kwargs):
             raise error
-        monkeypatch.setattr(runtime_worker.live_window, "fetch_live_window", fail)
+        monkeypatch.setattr(surveillance.live_window, "fetch_live_window", fail)
         published = []
-        monkeypatch.setattr(runtime_worker, "ingest_live_window",
+        monkeypatch.setattr(surveillance, "ingest_live_window",
                             lambda settings, **kw: kw["fetch_audio"](tmp_path) and published.append(1))
         with pytest.raises(PipelineError) as raised:
-            runtime_worker._publish_live_window(settings, {"liveWindow": WINDOW}, runtime_worker.JobOptions(), tmp_path)
-        assert raised.value.stage == error.error_class and runtime_worker._is_retryable_pipeline_error(raised.value) is retryable
+            surveillance.publish_window(settings, {"liveWindow": WINDOW}, JobOptions(), tmp_path)
+        assert raised.value.stage == error.error_class and is_retryable(raised.value) is retryable
         assert published == []
 
 
@@ -253,9 +254,10 @@ def test_live_window_is_oci_mullvad_only_and_exclusive(tmp_path, monkeypatch):
                                       "HOME": os.environ.get("HOME", "/tmp")}, clear=True):
         settings = load_settings()
     with pytest.raises(PipelineError) as err:
-        runtime_worker._publish_live_window(settings, {"liveWindow": WINDOW, "preferredRoute": "mac_ssh"}, runtime_worker.JobOptions(), tmp_path)
+        surveillance.publish_window(settings, {"liveWindow": WINDOW, "preferredRoute": "mac_ssh"}, JobOptions(), tmp_path)
     assert err.value.stage == "input"
     import asyncio
     with pytest.raises(PipelineError) as err:
-        asyncio.run(runtime_worker.execute_runtime_job(settings, None, {"liveWindow": WINDOW, "sourceUrl": "https://example.com/a"}))
+        asyncio.run(runtime_worker.execute_runtime_job(settings, None, {"liveWindow": WINDOW, "sourceUrl": "https://example.com/a",
+                                                                        "feed": "surveillance"}))
     assert err.value.stage == "input"

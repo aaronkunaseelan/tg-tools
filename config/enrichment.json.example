@@ -1,5 +1,7 @@
 {
   "episodes": "haiku",
   "speech": "haiku",
-  "surveillance": "sonnet"
+  "surveillance": "sonnet",
+  "meetings": "haiku",
+  "titles": "haiku"
 }

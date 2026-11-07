@@ -11,8 +11,9 @@ from types import SimpleNamespace
 import pytest
 
 import runtime_worker
+import surveillance
 from live_window import LiveWindowError
-from pipeline import PipelineError
+from pipeline import JobOptions, PipelineError, is_retryable
 from source_audio import SourceAudioError
 
 WALL = ("ERROR: [youtube] f39oHo6vFLg: Sign in to confirm you’re not a bot. Use --cookies-from-browser or --cookies "
@@ -25,8 +26,8 @@ WINDOW = {"videoId": "f39oHo6vFLg", "start": "2026-11-03T12:00:00Z", "seconds": 
     ("Requested format is not available", False, False), ("HTTP Error 503", True, True)])
 def test_classification(text, attended, unattended):
     error = PipelineError("metadata", "yt-dlp failed", text)
-    assert runtime_worker._is_retryable_pipeline_error(error) is attended
-    assert runtime_worker._is_retryable_pipeline_error(error, unattended=True) is unattended
+    assert is_retryable(error) is attended
+    assert is_retryable(error, unattended=True) is unattended
 
 
 @pytest.mark.parametrize("input_json, outcome", [({"delivery": "none"}, "retryable_error"),
@@ -62,9 +63,9 @@ def lookup(monkeypatch, tmp_path):
                                yt_dlp_format="ba", ffmpeg_bin="ffmpeg", mullvad_control_url="", mullvad_control_token="",
                                yt_dlp_remote_components="")
     state = SimpleNamespace(calls=0, rotator=Rotator(), errors=[SourceAudioError("metadata", "Source requires sign-in", WALL)])
-    monkeypatch.setattr(runtime_worker, "check_oci_mullvad_health", lambda tools: SimpleNamespace(ok=True))
-    monkeypatch.setattr(runtime_worker, "_exit_rotator", lambda s: state.rotator)
-    monkeypatch.setattr(runtime_worker.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(surveillance, "check_oci_mullvad_health", lambda tools: SimpleNamespace(ok=True))
+    monkeypatch.setattr(surveillance, "exit_rotator", lambda s: state.rotator)
+    monkeypatch.setattr(surveillance.time, "sleep", lambda seconds: None)
     audio = tmp_path / "window.m4a"
     audio.write_bytes(b"m4a")
 
@@ -73,11 +74,11 @@ def lookup(monkeypatch, tmp_path):
         if state.errors:
             raise state.errors.pop(0)
         return audio, 10800.0
-    monkeypatch.setattr(runtime_worker.live_window, "fetch_live_window", fetch)
-    monkeypatch.setattr(runtime_worker, "ingest_live_window", lambda settings, **kw: SimpleNamespace(
+    monkeypatch.setattr(surveillance.live_window, "fetch_live_window", fetch)
+    monkeypatch.setattr(surveillance, "ingest_live_window", lambda settings, **kw: SimpleNamespace(
         slug="s", title="t", public_url="https://h/s.mp3", file_size_bytes=1, script_url=None, notes_url=None,
         manifest_url=kw["fetch_audio"](tmp_path) and None))
-    state.run = lambda: runtime_worker._publish_live_window(settings, {"liveWindow": WINDOW}, runtime_worker.JobOptions(), tmp_path)
+    state.run = lambda: surveillance.publish_window(settings, {"liveWindow": WINDOW}, JobOptions(), tmp_path)
     return state
 
 

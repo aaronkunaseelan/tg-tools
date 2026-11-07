@@ -121,7 +121,7 @@ def _store_success_result(
         asr_model=transcribe_model,
         summary=summary_payload,
         summary_status=str(result_json.get("summaryStatus") or "ok"),
-        summary_model_display=str(result_json.get("summaryModel") or f"openai-codex/{settings.summary_model}"),
+        summary_model_display=str(result_json.get("summaryModel") or "unknown"),
         summary_error_text=summary_error_text,
     )
     return stored, summary_payload

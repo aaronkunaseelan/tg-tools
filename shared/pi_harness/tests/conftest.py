@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-TIERS = {"episodes": "haiku", "speech": "haiku", "surveillance": "sonnet"}
+TIERS = {"episodes": "haiku", "speech": "haiku", "surveillance": "sonnet", "meetings": "haiku", "titles": "haiku"}
 
 
 @pytest.fixture(autouse=True)

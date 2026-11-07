@@ -19,7 +19,7 @@ from episode_enrichment import timing
 from episode_enrichment.segments import check_segments
 from episode_enrichment.paragraphs import build_stream
 
-from notes_job import SEGMENTERS
+from surveillance_seams import SEGMENTERS
 
 RADIO, TV = SEGMENTERS["surveillance-radio"], SEGMENTERS["surveillance-tv"]
 RADIO_OPEN = "This is Bloomberg Surveillance with Tom Keene and Paul Sweeney."

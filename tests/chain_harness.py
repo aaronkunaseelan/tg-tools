@@ -117,7 +117,7 @@ class Edge:
                 self.end_headers()
                 self.wfile.write(data)
 
-            do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = _serve
+            do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = do_CONNECT = _serve   # CONNECT: a proxy's health check
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), _H)
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
@@ -282,8 +282,8 @@ def start_stack(*, meeting_schema: bool = False, controller: bool = True) -> Sta
 
 FAKE_MODEL = r'''#!/usr/bin/env python3
 """Stand-in for the `claude` and `pi` CLIs: answers the prompt shapes the lanes
-send (reader write/review/revise, enrichment topics/mentions) through the same
-argv/stdin/stdout contract, and logs every call."""
+send (reader write/review/revise, enrichment topics/mentions, the meeting summary
+and the episode title) through the same argv/stdin/stdout contract, and logs every call."""
 import json, os, re, sys
 argv = sys.argv[1:]
 if argv[:2] == ["auth", "status"]:
@@ -301,6 +301,12 @@ elif "=== RULINGS ===" in prompt:
     step, text = "revise", SCRIPT + "=== RULINGS ===\n1 accepted: hedge restored.\n"
 elif "=== TITLE ===" in prompt:
     step, text = "write", SCRIPT
+elif "Summarize this meeting transcript chunk" in prompt:
+    step, text = "meeting_chunk", json.dumps(MEETING_CHUNK)
+elif "Produce one final meeting summary" in prompt:
+    step, text = "meeting_final", json.dumps(MEETING_FINAL)
+elif "TITLE HINT" in prompt:
+    step, text = "episode_title", json.dumps({"title": EPISODE_TITLE})
 elif '"mentions"' in prompt:
     heads = re.findall(r'^- "(.*)" covers ', prompt, re.M)
     step, text = "mentions", json.dumps({"topics": [{"heading": h, "mentions": []} for h in heads]})
@@ -327,10 +333,25 @@ FAKE_SCRIPT = ("=== TITLE ===\nPlastic bottles shed particles\n=== SYNOPSIS ===\
                "=== SCRIPT ===\n## The finding\nHeating water in a polypropylene bottle released millions of "
                "particles per litre, the authors report, though exposure estimates remain uncertain.\n")
 
+# The meeting summary and the faithful read's title now come from the same harness the other
+# model steps use (X-104.3), so the fake answers those prompt shapes too.
+MEETING_CHUNK = {"title_hint": "Launch timing", "meeting_date_hint": "",
+                 "overview": "The launch moves to November.", "attendees": ["Ana", "Ben"],
+                 "key_points": ["Launch moves to November"], "decisions": ["Launch in November"],
+                 "action_items": ["Ben drafts the notice by Friday"], "open_questions": []}
+MEETING_FINAL = {"title": "Launch timing review", "meeting_date": "",
+                 "overview": "The team moved the launch to November.", "attendees": ["Ana", "Ben"],
+                 "key_points": ["Launch moves to November"], "decisions": ["Launch in November"],
+                 "action_items": ["Ben drafts the notice by Friday"], "open_questions": []}
+EPISODE_TITLE = "Plastic bottles shed particles"
+
 
 def install_fake_models(bin_dir: Path, log: Path) -> Path:
     bin_dir.mkdir(parents=True, exist_ok=True)
-    body = FAKE_MODEL.replace("argv = sys.argv[1:]", f"SCRIPT = {FAKE_SCRIPT!r}\nLOG = {str(log)!r}\nargv = sys.argv[1:]")
+    body = FAKE_MODEL.replace("argv = sys.argv[1:]", f"SCRIPT = {FAKE_SCRIPT!r}\nLOG = {str(log)!r}\n"
+                              f"MEETING_CHUNK = {json.dumps(MEETING_CHUNK)}\n"
+                              f"MEETING_FINAL = {json.dumps(MEETING_FINAL)}\n"
+                              f"EPISODE_TITLE = {EPISODE_TITLE!r}\nargv = sys.argv[1:]")
     for name in ("claude", "pi"):
         path = bin_dir / name
         path.write_text(body)
@@ -472,17 +493,6 @@ def callback(*, thread_id: int, message_id: int, data: str) -> Any:
     return type("Event", (), {"callback": InboundCallback(
         receipt_key=f"chain:cb:{message_id}", chat_id=CHAT_ID, thread_id=thread_id, callback_query_id="cb-1",
         message_id=message_id, user_id=OWNER_ID, data=data)})()
-
-
-def codex_responses(stack: Stack, reply: Callable[[dict[str, Any]], Any]) -> str:
-    """Serve the ChatGPT codex responses SSE stream; `reply(request_json)` returns the JSON object to stream."""
-    def handler(req: EdgeRequest) -> tuple[int, Any]:
-        text = json.dumps(reply(req.json()))
-        event = {"type": "response.output_text.delta", "delta": text}
-        completed = {"type": "response.completed", "response": {"status": "completed"}}
-        return 200, f"data: {json.dumps(event)}\n\ndata: {json.dumps(completed)}\n\ndata: [DONE]\n\n".encode()
-    stack.edge.route("POST", r"/backend-api/codex/responses$", handler)
-    return stack.edge.url + "/backend-api/codex/responses"
 
 
 async def deliver_all(runtime: Any) -> list[Any]:

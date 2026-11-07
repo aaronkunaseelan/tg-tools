@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from audio import AudioError, prepare_audio
 from config import Settings
-from summarizer import SummaryError, summarize_transcript_chunks
+from pi_harness import PiRunner, enrichment_tier
+from summarizer import SUMMARY_ROLE, SummaryError, summarize_transcript_chunks
 from transcribe_endpoint import ASRError, transcribe_chunks
 
 
@@ -29,7 +29,6 @@ class ExecutionResult:
     transcript_path: str
     chunks_path: str
     summary_path: str | None
-    summary_error_path: str | None
     audio_duration_seconds: float
     chunk_count: int
     transcribe_provider: str
@@ -47,7 +46,6 @@ class ExecutionResult:
             "transcriptPath": self.transcript_path,
             "chunksPath": self.chunks_path,
             "summaryPath": self.summary_path,
-            "summaryErrorPath": self.summary_error_path,
             "audioDurationSeconds": self.audio_duration_seconds,
             "chunkCount": self.chunk_count,
             "transcribeProvider": self.transcribe_provider,
@@ -65,6 +63,10 @@ def _required_text(data: dict[str, Any], key: str) -> str:
 
 
 def execute_pipeline(settings: Settings, runtime_job: dict[str, Any]) -> ExecutionResult:
+    # The summary model comes from the enrichment tier file's `meetings` pipeline, read once for
+    # this job and checked before any audio work or paid call. A problem is terminal, never a
+    # quiet fallback, and the failure classes the summary raises are the job's (runtime_worker).
+    summary_tier = enrichment_tier("meetings")
     input_json = dict(runtime_job.get("inputJson") or {})
     source_kind = _required_text(input_json, "sourceKind")
     source_key = _required_text(input_json, "sourceKey")
@@ -100,36 +102,19 @@ def execute_pipeline(settings: Settings, runtime_job: dict[str, Any]) -> Executi
     chunks_path = transcript_dir / "chunks.json"
     chunks_path.write_text(json.dumps(transcript_chunk_rows, indent=2) + "\n", encoding="utf-8")
 
-    summary_path: Path | None = None
-    summary_error_path: Path | None = None
-    summary_status = "ok"
+    summary_path: Path = summary_dir / "final_summary.json"
 
-    try:
-        chunk_summaries, summary_payload = summarize_transcript_chunks(
-            settings=settings,
-            chunk_texts=[item.text for item in chunk_transcripts if item.text.strip()],
-        )
-        (summary_dir / "chunk_summaries.json").write_text(
-            json.dumps(chunk_summaries, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        summary_path = summary_dir / "final_summary.json"
-        summary_path.write_text(json.dumps(summary_payload, indent=2) + "\n", encoding="utf-8")
-    except SummaryError as exc:
-        summary_status = "failed"
-        summary_error_path = summary_dir / "error.json"
-        summary_error_path.write_text(
-            json.dumps(
-                {
-                    "error": str(exc),
-                    "errorType": type(exc).__name__,
-                    "createdAt": datetime.now(UTC).isoformat(),
-                },
-                indent=2,
-            )
-            + "\n",
-            encoding="utf-8",
-        )
+    runner = PiRunner(SUMMARY_ROLE, cwd=str(summary_dir), tier=summary_tier)
+    chunk_summaries, summary_payload = summarize_transcript_chunks(
+        settings=settings,
+        chunk_texts=[item.text for item in chunk_transcripts if item.text.strip()],
+        runner=runner,
+    )
+    (summary_dir / "chunk_summaries.json").write_text(
+        json.dumps(chunk_summaries, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    summary_path.write_text(json.dumps(summary_payload, indent=2) + "\n", encoding="utf-8")
 
     return ExecutionResult(
         source_kind=source_kind,
@@ -138,14 +123,13 @@ def execute_pipeline(settings: Settings, runtime_job: dict[str, Any]) -> Executi
         local_source_path=str(local_source_path),
         transcript_path=str(transcript_path),
         chunks_path=str(chunks_path),
-        summary_path=str(summary_path) if summary_path else None,
-        summary_error_path=str(summary_error_path) if summary_error_path else None,
+        summary_path=str(summary_path),
         audio_duration_seconds=prepared.duration_seconds,
         chunk_count=len(transcript_chunk_rows),
         transcribe_provider=transcription.provider,
         transcribe_model=transcription.model,
-        summary_status=summary_status,
-        summary_model=f"openai-codex/{settings.summary_model}",
+        summary_status="ok",
+        summary_model=f"{runner.provider}/{runner.model}",
     )
 
 

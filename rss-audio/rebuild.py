@@ -67,7 +67,6 @@ def rebuild_job_payload(rebuild: Mapping[str, Any], *, producer_ref: str | None 
 def run_rebuild(settings: Settings, rebuild: Mapping[str, Any], work_dir: Path, tier: str | None) -> PublishResult:
     """Speech-to-text from the stored mp3, publish version n's script, and return the notes request."""
     feed, slug, version = rebuild["feed"], rebuild["slug"], int(rebuild["version"])
-    notes_job.check_segmenter(rebuild.get("segmenter"))
     if not settings.enrichment_enabled:
         raise PipelineError("input", "a rebuild needs speech-to-text, and enrichment is off", retryable=False)
     episode = _get_episode_by_slug(settings, slug, feed)
@@ -121,7 +120,6 @@ def submit_line(payload: Mapping[str, Any], submitted: Mapping[str, Any]) -> str
 def plan(settings: Settings, slug: str, feed: str, *, segmenter: str | None = None,
          segment_context: Mapping[str, Any] | None = None, producer_ref: str | None = None) -> tuple[dict, list[str]]:
     """(the submit payload, the plan's lines). Reads the episode; writes nothing."""
-    notes_job.check_segmenter(segmenter)
     episode = _get_episode_by_slug(settings, slug, feed)
     if episode is None:
         raise PipelineError("rebuild", f"no episode {slug} in feed {feed}", retryable=False)
@@ -149,6 +147,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--apply", action="store_true", help="submit the job (default: print the plan)")
     args = parser.parse_args(argv)
     import config
+    import surveillance
     from runtime_client import RuntimeClient
     try:
         settings = config.worker_settings()[0]
@@ -156,6 +155,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"rebuild: {config.WORKER_UNIT} settings unreadable ({type(exc).__name__})", file=sys.stderr)
         return 1
     try:
+        surveillance.named_segmenter(args.segmenter)
         payload, lines = plan(settings, args.slug, args.feed, segmenter=args.segmenter,
                               segment_context=args.context, producer_ref=args.producer_ref)
     except PipelineError as exc:

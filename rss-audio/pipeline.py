@@ -25,14 +25,21 @@ from tg_tools_common.rclone_upload import immutable_copy_argv
 from episode_enrichment import (EpisodeNames, EpisodeNamingMetadata,
                                 build_episode_names, names_from_prefix)
 from episode_enrichment.naming import document_version
+from exit_rotation import ExitRotator
 from source_audio import (
     SourceAudioError,
+    SourceFailureKind,
     SourceMetadata,
     SourceRoute,
     SourceToolSettings,
+    check_oci_mullvad_health,
+    classify_source_failure,
+    classify_text,
     convert_input_to_mp3,
     download_source_to_mp3_for_route,
     fetch_source_metadata_for_route,
+    is_mac_reachable,
+    route_label,
     run_command,
 )
 
@@ -200,8 +207,8 @@ FEEDS = {
     "audio": ("audio", "RSS_AUDIO_PUBLIC_ROOT"),
     "surveillance": ("surveillance", "SURVEILLANCE_PUBLIC_ROOT"),
 }
-# Which enrichment pipeline (a key of the enrichment tier file) each feed's episodes belong to.
-ENRICHMENT_PIPELINES = {"audio": "episodes", "surveillance": "surveillance"}
+# The pipeline that publishes each feed (episodes.py, surveillance.py); also its key in the enrichment tier file.
+PIPELINES = {"audio": "episodes", "surveillance": "surveillance"}
 SCHEDULED_DATE_BASIS = "scheduled_source"
 
 
@@ -250,7 +257,7 @@ def enrichment_preflight(settings: Settings, feed: str) -> str | None:
     if not settings.enrichment_enabled:
         return None
     feed_spec(feed)
-    pipeline = ENRICHMENT_PIPELINES[feed]
+    pipeline = PIPELINES[feed]
     try:
         from pi_harness import EnrichmentConfigError, enrichment_tier
     except ImportError as exc:
@@ -586,6 +593,210 @@ def _probe_duration_seconds(settings: Settings, path: Path) -> int:
         return max(0, round(float(result.stdout.strip())))
     except ValueError:
         return 0
+
+
+# -- steps both pipelines share (episodes.py, surveillance.py) --------------------------------------
+
+@dataclass(frozen=True)
+class RuntimeExecutionResult:
+    slug: str
+    title: str
+    public_url: str
+    file_size_bytes: int
+    completion_html: str
+    script_url: str | None = None
+    notes_url: str | None = None
+    manifest_url: str | None = None
+    segments_url: str | None = None
+    page_url: str | None = None
+    notes: dict | None = None   # the notes job to submit (notes_input), when there is a script
+
+
+def execution_result(published, source_url: str | None, feed: str = "audio") -> RuntimeExecutionResult:
+    return RuntimeExecutionResult(
+        slug=published.slug,
+        title=published.title,
+        public_url=published.public_url,
+        file_size_bytes=published.file_size_bytes,
+        completion_html=render_completion_message(
+            published.title, published.public_url,
+            notes_url=published.notes_url, script_url=published.script_url,
+            source_url=source_url, feed=feed),
+        script_url=published.script_url,
+        notes_url=published.notes_url,
+        manifest_url=published.manifest_url,
+        segments_url=getattr(published, "segments_url", None),
+        page_url=getattr(published, "page_url", None),
+        notes=getattr(published, "notes", None),
+    )
+
+
+def is_retryable(exc: PipelineError, unattended: bool = False) -> bool:
+    """Whether a failed attempt should be retried.
+
+    ``unattended`` (a job with ``delivery: none``, i.e. a scheduled source) treats a sign-in/bot wall as
+    transient: nobody is waiting to be told, a dead job is never resubmitted (its idempotency key is
+    spent), and this route sends no cookies, so the wall belongs to the proxy exit, not the source.
+    """
+    if exc.retryable is not None:
+        return exc.retryable
+    if exc.dependency != "source":
+        return exc.stage != "input"
+    if exc.stage == "input":
+        return False
+    kind = classify_source_failure(f"{exc}\n{exc.stderr}")
+    if kind == SourceFailureKind.AUTH_REQUIRED and unattended:
+        return True
+    if kind in {
+        SourceFailureKind.AUTH_REQUIRED,
+        SourceFailureKind.SOURCE_UNAVAILABLE,
+        SourceFailureKind.FORMAT_UNAVAILABLE,
+    }:
+        return False
+    return True
+
+
+def source_link(input_json: dict) -> tuple[str, str] | None:
+    """The job's ``sourceUrl`` as (kind, url), None when it has none; an unsupported URL is the input's error."""
+    source = input_json.get("sourceUrl")
+    if not isinstance(source, str) or not source.strip():
+        return None
+    classified = classify_text(source)
+    if not classified:
+        raise PipelineError("input", "Send a supported URL or audio file")
+    return classified
+
+
+def route_health_error(route: SourceRoute, reason: str, detail: str = "") -> PipelineError:
+    message = f"{route_label(route)} route unhealthy"
+    if reason:
+        message = f"{message}: {reason}"
+    return PipelineError("route-health", message, detail)
+
+
+def exit_rotator(settings: Settings) -> ExitRotator:
+    """Exit rotation is opt-in: without a control-server token the Mullvad
+    route behaves exactly as before (a single attempt per job)."""
+    return ExitRotator(
+        control_url=settings.mullvad_control_url,
+        token=settings.mullvad_control_token,
+        proxy=settings.mullvad_proxy,
+    )
+
+
+def publish_link(settings: Settings, input_json: dict, link: tuple[str, str], work_dir: Path | None,
+                 options: JobOptions) -> RuntimeExecutionResult:
+    """Get a link's audio (a direct audio URL, or by the source routes) and publish it."""
+    kind, source_url = link
+    if kind != "direct_audio_url":
+        return _fetch_and_publish_url(settings, input_json, source_url, work_dir, options)
+    published = ingest_direct_audio_url(settings, source_url, work_dir=work_dir, options=options)
+    return execution_result(published, source_url, options.feed)
+
+
+def _candidate_routes(input_json: dict) -> list[SourceRoute]:
+    preferred = input_json.get("preferredRoute")
+    if preferred:
+        return [SourceRoute(str(preferred))]
+    return [SourceRoute.OCI_MULLVAD, SourceRoute.MAC_SSH]
+
+
+def _attempt_mullvad_route(
+    settings: Settings,
+    source_url: str,
+    work_dir: Path | None,
+    rotator: ExitRotator,
+    options: JobOptions,
+) -> tuple[list[PipelineError], RuntimeExecutionResult | None]:
+    """Try the proxy route up to ``rotator.attempts()`` times, rotating the
+    Mullvad egress (with conservative jitter) between eligible failures.
+
+    Exit rotation is the middle rung between the pre-flight health gate and
+    the Mac fallback: it exists for IP-shaped refusals (bot checks, rate
+    limits) that a healthy-but-pinned exit can trigger.  It never fires for
+    proxy-unavailable or format failures, and never rotates more than
+    ``max_rotations`` times per job.
+    """
+    failures: list[PipelineError] = []
+    for attempt in range(rotator.attempts()):
+        current_progress().check()
+        try:
+            metadata = fetch_metadata(settings, source_url, route=SourceRoute.OCI_MULLVAD)
+            published = ingest_url_with_metadata(
+                settings, source_url, metadata, route=SourceRoute.OCI_MULLVAD,
+                work_dir=work_dir, options=options)
+            return [], execution_result(published, source_url, options.feed)
+        except PipelineError as exc:
+            if exc.dependency != "source":
+                raise
+            failures.append(exc)
+            if attempt + 1 < rotator.attempts():
+                detail = f"{exc}\n{exc.stderr}"
+                if rotator.eligible(detail) and rotator.rotate(attempt):
+                    delay = random.uniform(*rotator.jitter_sec)
+                    logger.info(
+                        "mullvad egress rotated after %s; retrying route in %.1fs",
+                        exc.stage, delay)
+                    with current_progress().stage("source_retry", retrySeconds=delay, reason="source_retry"):
+                        time.sleep(delay)
+                    continue
+            break
+    return failures, None
+
+
+def _fetch_and_publish_url(
+    settings: Settings,
+    input_json: dict,
+    source_url: str,
+    work_dir: Path | None,
+    options: JobOptions,
+) -> RuntimeExecutionResult:
+    failures: list[PipelineError] = []
+    rotator = exit_rotator(settings)
+    unattended = options.delivery == "none"
+    for route in _candidate_routes(input_json):
+        if route == SourceRoute.OCI_MULLVAD:
+            health = check_oci_mullvad_health(_source_tool_settings(settings))
+            if not health.ok:
+                failures.append(route_health_error(route, health.reason, health.detail))
+                continue
+            route_failures, result = _attempt_mullvad_route(
+                settings, source_url, work_dir, rotator, options)
+            failures.extend(route_failures)
+            if result is not None:
+                return result
+            continue
+
+        if route == SourceRoute.MAC_SSH and not is_mac_reachable(_source_tool_settings(settings)):
+            failures.append(route_health_error(route, "mac_unavailable"))
+            continue
+
+        try:
+            metadata = fetch_metadata(settings, source_url, route=route)
+            published = ingest_url_with_metadata(
+                settings, source_url, metadata, route=route, work_dir=work_dir, options=options)
+            return execution_result(published, source_url, options.feed)
+        except PipelineError as exc:
+            if exc.dependency != "source":
+                raise
+            failures.append(exc)
+            continue
+
+    if not failures:
+        raise PipelineError("source", "No source routes were attempted")
+    detail = "\n\n".join(f"{failure.stage}: {failure}\n{failure.stderr}" for failure in failures)
+    # Retryability is classified from the raised error, so surfacing only the
+    # last route's message let route ordering decide the outcome: a transient
+    # "mac unreachable" after a terminal auth failure looked retryable, and a
+    # terminal last route masked a genuinely retryable earlier one. Prefer a
+    # route that failed transiently -- if any route might succeed later, the
+    # job as a whole is worth retrying.
+    representative = next(
+        (failure for failure in failures if is_retryable(failure, unattended)),
+        failures[-1],
+    )
+    raise PipelineError("source", str(representative), detail,
+                        retryable=any(is_retryable(failure, unattended) for failure in failures))
 
 
 @tracked_stage("source_metadata", lambda r: {"title": " ".join(r.title.split())[:200], "audioDurationSeconds": max(0,r.duration_seconds)})

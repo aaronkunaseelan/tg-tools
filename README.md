@@ -88,8 +88,8 @@ uv, Postgres and a configured runtime-controller HTTP API; Telegram bot/API
 credentials; and the providers required by the products you enable. Podcast
 publication additionally needs B2/rclone, the rss-edge Worker with D1, ffmpeg and
 ffprobe. PDF reads need Poppler's `pdftotext`. Extractor routes can require a proxy
-and a separate SSH/browser-cookie host. Meeting summaries use a configured Codex
-OAuth login; transcription and speech need their configured Azure services.
+and a separate SSH/browser-cookie host. Meeting summaries and episode titles use the enrichment tier file's
+`meetings` and `titles` tiers; transcription and speech need their configured Azure services.
 
 1. Read [configuration](docs/config.md), copy the relevant `config/*.env.example`
    templates to protected deployment files, and fill in absolute paths, provider

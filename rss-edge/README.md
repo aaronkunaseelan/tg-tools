@@ -151,8 +151,22 @@ summary/Topics/artifact-footer contract and renders:
 MP3 and Manifest links are omitted from the listener description. Full descriptions
 remain stored; full script/notes/manifest objects, GUIDs and enclosures are unchanged.
 Publisher HTML outside the recognized generated contract is not summarized.
-`description` and `content:encoded` carry simple HTML; `itunes:summary` has a
-separately rendered plain-text fallback with labelled URLs, not stripped link labels.
+The full text is emitted **once**, in `content:encoded` — the notes, or the publisher's HTML — because that
+is the field podcast apps render in full (Apple Podcasts and Pocket Casts read it as HTML). `description`
+and the legacy `itunes:summary` carry the **one-sentence excerpt** instead, as escaped text (not
+CDATA): the publisher's `excerpt` when set, else the first sentence of the text, HTML stripped, at most
+300 characters. `itunes:subtitle` keeps the stored excerpt, clipped to its 255-character limit. This is what keeps the feed small: the same text used to be emitted three times
+(573,856 characters of description in a 627,385-byte Surveillance feed).
+
+`<podcast:chapters>` (Podcast Namespace 1.0, `type="application/json+chapters"`) is emitted on an item
+whose page is a condensed edition's — a `<stem>-condensed[.vN].page.html` name. Its URL is the sibling
+`<stem>-condensed[.vN].chapters.json` that the condensed publisher uploads with its six artefacts (chapters
+JSON version 1.2.0: `startTime`, `title`). A full show's page has no chapters file, so its item carries
+no element. The rule is one naming contract: all six artefacts share the `<slug>-condensed` stem.
+
+The item also follows the iTunes vocabulary the feed validator checks: `itunes:explicit` is `true`/`false`
+(the stored field is `yes`/`no`), and `itunes:season`, `itunes:episode` and `itunes:episodeType` are emitted
+only when they have a value.
 URLs deduplicate after legacy delivery-host canonicalization, preserving meaningful
 queries/fragments. The feed ETag includes the presentation key (`FEED_PRESENTATION` in `src/index.js`); increment this
 presentation key whenever output changes so unchanged D1 metadata cannot cause a

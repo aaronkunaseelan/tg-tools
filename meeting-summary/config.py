@@ -22,8 +22,6 @@ def _csv(raw: str) -> tuple[str, ...]:
 
 @dataclass(frozen=True)
 class Settings:
-    pi_auth_path: Path
-    summary_model: str
     transcribe_model: str
     transcribe_jobs: int
     max_audio_duration_sec: int
@@ -54,8 +52,6 @@ def load_settings(environ=None, *, pid=None) -> Settings:
     env = (os.environ if environ is None else environ).get
     state_dir = _path(env("MEETING_SUMMARY_STATE_DIR", "~/.local/share/meeting-summary"))
     return Settings(
-        pi_auth_path=_path(env("MEETING_SUMMARY_PI_AUTH_PATH", "~/.pi/agent/auth.json")),
-        summary_model=env("MEETING_SUMMARY_SUMMARY_MODEL", "gpt-5.4-mini"),
         transcribe_model=env("MEETING_SUMMARY_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe"),
         transcribe_jobs=max(1, int(env("MEETING_SUMMARY_TRANSCRIBE_JOBS", "3"))),
         max_audio_duration_sec=int(env("MEETING_SUMMARY_MAX_AUDIO_DURATION_SEC", "7200")),
@@ -107,8 +103,6 @@ def validate_settings(settings: Settings) -> None:
         missing.append(f"MEETING_SUMMARY_FFPROBE_BIN ({settings.ffprobe_bin})")
     if settings.runtime_worker_venue not in {"generic", "oci"}:
         missing.append("MEETING_SUMMARY_RUNTIME_WORKER_VENUE must be one of generic, oci")
-    if not settings.summary_model.strip():
-        missing.append("MEETING_SUMMARY_SUMMARY_MODEL")
     if not settings.transcribe_model.strip():
         missing.append("MEETING_SUMMARY_TRANSCRIBE_MODEL")
     if not settings.runtime_supported_execution_profiles:

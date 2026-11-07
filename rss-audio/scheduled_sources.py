@@ -16,6 +16,8 @@ A playlist is listed from its Atom feed. When the feed fails (it has answered 40
 the same playlist is listed with yt-dlp by the source's download route: one flat listing, plus one video
 metadata read per new show for its published time (an item with a job keeps its job's). Either path gives the
 same items, keyed on the video; the run prints a line when yt-dlp listed them, and names both errors if both fail.
+
+A live-stream window is Surveillance radio: its own fields and the days it is due are ``surveillance.py``'s.
 """
 from __future__ import annotations
 
@@ -27,16 +29,16 @@ import sys
 import urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, replace
-from datetime import UTC, date, datetime, time, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Mapping
-from zoneinfo import ZoneInfo
 
 from tg_tools_common.intent_contract import RuntimeJobIntent
 from tg_tools_common.runtime_contract import SKIPPED_ERROR_CLASS, source_receipt_payload
 
 from config import load_settings
-from pipeline import FEEDS
+import surveillance
+from pipeline import FEEDS, PipelineError
 from runtime_client import RuntimeClient
 from source_audio import SourceRoute
 
@@ -108,8 +110,7 @@ def _validate_source(source: Any) -> None:
     if kind not in KINDS:
         raise InventoryError(f"{name}: kind must be one of {', '.join(KINDS)}")
     needed = {"feed", "since", "title", "lookbackDays"} | (
-        {"playlistId", "titleRegex", "preferredRoute"} if kind == "youtube_playlist" else
-        {"videoId", "timezone", "weekdays", "start", "seconds", "expectOpening", "settleMinutes"})
+        {"playlistId", "titleRegex", "preferredRoute"} if kind == "youtube_playlist" else set())
     missing = sorted(needed - set(source))
     if missing:
         raise InventoryError(f"{name}: missing {', '.join(missing)}")
@@ -121,24 +122,19 @@ def _validate_source(source: Any) -> None:
             re.compile(source["titleRegex"])
             SourceRoute(source["preferredRoute"])
         else:
-            ZoneInfo(source["timezone"])
-            time.fromisoformat(source["start"])
+            surveillance.check_window_source(source)
     except (ValueError, KeyError, OSError, re.error) as exc:
         raise InventoryError(f"{name}: {exc}") from exc
     if "{date}" not in source["title"]:
         raise InventoryError(f"{name}: title must contain {{date}}")
-    if "segmenter" in source:   # the notes job splits the episode with it (notes_job.SEGMENTERS)
-        from notes_job import SEGMENTERS
-        if source["segmenter"] not in SEGMENTERS:
-            raise InventoryError(f"{name}: unknown segmenter {source['segmenter']!r} "
-                                 f"(known: {', '.join(sorted(SEGMENTERS))})")
-    for field in ("lookbackDays",) + (("seconds", "settleMinutes") if kind == "youtube_live_window" else ()):
-        if isinstance(source[field], bool) or not isinstance(source[field], int) or source[field] < 0:
-            raise InventoryError(f"{name}: {field} must be a non-negative integer")
-    if kind == "youtube_live_window" and not (
-            isinstance(source["weekdays"], list) and source["weekdays"]
-            and all(isinstance(day, int) and 1 <= day <= 7 for day in source["weekdays"])):
-        raise InventoryError(f"{name}: weekdays must be ISO weekday numbers 1 (Mon) .. 7 (Sun)")
+    if "segmenter" in source:   # the notes job splits the episode with it
+        try:
+            surveillance.named_segmenter(source["segmenter"])
+        except PipelineError as exc:
+            raise InventoryError(f"{name}: {exc}") from None
+    lookback = source["lookbackDays"]
+    if isinstance(lookback, bool) or not isinstance(lookback, int) or lookback < 0:
+        raise InventoryError(f"{name}: lookbackDays must be a non-negative integer")
 
 
 # -- expected items ----------------------------------------------------------------------------
@@ -227,7 +223,7 @@ def expected_items(source: Mapping[str, Any], now: datetime,
     since = date.fromisoformat(source["since"])
     if source["kind"] == "youtube_playlist":
         return _playlist_items(source, now, since, fetch_feed, second, job_published, notes)
-    return _window_items(source, now, since)
+    return [window_item(source, day) for day in surveillance.window_days(source, now, since)]
 
 
 def _playlist_items(source, now: datetime, since: date, fetch_feed, second=None, job_published=None,
@@ -310,30 +306,11 @@ def playlist_item(source: Mapping[str, Any], entry: Entry) -> Item:
     return Item(source["id"], key, title, job)
 
 
-def _window_items(source, now: datetime, since: date) -> list[Item]:
-    today = now.astimezone(ZoneInfo(source["timezone"])).date()
-    items = []
-    for back in range(source["lookbackDays"], -1, -1):
-        day = today - timedelta(days=back)
-        if day < since or day.isoweekday() not in source["weekdays"]:
-            continue
-        item = window_item(source, day)
-        if now < datetime.fromisoformat(item.input_json["liveWindow"]["start"].replace("Z", "+00:00")) + timedelta(
-                seconds=source["seconds"], minutes=source["settleMinutes"]):
-            continue
-        items.append(item)
-    return items
-
-
 def window_item(source: Mapping[str, Any], day: date) -> Item:
     """The item of one air day of a ``youtube_live_window`` source, due or not."""
-    start = datetime.combine(day, time.fromisoformat(source["start"]), tzinfo=ZoneInfo(source["timezone"])).astimezone(UTC)
     key, title = f"{source['id']}:{day.isoformat()}", source["title"].replace("{date}", _short_date(day))
-    job = _base_input(source, key, "live_window", title, start)
-    job["liveWindow"] = {"videoId": source["videoId"], "start": _iso_z(start), "seconds": source["seconds"],
-                         "expectOpening": source["expectOpening"]}
-    if source.get("segmenter"):   # hour labels on the window's wall clock
-        job["segmentContext"] = {"start": _iso_z(start), "timezone": source["timezone"]}
+    job = _base_input(source, key, "live_window", title, surveillance.window_start(source, day))
+    job.update(surveillance.window_fields(source, job["publishedAt"]))
     return Item(source["id"], key, title, job)
 
 

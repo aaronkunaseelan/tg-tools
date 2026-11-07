@@ -10,6 +10,21 @@ function safeUrl(value, canonicalize) {
   } catch { return null; }
 }
 
+// One sentence, for `description` and `itunes:summary`: the publisher's excerpt when it has one, else the first
+// sentence of the text, capped so a player's episode list stays readable. HTML never survives.
+function oneSentence(text, limit = 300) {
+  const plain = String(text || '').replace(/<h[1-6]\b[^>]*>[\s\S]*?<\/h[1-6]>/gi, ' ')
+    .replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!plain) return '';
+  // A too-short first segment is an abbreviation ("Dr.", "Mr.", an initial), not a sentence: take the next.
+  const segments = [...new Intl.Segmenter('en', { granularity: 'sentence' }).segment(plain)].map((part) => part.segment.trim()).filter(Boolean);
+  let first = segments.shift() || plain;
+  while (first.length < 20 && segments.length) first = `${first} ${segments.shift()}`;
+  if (first.length <= limit) return first;
+  const cut = first.slice(0, limit);
+  return cut.slice(0, Math.max(cut.lastIndexOf(' '), 1)).trim();
+}
+
 function compactSummary(text) {
   // Keep whole sentences, never cut a word/sentence to hit the target.
   const paragraphs = text.split(/\n\s*\n/).map((p) => p.trim()).filter(Boolean);
@@ -67,7 +82,8 @@ export function episodeDescription(episode, canonicalize = (url) => url) {
   if (!generated) {
     const remaining = textLines.join('\n').trim();
     const html = [linkHtml && `<p>${linkHtml}</p>`, remaining].filter(Boolean).join('\n');
-    return { html, plain: [linkText, remaining.replace(/<[^>]*>/g, '')].filter(Boolean).join('\n\n'), excerpt: episode.excerpt || '' };
+    return { html, plain: [linkText, remaining.replace(/<[^>]*>/g, '')].filter(Boolean).join('\n\n'),
+      excerpt: oneSentence(episode.excerpt || remaining) };
   }
   const remaining = textLines.join('\n');
   const topicMatch = remaining.match(/^Topics: (.+)$/m);
@@ -90,5 +106,5 @@ export function episodeDescription(episode, canonicalize = (url) => url) {
   ].filter(Boolean).join('\n');
   const plain = [linkText, ...paragraphs, topics.length && `Topics\n${topics.map((t) => `• ${t}`).join('\n')}`,
     allTopics.length > topics.length && hasNotes && 'Full topic list and references in Notes.', facts.join(' ')].filter(Boolean).join('\n\n');
-  return { html, plain, excerpt: paragraphs.join(' ').split(/\s+/).slice(0, 50).join(' ') };
+  return { html, plain, excerpt: oneSentence(episode.excerpt || summaryText) };
 }

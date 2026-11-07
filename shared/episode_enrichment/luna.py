@@ -27,6 +27,11 @@ MENTIONS_ROLE = "transcript_mentions"
 # for a slower model day, but bounded so a hung call cannot hold a job lease.
 TOPICS_TIMEOUT_S = 1800  # a 3 h Surveillance transcript (~36k tokens) on Sonnet timed out at 600 s (4 Nov)
 MENTIONS_TIMEOUT_S = 1800
+# Pass 2 runs in batches of at most this many consecutive frozen topics (pipeline._stage_mentions); at or
+# below it, one call. Evidence, Haiku on 3 h Surveillance hours (4 Nov, stored manifests): every call with
+# 30-33 topics passed on its first try (3 of 3); with 34-51, 5 of 8 needed the repair call and 2 failed
+# after it (47 frozen, 48 returned; 50 frozen, 26 returned). 33 is the largest count that never needed one.
+MENTIONS_BATCH_TOPICS = 33
 
 _FENCE_RE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.IGNORECASE)
 
@@ -133,3 +138,16 @@ def run_mentions(stream, analysis, *, runner, source_kind="audio") -> tuple[dict
         stage="mentions", timeout_s=MENTIONS_TIMEOUT_S,
         session_name="transcript-mentions", gate=gate,
     )
+
+
+def mention_batches(topics: list, limit: int = MENTIONS_BATCH_TOPICS) -> list[list]:
+    """``topics`` cut into consecutive batches of at most ``limit``, as even as possible
+    (47 -> 24 + 23, never 33 + 14); one batch holding all of them at or below ``limit``."""
+    count = max(1, -(-len(topics) // limit))
+    size, extra = divmod(len(topics), count)
+    batches, start = [], 0
+    for index in range(count):
+        end = start + size + (index < extra)
+        batches.append(topics[start:end])
+        start = end
+    return batches

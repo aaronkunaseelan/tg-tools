@@ -5,8 +5,8 @@
 | the same, v2                            |                     | PUT also moves speech_text_url; versions below 2 deleted after the PUT |
 | segments.json of another script         |                     | notes still written; manifest timing says why it was not used |
 | a script that is not the submitted one  |                     | terminal error, nothing uploaded or PUT                     |
-| -                                       | unknown segmenter   | terminal input error before any read                        |
-| -                                       | a registered one    | its segments become the notes' sections                     |
+| -                                       | unknown segmenter   | the worker's terminal input error, before any read          |
+| -                                       | a segmenter passed  | its segments become the notes' sections                     |
 | no episode row                          |                     | terminal error                                              |
 notes_job_payload: idempotent on (slug, version), producer ref extends the parent's, delivery none.
 runtime_worker._submit_notes: the parent's segmenter rides along; a failed submit retries the parent.
@@ -32,6 +32,7 @@ import notes_job
 import pipeline
 from config import load_settings
 from episode_enrichment import Segment, timing
+from surveillance_seams import SEGMENTERS
 
 SLUG = "2026-11-03-bloomberg-surveillance-radio-27d0976312c4"
 SCRIPT = "\n\n".join(f"Paragraph {n} of the show." for n in range(1, 5))
@@ -105,11 +106,11 @@ def store(monkeypatch, tmp_path):
     monkeypatch.setattr(notes_job, "delete_documents",
                         lambda s, slug, feed, below_version: seen.deleted.append((slug, feed, below_version)))
     seen.variant = ""
-    seen.run = lambda version=1, sha=SHA, work="w", **extra: notes_job.run_notes(
+    seen.run = lambda version=1, sha=SHA, work="w", split=None, **extra: notes_job.run_notes(
         settings(), notes_job.notes_input(feed="surveillance", slug=SLUG, version=version, script_sha256=sha,
                                           title="Radio", published_at="2026-11-03T12:00:00Z", date_basis="scheduled_source",
                                           duration_seconds=10800, source_url=None, stt_engine="parakeet-ultra", **extra),
-        tmp_path / f"{work}{version}", "sonnet", runner_factory=lambda role: Runner(seen.calls, seen.variant))
+        tmp_path / f"{work}{version}", "sonnet", segmenter=split, runner_factory=lambda role: Runner(seen.calls, seen.variant))
     return seen
 
 
@@ -159,17 +160,25 @@ def test_a_script_that_is_not_the_submitted_one_is_refused(store):
     assert error.value.retryable is False and store.uploaded == {} and store.api == []
 
 
-def test_segmenters_by_name(store, monkeypatch):
+def test_an_unknown_segmenter_is_the_workers_input_error_before_any_read(store, tmp_path):
+    import asyncio
+    import runtime_worker
+    notes = notes_job.notes_input(feed="surveillance", slug=SLUG, version=1, script_sha256=SHA, title="Radio",
+                                  published_at=None, date_basis="unknown", duration_seconds=None, source_url=None,
+                                  stt_engine=None, segmenter="nope")
     with pytest.raises(pipeline.PipelineError) as error:
-        store.run(segmenter="nope")
-    assert error.value.stage == "input" and error.value.retryable is False
+        asyncio.run(runtime_worker.execute_runtime_job(settings(), None, notes, tmp_path))
+    assert error.value.stage == "input" and error.value.retryable is False and "nope" in str(error.value)
+    assert store.api == [] and store.uploaded == {}
+
+
+def test_a_segmenter_splits_the_notes_into_its_sections(store):
     seen_context = []
 
     def halves(stream, timed, context):
         seen_context.append((timed["basis"], context))
         return [Segment("Hour 1", "p00001", "p00002", rule="seam"), Segment("Hour 2", "p00003", "p00004", rule="fallback")]
-    monkeypatch.setitem(notes_job.SEGMENTERS, "halves", halves)
-    store.run(segmenter="halves", segment_context={"timezone": "America/New_York"})
+    store.run(split=halves, segment_context={"timezone": "America/New_York"})
     notes = store.uploaded[f"{SLUG}.notes.md"]
     assert "## Hour 1" in notes and "## Hour 2" in notes
     assert seen_context == [("words", {"durationSeconds": 10800, "timezone": "America/New_York"})]
@@ -199,16 +208,16 @@ def test_the_worker_runs_a_notes_input_as_a_notes_job(monkeypatch, tmp_path):
     import runtime_worker
     seen = []
 
-    def fake(s, notes, work_dir, tier):
-        seen.append((notes["slug"], tier))
+    def fake(s, notes, work_dir, tier, segmenter=None):
+        seen.append((notes["slug"], tier, segmenter))
         return pipeline.PublishResult(slug=SLUG, title="Radio", public_url="https://x/a.mp3", file_size_bytes=1,
                                       notes_url="https://x/n.md")
     monkeypatch.setattr(notes_job, "run_notes", fake)
     notes = notes_job.notes_input(feed="surveillance", slug=SLUG, version=1, script_sha256=SHA, title="Radio",
                                   published_at=None, date_basis="unknown", duration_seconds=None, source_url=None,
-                                  stt_engine=None)
+                                  stt_engine=None, segmenter="surveillance-radio")
     result = asyncio.run(runtime_worker.execute_runtime_job(settings(), None, notes, tmp_path))
-    assert seen == [(SLUG, "sonnet")] and result.notes_url == "https://x/n.md"
+    assert seen == [(SLUG, "sonnet", SEGMENTERS["surveillance-radio"])] and result.notes_url == "https://x/n.md"
 
 
 def test_the_publish_job_submits_its_notes_job_with_the_parent_segmenter():

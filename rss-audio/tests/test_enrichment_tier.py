@@ -25,7 +25,7 @@ import pipeline
 import runtime_worker
 from pi_harness import EnrichmentConfigError
 from config import load_settings
-from pipeline import ENRICHMENT_PIPELINES, FEEDS, PipelineError
+from pipeline import FEEDS, PIPELINES, PipelineError
 
 ENV = {"RSS_AUDIO_BASE_URL": "https://rss-feeds.stations.work", "RSS_AUDIO_B2_BUCKET": "example-audio",
        "HOME": os.environ.get("HOME", "/tmp"), "RSS_AUDIO_B2_REMOTE": "b2"}
@@ -78,7 +78,7 @@ def work(monkeypatch, tmp_path):
 
 
 def test_pipelines_cover_every_feed():
-    assert set(ENRICHMENT_PIPELINES) == set(FEEDS)
+    assert set(PIPELINES) == set(FEEDS)
 
 
 @pytest.mark.parametrize("feed, tier", [("audio", "haiku"), ("surveillance", "sonnet")])
@@ -90,6 +90,12 @@ def test_each_feed_enriches_on_its_pipelines_tier(work, feed, tier):
 def test_a_job_without_a_feed_is_the_episodes_pipeline(work, tmp_path):
     asyncio.run(runtime_worker.execute_runtime_job(make_settings(), None, {"localSourcePath": str(work.audio)}, tmp_path / "j"))
     assert [call["tier"] for call in work.enrich] == ["haiku"]
+
+
+def test_the_deepseek_tier_reaches_enrichment(work, enrichment_tiers):
+    enrichment_tiers.write_text(json.dumps({"episodes": "deepseek", "surveillance": "sonnet"}))
+    work.run(make_settings(), "audio")
+    assert [call["tier"] for call in work.enrich] == ["deepseek"]
 
 
 def test_a_changed_file_applies_to_the_next_job_without_a_restart(work, enrichment_tiers):
@@ -105,14 +111,14 @@ def test_unusable_tier_file_fails_before_any_work(work, enrichment_tiers, conten
     enrichment_tiers.unlink() if content is None else enrichment_tiers.write_text(content)
     with pytest.raises(PipelineError) as error:
         work.run(make_settings(), "surveillance")
-    assert error.value.stage == "enrichment_config" and runtime_worker._is_retryable_pipeline_error(error.value) is False
+    assert error.value.stage == "enrichment_config" and pipeline.is_retryable(error.value) is False
     assert (work.enrich, work.converted, work.commands, work.api) == ([], [], [], [])
 
 
 def test_config_error_beats_a_source_url_download(work, enrichment_tiers, monkeypatch):
     enrichment_tiers.write_text("{}")
     for name in ("ingest_direct_audio_url", "_fetch_and_publish_url", "fetch_metadata"):
-        monkeypatch.setattr(runtime_worker, name, lambda *a, **k: pytest.fail("downloaded before the configuration check"))
+        monkeypatch.setattr(pipeline, name, lambda *a, **k: pytest.fail("downloaded before the configuration check"))
     with pytest.raises(PipelineError) as error:
         asyncio.run(runtime_worker.execute_runtime_job(
             make_settings(), None, {"sourceUrl": "https://example.com/a.mp3", "feed": "surveillance"}))

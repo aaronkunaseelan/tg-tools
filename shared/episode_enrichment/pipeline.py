@@ -12,7 +12,8 @@ from typing import Any
 from tg_tools_common.progress import current_progress, tracked_stage
 
 from . import render, timing as timing_mod
-from .luna import EnrichmentModelError, MENTIONS_ROLE, TOPICS_ROLE, run_mentions, run_topics
+from .luna import (EnrichmentModelError, MENTIONS_ROLE, TOPICS_ROLE, mention_batches, run_mentions,
+                   run_topics)
 from .paragraphs import ParagraphStream, build_stream, stream_from_json
 from .segments import Segment, check_segments, single_segment, substream
 from .source import AudioSttSource, TranscriptSource
@@ -99,7 +100,7 @@ def _sha256(text: str) -> str:
 def _invalidate_dependents(work_dir: Path) -> None:
     for name in _DEPENDENT_CHECKPOINTS:
         (work_dir / name).unlink(missing_ok=True)
-    for pattern in ("topics-*.json", "mentions-*.json"):   # per-segment call caches
+    for pattern in ("topics-*.json", "mentions-*.json"):   # per-segment and per-batch call caches
         for path in work_dir.glob(pattern):
             path.unlink(missing_ok=True)
 
@@ -254,16 +255,56 @@ def _stage_mentions(path: Path, stream: ParagraphStream, analysis: dict,
         logger.info("reusing checkpointed mentions")
         return cached, {"cached": True, "ok": True}
     started = time.monotonic()
-    try:
-        mentions, report, _raw = run_mentions(
-            stream, analysis, runner=runner_factory(MENTIONS_ROLE),
-            source_kind=source_kind)
-    except EnrichmentModelError as exc:
-        raise EnrichmentError(f"mentions:{exc.stage}", str(exc)) from exc
-    payload = report.to_json()
+    batches = mention_batches(analysis["topics"])
+    if len(batches) > 1:
+        mentions, payload = _batched_mentions(path, stream, batches, runner_factory, source_kind)
+    else:
+        try:
+            mentions, report, _raw = run_mentions(
+                stream, analysis, runner=runner_factory(MENTIONS_ROLE),
+                source_kind=source_kind)
+        except EnrichmentModelError as exc:
+            raise EnrichmentError(f"mentions:{exc.stage}", str(exc)) from exc
+        payload = report.to_json()
     payload["durationSeconds"] = round(time.monotonic() - started, 1)
     _atomic_write(path, json.dumps(mentions, ensure_ascii=False, indent=1))
     return mentions, payload
+
+
+def _batched_mentions(path: Path, stream: ParagraphStream, batches: list[list],
+                      runner_factory, source_kind: str) -> tuple[dict, dict]:
+    """Pass 2 one batch of consecutive topics at a time (luna.mention_batches), each on only its topics'
+    paragraphs, through the same prompt and gate; joined in order under one report. Each batch is cached
+    by its paragraphs and topics (``mentions-batch-*.json``), so a retry reuses every finished batch.
+    Names are made canonical within a batch, as they are within a segment."""
+    topics, notes, parts, first = [], [], [], 0
+    for number, batch in enumerate(batches, 1):
+        name = f"batch {number}/{len(batches)} (topics {first + 1}-{first + len(batch)})"
+        first += len(batch)
+        part = substream(stream, Segment(name, batch[0]["startParagraphId"], batch[-1]["endParagraphId"]))
+        cache = path.with_name("mentions-batch-%s.json" % _sha256(
+            part.stream_sha256 + json.dumps(batch, sort_keys=True, ensure_ascii=False))[:12])
+        cached = _read_json(cache) if cache.exists() else None
+        if cached and isinstance(cached.get("topics"), list) and isinstance(cached.get("report"), dict):
+            mentions, report = {"topics": cached["topics"]}, {**cached["report"], "cached": True}
+        else:
+            started = time.monotonic()
+            try:
+                mentions, gate, _raw = run_mentions(part, {"topics": batch}, runner=runner_factory(MENTIONS_ROLE),
+                                                    source_kind=source_kind)
+            except EnrichmentModelError as exc:
+                raise EnrichmentError(f"mentions:{exc.stage}", f"{name}: {exc}") from exc
+            report = {**gate.to_json(), "durationSeconds": round(time.monotonic() - started, 1)}
+            _atomic_write(cache, json.dumps({**mentions, "report": report}, ensure_ascii=False, indent=1))
+        topics.extend(mentions["topics"])
+        notes.extend(f"{name}: {note}" for note in report.get("notes") or [])
+        parts.append({"batch": name, "topics": len(batch), "stats": report.get("stats") or {},
+                      "durationSeconds": report.get("durationSeconds"), "cached": bool(report.get("cached"))})
+    total = {key: sum(p["stats"].get(key) or 0 for p in parts)
+             for key in ("mentionsReturned", "mentionsKept", "mentionsDropped")}
+    total["keepRate"] = round(total["mentionsKept"] / total["mentionsReturned"], 3) \
+        if total["mentionsReturned"] else None
+    return {"topics": topics}, {"ok": True, "errors": [], "notes": notes, "stats": total, "batches": parts}
 
 
 def _segments(stream: ParagraphStream, script: PreparedScript, segmenter, context, topics) -> list[Segment]:

@@ -13,9 +13,12 @@ Telegram ingress, review replies and the Accept callback belong to
 2. `runtime_worker.py` registers as a worker, claims the job, prepares and
    chunks the audio (`audio.py`), transcribes each chunk through
    `transcribe-audio/transcribe.py` on Azure OpenAI (`transcribe_endpoint.py`),
-   and asks for a strict-JSON summary from the Codex responses endpoint with
-   the `openai-codex` OAuth login in `~/.pi/agent/auth.json` (`summarizer.py`;
-   `openai_auth.py` refreshes the token). No OpenAI API key is used.
+   and asks for a strict-JSON summary with one contained `pi -p` turn per chunk
+   (`summarizer.py`), on the `meetings` tier of the enrichment tier file
+   (`shared/pi_harness`; read at the start of the job, before any audio work).
+   There is no second client: a failed call or an unusable reply is a named job
+   error (`model_transient`, `model_schema_invalid`), never a note without a
+   summary.
 3. `result_consumer.py` stores the note in `tg_meeting_summary.*`, then queues
    the review message, the Markdown preview and, once the preview is sent, the
    Accept button. It consumes the result only after the review is visible;

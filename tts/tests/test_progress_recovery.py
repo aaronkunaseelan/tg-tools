@@ -29,7 +29,7 @@ def setup_execution(tmp_path, monkeypatch, decision):
     settings = SimpleNamespace(default_voice="nova", speech_provider="azure", azure_tts_model="model")
     return dict(settings=settings, input_json={"workloadType": "tts_synthesize"}, work=tmp_path,
                 source_key="source", attempt_id="attempt", source_fetcher=None, gemini_post=None,
-                openai_post=None, pi_runner_factory=None, rclone_runner=None, media_runner=None,
+                pi_runner_factory=None, rclone_runner=None, media_runner=None,
                 episode_post=None, episode_get=None, cancel_check=None)
 
 

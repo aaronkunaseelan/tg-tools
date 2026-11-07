@@ -2,7 +2,7 @@
 
 The publish job puts the mp3, ``script.md`` and ``segments.json`` in the feed and then submits this
 job, so nothing waits on notes. The job reads the stored script and segments (never the source again),
-runs the shared enrichment with the job's segmenter (one segment by default; ``SEGMENTERS``), uploads ``notes.md`` and
+runs the shared enrichment with the segmenter its caller passes (one segment by default), uploads ``notes.md`` and
 ``manifest.json`` once, and switches the episode over with one partial ``PUT``. When the episode
 is not on this version's script yet (a rebuild), the same PUT moves ``speech_text_url``; a version >= 2
 then deletes the older versions' documents (D1: uploads are immutable, nothing is overwritten).
@@ -27,7 +27,6 @@ from episode_enrichment import EnrichmentError, PreparedScript, enrich_script
 from episode_enrichment import timing as timing_mod
 from episode_enrichment.naming import document_version, names_from_prefix
 from episode_enrichment.page import PAGE_LAYOUT, render_page
-from surveillance_seams import SEGMENTERS as SURVEILLANCE_SEGMENTERS
 from pipeline import (PipelineError, PublishResult, _api_json, _get_episode_by_slug, _run, _upload_artifact,
                       notes_input,
                       build_public_manifest_url, build_public_notes_url, build_public_script_url,
@@ -38,15 +37,6 @@ logger = logging.getLogger(__name__)
 INPUT_KIND = "notes"
 PAGE_KIND = "page"   # the page alone, from stored notes and script: no model call
 PAGE_PRIORITY = 10
-# Show-specific segmenters, by the name a job carries; each comes from its show's own module.
-SEGMENTERS: dict[str, Callable] = {**SURVEILLANCE_SEGMENTERS}
-
-
-def check_segmenter(name: str | None) -> None:
-    """An unknown segmenter name is the input's error, before any read or paid step."""
-    if name and name not in SEGMENTERS:
-        raise PipelineError("input", f"unknown segmenter {name!r} (known: {', '.join(sorted(SEGMENTERS)) or 'none'})",
-                            retryable=False)
 
 
 @dataclass(frozen=True)
@@ -229,11 +219,10 @@ def _switch(settings: Settings, feed: str, names, episode: Mapping[str, Any], ur
 
 
 def run_notes(settings: Settings, notes: Mapping[str, Any], work_dir: Path, tier: str | None,
-              *, runner_factory=None) -> PublishResult:
-    """Write the notes of one published episode and switch the episode to them."""
+              *, segmenter: Callable | None = None, runner_factory=None) -> PublishResult:
+    """Write the notes of one published episode, split by ``segmenter`` (one segment when None), and switch
+    the episode to them."""
     feed, slug, version = notes["feed"], notes["slug"], int(notes.get("version") or 1)
-    name = notes.get("segmenter")
-    check_segmenter(name)
     episode = _get_episode_by_slug(settings, slug, feed)
     if episode is None:
         raise PipelineError("notes", f"no episode {slug} in feed {feed}", retryable=False)
@@ -257,7 +246,7 @@ def run_notes(settings: Settings, notes: Mapping[str, Any], work_dir: Path, tier
             slug=slug, published=notes.get("publishedAt"), date_basis=str(notes.get("dateBasis") or "unknown"),
             duration_seconds=notes.get("durationSeconds"), mp3_url=mp3_url, notes_url=urls["notes"],
             script_url=urls["script"], source_url=notes.get("originalUrl"), tier=tier,
-            segments_url=urls["segments"], segmenter=SEGMENTERS.get(name) if name else None,
+            segments_url=urls["segments"], segmenter=segmenter,
             segment_context=context, runner_factory=runner_factory)
     except EnrichmentError as exc:
         if getattr(exc, "error_class", None) == "enrichment_config":

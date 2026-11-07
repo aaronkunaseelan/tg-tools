@@ -22,13 +22,13 @@ from tts_common.materialise import materialise
 from tts_common.speech_text import artifact_to_speech_text
 from tts_common import typed_fetch
 
-from pi_harness import EnrichmentConfigError, enrichment_tier
+from pi_harness import EnrichmentConfigError, PiRunner, enrichment_tier
 from .acquire import AcquireError, acquire_source
 from episode_enrichment import (EpisodeNamingMetadata, PlainScriptSource,
                                 ScriptSource, build_episode_names, enrich,
                                 names_from_prefix)
 
-from .episode_title import heuristic_title, resolve_title
+from .episode_title import TITLE_ROLE, TitleError, resolve_title
 from tts_reader.adapter import compile_explained_artifact_pi
 from tts_reader.errors import ExplainError
 from .config import Settings, load_settings
@@ -77,10 +77,6 @@ class TTSJobError(RuntimeError):
         self.recovery_available = recovery_available
 
 
-def _safe_title(source_md: Path, meta: dict[str, Any]) -> str:
-    return heuristic_title(source_md, meta)
-
-
 def _metadata_creators(meta: dict[str, Any]) -> tuple[str, ...]:
     raw = meta.get("authors") or meta.get("creators") or meta.get("author") or ()
     if isinstance(raw, str):
@@ -102,7 +98,6 @@ def execute_job(
     attempt_id: str,
     source_fetcher: Any | None = None,
     gemini_post: Any | None = None,
-    openai_post: Any | None = None,
     pi_runner_factory: Any | None = None,
     rclone_runner: Any | None = None,
     media_runner: Any | None = None,
@@ -121,7 +116,6 @@ def execute_job(
                 attempt_id=attempt_id,
                 source_fetcher=source_fetcher,
                 gemini_post=gemini_post,
-                openai_post=openai_post,
                 pi_runner_factory=pi_runner_factory,
                 rclone_runner=rclone_runner,
                 media_runner=media_runner,
@@ -142,7 +136,6 @@ def _execute_job_in_root(
     attempt_id: str,
     source_fetcher: Any | None,
     gemini_post: Any | None,
-    openai_post: Any | None,
     pi_runner_factory: Any | None,
     rclone_runner: Any | None,
     media_runner: Any | None,
@@ -165,10 +158,12 @@ def _execute_job_in_root(
             validate_voice(engine, voice)
         except ValueError as exc:
             raise TTSJobError("admission", "voice_invalid", str(exc)) from exc
-        # The notes model comes from the enrichment tier file, read once for this job and checked
-        # here, before any download or paid call. A problem is terminal, never a quiet fallback.
+        # The notes and title models come from the enrichment tier file, read once for this job and
+        # checked here, before any download or paid call. A problem is terminal, never a quiet
+        # fallback. An x-tts explain job names no faithful-read title, so it reads no titles tier.
         try:
             notes_tier = enrichment_tier("speech")
+            titles_tier = None if x_mode else enrichment_tier("titles")
         except EnrichmentConfigError as exc:
             raise TTSJobError("admission", "enrichment_config", str(exc)) from exc
         _cancel()
@@ -345,9 +340,8 @@ def _execute_job_in_root(
                 title = resolve_title(
                     source_md,
                     meta,
-                    settings=settings,
                     title_hint=input_json.get("titleHint"),
-                    http_post=openai_post,
+                    runner=PiRunner(TITLE_ROLE, cwd=str(work), tier=titles_tier),
                 )
                 cleaned = clean_faithful_markdown(
                     source_md.read_text(encoding="utf-8"), episode_title=title
@@ -403,6 +397,8 @@ def _execute_job_in_root(
                 names = names_from_prefix(pinned_prefix)
         except ExplainError as exc:
             raise TTSJobError("model", exc.error_class, str(exc)) from exc
+        except TitleError as exc:
+            raise TTSJobError("compile", exc.error_class, str(exc)) from exc
         except TTSJobError:
             raise
         except LeaseLost:

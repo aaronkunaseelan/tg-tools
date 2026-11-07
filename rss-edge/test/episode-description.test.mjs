@@ -75,14 +75,23 @@ test('non-generated publisher HTML is preserved, not summarized or reinterpreted
   assert.doesNotMatch(result.html, /Machine-generated/);
 });
 
+test("the excerpt is one sentence: the publisher's field, else the first sentence of the text, at most 300 characters", () => {
+  assert.equal(episodeDescription({ ...episode, excerpt: 'Set by the publisher.' }).excerpt, 'Set by the publisher.');
+  assert.equal(episodeDescription({ ...episode, excerpt: '', description: 'Dr. Howell compares 5.1 with 6.2. A second sentence.' }).excerpt,
+    'Dr. Howell compares 5.1 with 6.2.');
+  const long = episodeDescription({ ...episode, excerpt: '', description: `<p>${'word '.repeat(100)}end.</p>` }).excerpt;
+  assert.ok(long.length <= 300 && long.endsWith('word'), long.slice(-20));
+  assert.equal(episodeDescription({ description: '', excerpt: '' }).excerpt, '');
+});
+
 test('RSS fields render top links with stable GUID/enclosure and explicit plain fallback', async () => {
   const feed = { id: 'audio', site_url: base, logo_path: 'logo.png', categories: '[]', author: 'Author', email: 'a@example.com', title: 'Title', description: 'Feed', language: 'en', copyright: 'Copyright', explicit: 'no', updated_at: '1' };
   const DB = { prepare: (sql) => ({ bind: () => ({ first: async () => sql.includes('MAX(') ? { count: 1, latest_updated: '1' } : feed, all: async () => ({ results: [episode] }), run: async () => ({}) }) }) };
   const response = await worker.fetch(new Request(`${EPISODES}/podcast.xml`), { DB, FEED_KEYS });
   const xml = await response.text();
-  assert.match(xml, /<description><!\[CDATA\[<p><a href=/);
+  assert.match(xml, /<description>Short excerpt<\/description>/);
   assert.match(xml, /<content:encoded><!\[CDATA\[<p><a href=/);
-  assert.match(xml, /<itunes:summary><!\[CDATA\[Notes: https:/);
+  assert.match(xml, /<itunes:summary>Short excerpt<\/itunes:summary>/);
   assert.match(xml, /<guid isPermaLink="false">test\.md<\/guid>/);
   assert.ok(xml.includes(`<enclosure url="${EPISODES}/test.mp3" length="42"`));
   assert.doesNotMatch(xml, /stations\.work\/audio\//);

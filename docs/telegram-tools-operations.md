@@ -72,10 +72,13 @@ workers restart on the new code; otherwise every rss-audio and TTS job fails ter
 
 1. `~/.config/tg-tools/enrichment.json` is installed (`config/enrichment.json.example`). The workers
    read it per job and there is no fallback tier; check with `ls ~/.config/tg-tools/enrichment.json`.
-2. No live `TTS_PI_ROLES_FILE` sets `tier`, `provider` or `model` on `transcript_topics` or
-   `transcript_mentions`, and none redefines the tier the enrichment file chooses in its `models`
+2. No live `TTS_PI_ROLES_FILE` sets `tier`, `provider` or `model` on any enrichment role
+   (`transcript_topics`, `transcript_mentions`, `meeting_summary`, `episode_title`), and none
+   redefines the tier the enrichment file chooses in its `models`
    object. Remove them from the roles files (if a file name is a content hash, repoint the
-   `TTS_PI_ROLES_FILE` line in the env file). No tier may resolve to `openai-codex`.
+   `TTS_PI_ROLES_FILE` line in the env file). No tier may resolve to `openai-codex`. A tier that
+   owns its effort (`deepseek`: `xhigh`) also refuses a `thinking` on those roles, so clear that too
+   before pointing a pipeline at it.
 3. A `.timer` is copied by hand (`cp systemd/rss-audio-schedule.timer ~/.config/systemd/user/`, then
    `daemon-reload`): the `cp systemd/*.service` line above does not copy it, and neither the release
    script nor a restart enables it. Enable it as its own, deliberate step, after one real window has
@@ -279,8 +282,9 @@ the fail log.
 - `tg-gateway-ms` accepts meeting audio, handles review replies and the Accept
   callback. Commands: `/status`, `/queue`.
 - `meeting-summary-runtime-worker` runs `meeting_summary` jobs: transcription
-  through `transcribe-audio/transcribe.py` (Azure OpenAI), summary through the
-  `openai-codex` OAuth login in `~/.pi/agent/auth.json` (never an API key).
+  through `transcribe-audio/transcribe.py` (Azure OpenAI), summaries through one
+  contained `pi -p` turn per chunk on the `meetings` tier of
+  `~/.config/tg-tools/enrichment.json` (never a second client, never a fallback).
 - `meeting-summary-result-consumer` stores the note in `tg_meeting_summary.*`
   (`MEETING_SUMMARY_DATABASE_URL`, your configured database), then queues
   the review message, the Markdown preview and the Accept button edit.
@@ -328,10 +332,15 @@ speech spend, and the user is asked to upload the file.
   whole-script review, at most one revision. Role models come from
   `shared/pi_harness/roles.py`, overridden by the JSON profile in
   `TTS_PI_ROLES_FILE`; a role resolves to `claude -p` (subscription login, API
-  keys stripped) or `pi -p` (Codex OAuth). Startup checks every provider's auth.
+  keys stripped) or `pi -p` (the provider's own auth store, e.g. opencode-go-min
+  for the `deepseek` enrichment tier). Startup checks the claude and Codex auth;
+  a `pi -p` provider's key is proven by the first call that uses it.
   The notes model (transcript topics and mentions) is the `speech` tier of
   `~/.config/tg-tools/enrichment.json`, read per job; a missing entry fails the job
-  (`enrichment_config`) and startup logs it as a warning.
+  (`enrichment_config`) and startup logs it as a warning. A faithful read's episode title
+  is one `pi`/`claude` harness turn on the `titles` tier, read at admission; a failed or
+  unusable reply fails the job (`model_transient`, `model_schema_invalid`), it never falls
+  back to a source heading.
 - **Projector**: `tts-result-projector` is the only consumer of `tts`/`x-tts`
   results: it appends one stable-key delivery, then consumes the result.
 - **Work state**: `TTS_WORK_DIR` holds per-source retry state

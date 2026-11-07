@@ -15,7 +15,7 @@ import pytest
 from config import Settings, load_settings, validate_settings
 
 BASE = dict(
-    pi_auth_path=Path("/tmp/auth.json"), summary_model="gpt-5.4-mini", transcribe_model="gpt-4o-mini-transcribe",
+    transcribe_model="gpt-4o-mini-transcribe",
     transcribe_jobs=3, max_audio_duration_sec=7200, chunk_seconds=600, summary_timeout_sec=180,
     state_dir=Path("/tmp/state"), spool_dir=Path("/tmp/spool"), database_url="postgresql://example",
     retention_days=7, ffmpeg_bin="ffmpeg", ffprobe_bin="ffprobe", runtime_controller_url="http://127.0.0.1:8787",

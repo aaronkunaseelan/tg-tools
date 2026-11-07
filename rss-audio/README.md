@@ -1,44 +1,49 @@
 # rss-audio
 
-The `audio` podcast feed on the configured rss-edge host (`RSS_AUDIO_BASE_URL`), plus the scribe
+The `audio` and `surveillance` podcast feeds on the configured rss-edge host (`RSS_AUDIO_BASE_URL`), plus the scribe
 (transcription) topic. Telegram ingress and delivery belong to
 `tg-gateway-rss` through `rss_gateway_adapter.py`; the workers here execute
 the jobs. Configuration: `config/rss-audio.env.example`. Operations:
 `docs/telegram-tools-operations.md`.
 
-## Publish (`rss_publish`, `runtime_worker.py`)
+## Two pipelines (`rss_publish`)
 
-1. Source audio: direct audio URLs and Telegram files are fetched directly;
-   extractor URLs try OCI through the Mullvad proxy (rotating the exit on
-   IP-shaped failures, `exit_rotation.py`), then the Mac over SSH with browser
-   cookies. Route failures are classified retryable or terminal.
-2. Produce and validate an MP3.
-3. Speech-to-text: reuse a script checkpoint or transcribe once
-   (`shared/episode_enrichment`), giving the script and, with timings, its
-   segments. If it fails the audio still publishes alone; a configuration
-   error fails the job.
-4. Upload the mp3, script and segments to `<RSS_AUDIO_B2_REMOTE>:<RSS_AUDIO_B2_BUCKET>/audio/episodes/`
-   (immutable), then install the episode through the Worker API with the
-   script link and no notes.
-5. Queue one Telegram confirmation through the outbox (audio and script links);
-   `result_projector.py` recovers a missed one from the durable result without
-   republishing.
-6. Submit the notes job (`notes_job.py`, `inputKind: "notes"`, keyed on slug and
-   version). Besides notes and manifest it writes `<prefix>[.v<n>].page.html`
-   (`episode_enrichment/page.py`): the notes, then the script with linked paragraph
-   ids and times, deterministic, no JavaScript. The page is an add-on: it is derived and uploaded allowing overwrite, and a page that
-   fails is logged and left out of the PUT, so it never blocks the notes. When it
-   succeeds, the switch PUT carries `page_url`. An
-   episode that already has notes gets its page from a `page` job
-   (`notes_job.run_page`), with no model call. It reads the stored script and segments, never the source, writes
-   notes and manifest once, and switches the live episode with one partial PUT
-   (`md_url`, `manifest_url`, `description`). It sends nothing. The model is the
-   tier of the feed's pipeline (`episodes` for `audio`, `surveillance` for
-   `surveillance`) in `~/.config/tg-tools/enrichment.json`, read at the start of
-   every job; a missing or wrong entry fails the job (`enrichment_config`)
-   before any paid step. A failed notes job leaves the episode live with its
-   script. Notes jobs claim just below their publish job (`notes_job.notes_priority`:
-   parent minus 5), so queued notes never hold a publish beyond the one in flight.
+The worker (`runtime_worker.execute_runtime_job`) runs a publish job on its feed's pipeline
+(`pipeline.PIPELINES`). Each pipeline is one short `run` that reads as its steps, and one chain test
+drives it end to end on the private stack:
+
+| pipeline | feed | steps | chain test |
+|---|---|---|---|
+| episodes: a Telegram file or link | `audio` | `episodes.py: run` | `tests/test_chain_rss_publish.py` |
+| Surveillance: a scheduled show | `surveillance` | `surveillance.py: run` | `tests/test_chain_surveillance.py` |
+
+A publish job ends with the episode live (mp3, script and segments) and submits the episode's notes
+job (`notes_job.py`), which writes the notes and the page. The notes, page and rebuild jobs are later
+steps both pipelines share, as are the steps in `pipeline.py`. What the steps hold to:
+
+- Source audio: direct audio URLs and Telegram files are fetched directly; extractor URLs try OCI
+  through the Mullvad proxy (rotating the exit on IP-shaped failures, `exit_rotation.py`), then the
+  Mac over SSH with browser cookies. Route failures are classified retryable or terminal.
+- Speech-to-text reuses a script checkpoint or transcribes once (`shared/episode_enrichment`). If it
+  fails the audio still publishes alone; a configuration error fails the job.
+- Uploads to `<RSS_AUDIO_B2_REMOTE>:<RSS_AUDIO_B2_BUCKET>/<feed>/episodes/` are immutable. The episode
+  is installed through the Worker API with the script link and no notes.
+- A Telegram publish queues one confirmation through the outbox (audio and script links);
+  `result_projector.py` recovers a missed one from the durable result without republishing.
+- The notes job (`inputKind: "notes"`, keyed on slug and version) reads the stored script and segments,
+  never the source, writes notes and manifest once, and switches the live episode with one partial
+  PUT (`md_url`, `manifest_url`, `description`). It sends nothing. A failed notes job leaves the
+  episode live with its script. Notes jobs claim just below their publish job
+  (`notes_job.notes_priority`: parent minus 5), so queued notes never hold a publish beyond the one
+  in flight.
+- The notes model is the tier of the feed's pipeline in `~/.config/tg-tools/enrichment.json`, read at
+  the start of every job; a missing or wrong entry fails the job (`enrichment_config`) before any paid
+  step.
+- The page (`<prefix>[.v<n>].page.html`, `episode_enrichment/page.py`: the notes, then the script with
+  linked paragraph ids and times, deterministic, no JavaScript) is an add-on: derived and uploaded
+  allowing overwrite, and a page that fails is logged and left out of the PUT, so it never blocks the
+  notes. When it succeeds, the switch PUT carries `page_url`. An episode that already has notes gets
+  its page from a `page` job (`notes_job.run_page`), with no model call.
 
 Every episode has one metadata-led prefix (proper nouns from creators, title,
 series and channel, plus a stable identity suffix; `undated` when no date is
@@ -108,7 +113,13 @@ and the API body, the exact-slug lookup and message links follow. Other optional
 `publishedAt` (ISO UTC; the episode's `pub_date`, its date in the slug, notes and manifest, with
 `dateBasis` `scheduled_source`), `title` (the whole episode title, so channel, creators and series
 no longer prefix it), `delivery: "none"` (no Telegram confirmation: the worker logs INFO and the
-result projector consumes the result), and `liveWindow`:
+result projector consumes the result), and the Surveillance pipeline's `liveWindow` (below).
+
+## Surveillance
+
+A Surveillance publish carries one of: `liveWindow` (the radio show, a window of the live stream),
+`sourceUrl` (the TV show, the playlist's video) or `localSourcePath` (a radio window captured earlier,
+from the backfill). The `liveWindow` input:
 
 ```json
 {"videoId": "f39oHo6vFLg", "start": "2026-11-03T12:00:00Z", "seconds": 10800, "expectOpening": "Bloomberg Surveillance"}
@@ -127,13 +138,13 @@ route belongs to the proxy exit: a dead job is never resubmitted (its idempotenc
 no one is waiting. The stream lookup of a `liveWindow` rotates the Mullvad exit on such a refusal,
 as a URL job does. Telegram jobs still fail at once on a sign-in wall.
 
-## Scheduled sources
+### Scheduled sources
 
 `scheduled_sources.py` (unit `rss-audio-schedule.timer`, 01:30 UTC) reads
 `config/scheduled-sources.json` (in git, no secrets). Each source lists what is due now:
 `youtube_playlist` (Atom feed entries whose title matches `titleRegex`, within `lookbackDays` and
 since `since`) or `youtube_live_window` (weekday windows in a time zone, due once the window ended
-`settleMinutes` ago). Each item is submitted like a Telegram message (source receipt with
+`settleMinutes` ago: `surveillance.window_days`). Each item is submitted like a Telegram message (source receipt with
 `source_system="schedule"`, job, link) with idempotency key `<source id>:<video id | air date>`,
 `delivery: "none"`, priority 20 (Telegram jobs are 60) and three attempts, then its job is read and
 one line printed: `published`, `queued`, `running`, `skipped (window_not_show: <what was heard>)` or
@@ -146,7 +157,8 @@ nonzero exit fires `lane-alert@` (installed by the reading lane; see the operati
 nothing.
 
 A source's optional `segmenter` names how its episodes' notes split into sections
-(`notes_job.SEGMENTERS`; an unknown name fails the inventory). The Surveillance sources use
+(`surveillance_seams.SEGMENTERS`, by `surveillance.named_segmenter`; an unknown name fails the inventory,
+and a notes or rebuild job before any read). The Surveillance sources use
 `surveillance-tv` and `surveillance-radio` (`surveillance_seams.py`). These split the 3-hour show
 at its own hour opens, following the accepted seam study, into `## Hour n` sections. Each
 section records the rule that began it: `seam`, `fallback` or `estimated`. A window source's
@@ -157,6 +169,8 @@ on New York's wall clock.
 (queued, window/download, opening, STT, upload, feed, then the notes job) and, on Enter, the files at each stage: work dir, B2
 objects, feed row, job, STT engine and the opening check. It is read only and uses the settings of the running
 `rss-audio-runtime-worker`; a source it cannot read shows `unknown: <reason>`. The episode API and B2 are read at most once a minute (`r` reads them at once); the list shows `feed read <age> ago`. `--once` prints the list and one item.
+
+## Jobs
 
 `bin/rss-audio-jobs` (`jobs_view.py`) lists the rss-audio jobs on the runtime controller (newest first, `--status`, `--limit`), their counts by kind and status, and the rss-audio workers; `--job ID` shows one job, `--json` the same as one object. Read only (GET requests); an API failure prints `unknown: <reason>` and exits 1; no URL or 28+ character token is printed.
 

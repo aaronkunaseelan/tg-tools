@@ -1132,6 +1132,35 @@ function publicizeAll(xml, keys) {
   return xml.replace(new RegExp(STORED_HOST.source + "[^\\s\"'<]*", "g"), (url) => publicize(url, keys));
 }
 __name(publicizeAll, "publicizeAll");
+// The Podcast Namespace's <podcast:chapters>: the condensed edition's chapters.json sits beside its page.html (the
+// six artefacts are named <slug>-condensed.<ext>); a full show's page has no chapters file, and its page name says
+// which edition it is. Returns null when the item has no condensed page.
+function chaptersUrl(pageUrl) {
+  const match = /^(.*-condensed[^/]*?)\.page\.html$/.exec(pageUrl || "");
+  return match ? `${match[1]}.chapters.json` : null;
+}
+__name(chaptersUrl, "chaptersUrl");
+// The iTunes vocabulary: explicit is true|false (the stored field is yes|no) and an empty season, episode or
+// episodeType element is invalid, so those three are emitted only when they have a value. The feed validator treats
+// every one of them as an error otherwise.
+function itunesExplicit(value) {
+  return ["yes", "true"].includes(String(value || "").toLowerCase()) ? "true" : "false";
+}
+__name(itunesExplicit, "itunesExplicit");
+function itemNumbers(episode) {
+  return [["itunes:season", episode.season], ["itunes:episode", episode.episode_num], ["itunes:episodeType", episode.episode_type]]
+    .filter(([, value]) => value !== undefined && value !== null && value !== "")
+    .map(([name, value]) => `            <${name}>${xmlEscape(value)}</${name}>\n`).join("");
+}
+__name(itemNumbers, "itemNumbers");
+// itunes:subtitle is limited to 255 characters.
+function clip(value, limit) {
+  const text = String(value ?? "");
+  if (text.length <= limit) return text;
+  const cut = text.slice(0, limit);
+  return (cut.lastIndexOf(" ") > 0 ? cut.slice(0, cut.lastIndexOf(" ")) : cut).trimEnd();
+}
+__name(clip, "clip");
 // The one item renderer. "" for an episode the feed does not publish: an enclosure outside the sole delivery
 // hostname (the external pscrb.fm episode remains in D1 until its media can be licensed/imported).
 function renderItem(ctx, episode) {
@@ -1140,30 +1169,33 @@ function renderItem(ctx, episode) {
   catch { return ""; }
   const keywords = episodeKeywords(episode);
   const presentation = episodeDescription(episode, publicUrl);
-  const summary = presentation.plain;
+  // The full text (notes, or the publisher's HTML) is emitted once, in content:encoded, the field podcast apps
+  // render in full; description and the legacy itunes:summary carry the one-sentence excerpt.
+  const summary = presentation.excerpt;
   const content = presentation.html;
   // The episode's reader page (X-76: Surveillance notes + script) when it has one, else its notes, else the audio.
   const link = publicUrl(episode.page_url || episode.md_url || episode.mp3_url);
+  const chapters = chaptersUrl(publicUrl(episode.page_url));
+  const chaptersXml = chapters
+    ? `            <podcast:chapters url="${xmlEscape(chapters)}" type="application/json+chapters"/>\n`
+    : "";
   return publicizeAll(`        <item>
             <title>${xmlEscape(episode.title)}</title>
             <itunes:title>${xmlEscape(episode.title)}</itunes:title>
-            <description>${cdata(content)}</description>
+            <description>${xmlEscape(summary)}</description>
             <content:encoded>${cdata(content)}</content:encoded>
             <link>${xmlEscape(link)}</link>
             <pubDate>${toRfc822(episode.pub_date)}</pubDate>
             <guid isPermaLink="false">${xmlEscape(`${episode.slug}.md`)}</guid>
             <enclosure url="${xmlEscape(publicUrl(episode.mp3_url))}" length="${episode.mp3_size}" type="audio/mpeg"/>
             <itunes:author>${xmlEscape(feed.author)}</itunes:author>
-            <itunes:summary>${cdata(summary)}</itunes:summary>
-            <itunes:subtitle>${cdata(episode.excerpt)}</itunes:subtitle>
+            <itunes:summary>${xmlEscape(summary)}</itunes:summary>
+            <itunes:subtitle>${xmlEscape(clip(episode.excerpt, 255))}</itunes:subtitle>
             <itunes:keywords>${xmlEscape(keywords)}</itunes:keywords>
-            <itunes:season>${xmlEscape(episode.season ?? "")}</itunes:season>
-            <itunes:episode>${xmlEscape(episode.episode_num ?? "")}</itunes:episode>
-            <itunes:episodeType>${xmlEscape(episode.episode_type ?? "")}</itunes:episodeType>
-            <itunes:image href="${xmlEscape(logoUrl)}" />
-            <itunes:explicit>${xmlEscape(episode.explicit)}</itunes:explicit>
+${itemNumbers(episode)}            <itunes:image href="${xmlEscape(logoUrl)}" />
+            <itunes:explicit>${itunesExplicit(episode.explicit)}</itunes:explicit>
             <itunes:block>${xmlEscape(episode.block)}</itunes:block>
-        </item>`, keys);
+${chaptersXml}        </item>`, keys);
 }
 __name(renderItem, "renderItem");
 // The channel around already-rendered items (newest first).
@@ -1177,6 +1209,7 @@ function feedXml(ctx, items) {
     xmlns:content="http://purl.org/rss/1.0/modules/content/"
     xmlns:atom="http://www.w3.org/2005/Atom"
     xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd"
+    xmlns:podcast="https://podcastindex.org/namespace/1.0"
     xml:lang="${xmlEscape(feed.language)}">
     <channel>
         <atom:link href="${xmlEscape(selfUrl)}" rel="self" type="application/rss+xml" />
@@ -1206,7 +1239,7 @@ function feedXml(ctx, items) {
         <itunes:image href="${xmlEscape(logoUrl)}" />
 ${categories}
         <itunes:type>episodic</itunes:type>
-        <itunes:explicit>${xmlEscape(feed.explicit)}</itunes:explicit>
+        <itunes:explicit>${itunesExplicit(feed.explicit)}</itunes:explicit>
 `, keys) + `${items.filter(Boolean).join("\n")}
     </channel>
 </rss>
@@ -1228,7 +1261,7 @@ __name(generateXml, "generateXml");
 // joins the stored items under a fresh channel header. A fragment from another presentation version or context, or
 // older than its episode's updated_at (an edit outside the API), is rendered again at the rebuild and stored, so the
 // result always equals generateXml over the same rows. Every non-blocked episode is listed (owner, X-71 amendment).
-var FEED_PRESENTATION = "listener-description-v6-all-items";
+var FEED_PRESENTATION = "listener-description-v7-content-once-chapters";
 var FEED_STORE_MAX_AGE_S = 86400;
 function toBase64(bytes) {
   if (bytes.toBase64) return bytes.toBase64();

@@ -179,7 +179,6 @@ def test_effective_config_uses_actual_worker_ids_and_pid_defaults():
     # Product config loaders are the authority, not duplicated telemetry defaults.
     tts = {'TTS_AZURE_TTS_BASE_URL': 'https://example.com', 'TTS_AZURE_TTS_KEY_CMD': 'false',
            'TTS_B2_BUCKET': 'test', 'TTS_FEED_URL': 'https://example.com', 'TTS_FEED_TITLE': 'test',
-           'TTS_AZURE_CHAT_BASE_URL': 'https://example.com', 'TTS_AZURE_CHAT_KEY_CMD': 'false',
            'TTS_WORKER_ID': 'custom-tts', 'TTS_WORKER_LEASE_SECONDS': '8000'}
     rss = {'RSS_AUDIO_BASE_URL': 'https://example.com', 'RSS_AUDIO_B2_BUCKET': 'test'}
     def env(unit):

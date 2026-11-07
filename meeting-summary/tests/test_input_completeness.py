@@ -1,5 +1,4 @@
 """Meeting processing requires complete audio, text and provider completion."""
-import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,28 +9,17 @@ import summarizer
 import pytest
 
 
-@pytest.mark.parametrize("terminal", [
-    b'', b'data: [DONE]\\n',
-    b'data: {"type":"response.incomplete"}\\n',
-    b'data: {"type":"error"}\\n',
-])
-def test_provider_completion_is_required(terminal):
-    stream = io.BytesIO(b'data: {"type":"response.output_text.delta","delta":"{}"}\\n' + terminal)
-    with pytest.raises(summarizer.SummaryError):
-        summarizer.read_sse_output_text(stream)
-
-
 def test_long_transcript_is_split_without_losing_text(monkeypatch):
     text = 'a' * 16000 + 'b' * 16000 + 'FINAL DECISION'
     prompts = []
-    monkeypatch.setattr(summarizer, 'load_openai_codex_auth', lambda path: object())
-    def call(auth, **kwargs):
-        prompts.append(kwargs['prompt'])
+
+    def call(runner, prompt, **kwargs):
+        prompts.append(prompt)
         return {}
-    monkeypatch.setattr(summarizer, 'call_codex_json', call)
+
+    monkeypatch.setattr(summarizer, 'call_summary_json', call)
     summaries, final = summarizer.summarize_transcript_chunks(
-        settings=NS(pi_auth_path=None, summary_model='synthetic', summary_timeout_sec=1),
-        chunk_texts=[text])
+        settings=NS(summary_timeout_sec=1), chunk_texts=[text], runner=object())
     assert len(summaries) == 3
     for index in range(3):
         assert text[index * 16000:(index + 1) * 16000] in prompts[index]
@@ -59,11 +47,3 @@ class MeetingCompleteness(unittest.TestCase):
         prompt = summarizer.build_chunk_summary_prompt(0, 1, text)
         self.assertTrue(sentinel in prompt,
                         'summary discards source after character 15997')
-
-    def test_failed_response_stream_must_not_be_success(self):
-        stream = io.BytesIO(b'data: {"type":"response.output_text.delta","delta":"{}"}\n'
-                            b'data: {"type":"response.failed","response":{"status":"failed"}}\n')
-        with self.assertRaises(summarizer.SummaryError):
-            summarizer.read_sse_output_text(stream)
-
-

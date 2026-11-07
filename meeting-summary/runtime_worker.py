@@ -10,7 +10,9 @@ from dataclasses import dataclass
 from typing import Any
 
 from config import ensure_directories, load_settings, validate_settings
-from pipeline import ASRError, AudioError, LocalSourceMissingError, PipelineError, execute_pipeline
+from pi_harness import EnrichmentConfigError
+from pipeline import (ASRError, AudioError, LocalSourceMissingError, PipelineError, SummaryError,
+                      execute_pipeline)
 from runtime_client import RuntimeClient, RuntimeClientError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -56,6 +58,14 @@ def classify_worker_error(exc: Exception) -> tuple[str, str, str]:
         return ("terminal_error", "invalid_audio", text)
     if isinstance(exc, ASRError):
         return ("retryable_error", "asr_transient", text)
+    if isinstance(exc, EnrichmentConfigError):
+        # The enrichment tier file (or a roles file) is missing or wrong: nothing a retry fixes.
+        return ("terminal_error", exc.error_class, text)
+    if isinstance(exc, SummaryError):
+        # The model call or its reply failed: a named class the runtime retries, bounded by attempts;
+        # an empty transcript is the input's fault and fails at once.
+        return ("terminal_error" if exc.error_class == "input_empty" else "retryable_error",
+                exc.error_class, text)
     if isinstance(exc, PipelineError):
         return ("terminal_error", "missing_input", text)
     if isinstance(exc, RuntimeClientError):

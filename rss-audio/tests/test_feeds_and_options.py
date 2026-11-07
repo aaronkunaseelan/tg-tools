@@ -121,7 +121,7 @@ def test_title_and_date_options_reach_the_episode_record(settings):
 def test_bad_options_are_terminal_input_errors(bad):
     with pytest.raises(PipelineError) as err:
         job_options(bad)
-    assert err.value.stage == "input" and runtime_worker._is_retryable_pipeline_error(err.value) is False
+    assert err.value.stage == "input" and pipeline.is_retryable(err.value) is False
 
 
 def test_unknown_feed_fails_the_job_before_any_work(settings):

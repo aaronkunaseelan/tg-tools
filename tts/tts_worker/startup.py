@@ -56,10 +56,7 @@ def validate_startup(settings) -> tuple[list[str], list[str]]:
         fatal.append("TTS_SPEECH_PROVIDER=self-hosted requires TTS_SELF_HOSTED_SPEECH_URL and TTS_SELF_HOSTED_SPEECH_TOKEN")
     if settings.speech_provider in ("azure", "self-hosted"):
         # Azure speaks, or is the self-hosted fallback. Check configuration only; do not spend quota or expose keys at startup.
-        credentials = [("TTS_AZURE_TTS", settings.azure_tts_api_key, settings.azure_tts_key_cmd)]
-        if settings.title_model:
-            credentials.append(("TTS_AZURE_CHAT", settings.azure_chat_api_key, settings.azure_chat_key_cmd))
-        for label, key, command in credentials:
+        for label, key, command in [("TTS_AZURE_TTS", settings.azure_tts_api_key, settings.azure_tts_key_cmd)]:
             if key.strip():
                 continue
             try:
@@ -68,17 +65,25 @@ def validate_startup(settings) -> tuple[list[str], list[str]]:
                 argv = []
             if not argv or not shutil.which(argv[0]):
                 fatal.append(f"{label} requires a key or an executable key command")
+    # A faithful read names its episode on the tier the enrichment tier file gives `titles`. The file
+    # is read per job, so a missing entry can be fixed without a restart; until then every faithful
+    # read fails with errorClass enrichment_config (admission, before any paid call).
+    try:
+        from pi_harness import enrichment_tier
+        enrichment_tier("titles")
+    except Exception as exc:
+        warnings.append("faithful-read episode titles are not configured, jobs will fail: " + str(exc))
     if "x_tts_explain" in settings.workload_types:
         try:
             from pi_harness.preflight import assert_provider_auth
-            from pi_harness.roles import TRANSCRIPT_ROLES, EnrichmentConfigError, enrichment_tier, resolve_role
+            from pi_harness.roles import ENRICHMENT_ROLES, EnrichmentConfigError, enrichment_tier, resolve_role
             from .fingerprint import reader_role_map
 
             role_map = reader_role_map()
             providers = [cfg["provider"] for name, cfg in role_map.items() if name != "_hash"]
             try:
                 notes_tier = enrichment_tier("speech")
-                providers += [resolve_role(r, tier=notes_tier)["provider"] for r in TRANSCRIPT_ROLES]
+                providers += [resolve_role(r, tier=notes_tier)["provider"] for r in ENRICHMENT_ROLES]
             except EnrichmentConfigError as exc:
                 # The file is read per job, so it can be fixed without a restart; until then every job
                 # fails with errorClass enrichment_config.

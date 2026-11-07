@@ -68,8 +68,6 @@ def _tts_settings(stack, monkeypatch, speech_env=None):
         "TTS_PUBLIC_BASE_URL": stack.edge.url + "/pub", "TTS_API_BASE_URL": stack.edge.url, "TTS_API_TOKEN": "chain",
         "TTS_FEED_URL": stack.edge.url + "/tts/podcast.xml", "TTS_FEED_TITLE": "Example TTS",
         "TTS_AZURE_TTS_KEY_CMD": "printf chain",
-        "TTS_AZURE_CHAT_BASE_URL": stack.edge.url + "/openai/v1", "TTS_AZURE_CHAT_KEY_CMD": "printf chain",
-        "TTS_TITLE_MODEL": "",
         "TTS_PI_ROLES_FILE": "",
         **(speech_env or {}),
     }
@@ -165,7 +163,8 @@ def test_tts_text_message_publishes_and_replies(stack, monkeypatch, speech, m3_s
     episode, notes, script = _episode_checks(stack, event)
     assert episode["route"] == "tts" and episode["episode_kind"] == "faithful_read"
     assert "sixteen million particles" in script and episode["mp3_url"] in notes
-    assert {c["step"] for c in model_calls(stack.root / "models.jsonl")} == {"topics", "mentions"}
+    # the faithful read's title is one harness call on the `titles` tier, then the notes passes
+    assert {c["step"] for c in model_calls(stack.root / "models.jsonl")} == {"episode_title", "topics", "mentions"}
     manifest = json.loads(_exact_get(stack, episode["manifest_url"]))
     assert manifest["voice"] == voice
     assert {(r["provider"], r["model"]) for r in manifest["chunkReceipts"]} == {receipts}

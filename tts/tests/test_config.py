@@ -11,8 +11,6 @@ ACCOUNT_ENV = {
     "TTS_FEED_TITLE": "Example TTS",
     "TTS_AZURE_TTS_BASE_URL": "https://speech.example.test/",
     "TTS_AZURE_TTS_KEY_CMD": "printf example-speech-key",
-    "TTS_AZURE_CHAT_BASE_URL": "https://chat.example.test/openai/v1/",
-    "TTS_AZURE_CHAT_KEY_CMD": "printf example-chat-key",
 }
 
 
@@ -34,9 +32,7 @@ def test_publication_config_and_notification(monkeypatch):
     assert settings.feed_url == ACCOUNT_ENV["TTS_FEED_URL"]
     assert settings.feed_title == ACCOUNT_ENV["TTS_FEED_TITLE"]
     assert settings.azure_tts_base_url == ACCOUNT_ENV["TTS_AZURE_TTS_BASE_URL"].rstrip("/")
-    assert settings.azure_chat_base_url == ACCOUNT_ENV["TTS_AZURE_CHAT_BASE_URL"].rstrip("/")
     assert settings.azure_tts_key_cmd == ACCOUNT_ENV["TTS_AZURE_TTS_KEY_CMD"]
-    assert settings.azure_chat_key_cmd == ACCOUNT_ENV["TTS_AZURE_CHAT_KEY_CMD"]
     monkeypatch.setenv("TTS_FEED_TITLE", settings.feed_title)
     assert render_notification("succeeded", {"ok": True, "title": "Title", "publicAudioUrl": "audio",
                                            "scriptUrl": "script", "notesUrl": "notes", "feedUrl": "feed"}) == (

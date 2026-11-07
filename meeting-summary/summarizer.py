@@ -1,21 +1,34 @@
+"""Meeting summary calls: one contained harness turn per chunk, one for the final summary.
+
+The model comes from the enrichment tier file's ``meetings`` pipeline (``pi_harness`` role
+``meeting_summary``), read once at the start of a job: there is no second client and no
+fallback model. A call that fails, or a reply that is not the strict JSON the prompt asks
+for, raises ``SummaryError`` with a named ``error_class`` (``model_transient``,
+``model_schema_invalid``) that the worker turns into a job error, so the job fails and
+retries instead of quietly producing a note without a summary.
+"""
+
 from __future__ import annotations
 
 import json
-import os
 import textwrap
-import urllib.error
-import urllib.request
 from html import escape
 from typing import Any
 
-from config import Settings
-from openai_auth import OpenAICodexAuth, OpenAIAuthError, load_openai_codex_auth
+from pi_harness import PiRunner
 
-CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses"
+SUMMARY_ROLE = "meeting_summary"
 
 
 class SummaryError(RuntimeError):
-    pass
+    """A summary call, or the input it was given, failed; ``error_class`` names it for the job."""
+
+    error_class = "model_transient"
+
+    def __init__(self, message: str, error_class: str | None = None) -> None:
+        super().__init__(message)
+        if error_class:
+            self.error_class = error_class
 
 
 MISSING_INFORMATION_RULES = (
@@ -52,84 +65,23 @@ def strip_json_fences(text: str) -> str:
     return text.strip()
 
 
-def read_sse_output_text(response) -> str:
-    parts: list[str] = []
-    completed = False
-    for raw_line in response:
-        line = raw_line.decode("utf-8", errors="replace").strip()
-        if not line.startswith("data: "):
-            continue
-        payload = line[6:].strip()
-        if not payload or payload == "[DONE]":
-            continue
-        try:
-            event = json.loads(payload)
-        except json.JSONDecodeError as exc:
-            raise SummaryError("malformed openai-codex stream") from exc
-        kind = event.get("type")
-        if kind in {"error", "response.failed", "response.incomplete"}:
-            raise SummaryError(f"openai-codex stream ended with {kind}")
-        if kind == "response.completed":
-            if event.get("response", {}).get("status") != "completed":
-                raise SummaryError("openai-codex response did not complete")
-            completed = True
-        if event.get("type") == "response.output_text.delta" and event.get("delta"):
-            parts.append(str(event["delta"]))
-    if not completed:
-        raise SummaryError("incomplete openai-codex stream")
-    text = "".join(parts).strip()
-    if not text:
-        raise SummaryError("empty openai-codex response")
-    return text
-
-
-def call_codex_json(
-    auth: OpenAICodexAuth,
-    *,
-    model: str,
-    instructions: str,
-    prompt: str,
-    timeout_sec: int,
-) -> dict[str, Any]:
-    body = json.dumps(
-        {
-            "model": model,
-            "store": False,
-            "stream": True,
-            "instructions": instructions,
-            "input": [{"role": "user", "content": prompt}],
-            "text": {"verbosity": "medium"},
-            "tool_choice": "none",
-            "reasoning": {"effort": "medium", "summary": "auto"},
-        }
-    ).encode("utf-8")
-    request = urllib.request.Request(
-        # The env override points summaries at a local responses endpoint (chain tests).
-        os.environ.get("MEETING_SUMMARY_CODEX_RESPONSES_URL") or CODEX_RESPONSES_URL,
-        data=body,
-        headers={
-            "Authorization": f"Bearer {auth.token}",
-            "chatgpt-account-id": auth.account_id,
-            "OpenAI-Beta": "responses=experimental",
-            "originator": "meeting-summary",
-            "Content-Type": "application/json",
-            "Accept": "text/event-stream",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=timeout_sec) as response:
-            text = read_sse_output_text(response)
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")[:1000]
-        raise SummaryError(f"openai-codex HTTP {exc.code}: {body}") from exc
-    except urllib.error.URLError as exc:
-        raise SummaryError(f"openai-codex request failed: {exc}") from exc
+def parse_summary_json(text: str) -> dict[str, Any]:
+    """One summary reply as an object; anything else is a named failure."""
     cleaned = strip_json_fences(text)
     try:
-        return json.loads(cleaned)
+        payload = json.loads(cleaned)
     except json.JSONDecodeError as exc:
-        raise SummaryError(f"summary JSON parse failed: {cleaned[:500]}") from exc
+        raise SummaryError(f"summary JSON parse failed: {cleaned[:500]}", "model_schema_invalid") from exc
+    if not isinstance(payload, dict):
+        raise SummaryError(f"summary reply was not a JSON object: {cleaned[:500]}", "model_schema_invalid")
+    return payload
+
+
+def call_summary_json(runner: PiRunner, prompt: str, *, timeout_sec: int, session_name: str) -> dict[str, Any]:
+    result = runner.run(prompt, allow_tools=False, timeout_s=timeout_sec, session_name=session_name)
+    if not result.ok:
+        raise SummaryError(f"summary call failed: {result.error}")
+    return parse_summary_json(result.text)
 
 
 def build_chunk_summary_prompt(chunk_index: int, total_chunks: int, transcript_text: str) -> str:
@@ -180,35 +132,30 @@ def build_final_summary_prompt(chunk_summaries: list[dict[str, Any]]) -> str:
 
 def summarize_transcript_chunks(
     *,
-    settings: Settings,
+    settings: Any,
     chunk_texts: list[str],
+    runner: PiRunner,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    try:
-        auth = load_openai_codex_auth(settings.pi_auth_path)
-    except OpenAIAuthError as exc:
-        raise SummaryError(str(exc)) from exc
     # Partition without discarding any characters; every part gets a summary.
     chunk_texts = [text[start:start + 16000] for text in chunk_texts
                    for start in range(0, len(text), 16000)]
     if not chunk_texts:
-        raise SummaryError("empty meeting transcript")
+        raise SummaryError("empty meeting transcript", "input_empty")
+    timeout_sec = settings.summary_timeout_sec
     chunk_summaries: list[dict[str, Any]] = []
     for index, chunk_text in enumerate(chunk_texts):
-        chunk_summary = call_codex_json(
-            auth,
-            model=settings.summary_model,
-            instructions="You summarize one meeting transcript chunk. Return strict JSON only.",
-            prompt=build_chunk_summary_prompt(index, len(chunk_texts), chunk_text),
-            timeout_sec=settings.summary_timeout_sec,
-        )
-        chunk_summaries.append(chunk_summary)
+        chunk_summaries.append(call_summary_json(
+            runner,
+            build_chunk_summary_prompt(index, len(chunk_texts), chunk_text),
+            timeout_sec=timeout_sec,
+            session_name=f"meeting-chunk-{index + 1}",
+        ))
 
-    final_summary = call_codex_json(
-        auth,
-        model=settings.summary_model,
-        instructions="You synthesize one final meeting summary. Return strict JSON only.",
-        prompt=build_final_summary_prompt(chunk_summaries),
-        timeout_sec=settings.summary_timeout_sec,
+    final_summary = call_summary_json(
+        runner,
+        build_final_summary_prompt(chunk_summaries),
+        timeout_sec=timeout_sec,
+        session_name="meeting-final",
     )
     return chunk_summaries, final_summary
 
