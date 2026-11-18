@@ -70,9 +70,9 @@ retry policy. Publication failures never rotate the VPN or switch downloaders.
 
 ## Rebuild (`rebuild.py`)
 
-`rebuild.py SLUG --feed F [--segmenter NAME] [--context JSON] [--apply]` rebuilds one
-episode's transcript and notes from its stored mp3, without refetching the source. It
-is a dry run by default: it prints the plan and submits nothing.
+`rebuild.py SLUG --feed F [--producer-ref REF] [--apply]` rebuilds one episode's transcript and
+notes from its stored mp3, without refetching the source. It is a dry run by default: it prints the
+plan and submits nothing.
 
 The job (`inputKind: "rebuild"`, keyed on slug and version) works as follows:
 - It runs speech-to-text on `<prefix>.mp3`, then uploads `<prefix>.v<n>.script.md`
@@ -91,8 +91,7 @@ The job (`inputKind: "rebuild"`, keyed on slug and version) works as follows:
 inventory, a dry run by default. It submits:
 - rebuilds of the 3 Nov radio and TV and the 28/29 Oct radio;
 - local-file publishes of the 30 Oct and 2 Nov radio windows captured in `/var/tmp/sv-capture`,
-  with the timer's own title, date, segmenter and window context
-  (`scheduled_sources.window_item`).
+  with the timer's own title and date (`scheduled_sources.window_item`).
 - publishes of the 14 TV shows from 14 Oct to 2 Nov, before the timer's `since`. They are pinned
   in the module, because the playlist feed lists only its newest 15 entries. Each is the nightly's
   own item (`scheduled_sources.playlist_item`, keyed `surveillance-tv:<video id>`).
@@ -153,22 +152,23 @@ transcript does not matter. The exit status is nonzero if a source cannot be lis
 other than `window_not_show`. A skip is a dead job, so tg-tools telemetry shows it and the supervisor
 checks whether the show really did not air (X-75). A dead item fails
 only the first run that sees it dead (it ended within 36 h), not every night of the lookback. A
-nonzero exit fires `lane-alert@` (installed by the reading lane; see the operations guide). `python scheduled_sources.py --list [--now ISO]` prints what is due and submits
+nonzero exit fails the unit, which the supervisor's watch sees. `python scheduled_sources.py --list [--now ISO]` prints what is due and submits
 nothing.
 
-A source's optional `segmenter` names how its episodes' notes split into sections
-(`surveillance_seams.SEGMENTERS`, by `surveillance.named_segmenter`; an unknown name fails the inventory,
-and a notes or rebuild job before any read). The Surveillance sources use
-`surveillance-tv` and `surveillance-radio` (`surveillance_seams.py`). These split the 3-hour show
-at its own hour opens, following the accepted seam study, into `## Hour n` sections. Each
-section records the rule that began it: `seam`, `fallback` or `estimated`. A window source's
-items also carry `segmentContext` (window start and time zone), so radio hours are labelled
-on New York's wall clock.
+A Surveillance episode's notes are **section notes** (`surveillance_notes.py`): one model call per
+interview or panel block of the show's structure, then one ranking call, and code writes the names, firms
+and clocks. The notes job runs that path when its input names it (`notesKind: "sections"`, with the cut's
+`intervals` and the structure's `blocks`); every other episode keeps the single-pass topics/mentions
+enrichment. The hour-seam notes (`surveillance_seams.py`, `## Hour n`) left this path with X-104.
 
-`bin/surveillance-tui` (`surveillance_tui.py`, stdlib curses) follows every Surveillance item through the pipe
-(queued, window/download, opening, STT, upload, feed, then the notes job) and, on Enter, the files at each stage: work dir, B2
-objects, feed row, job, STT engine and the opening check. It is read only and uses the settings of the running
-`rss-audio-runtime-worker`; a source it cannot read shows `unknown: <reason>`. The episode API and B2 are read at most once a minute (`r` reads them at once); the list shows `feed read <age> ago`. `--once` prints the list and one item.
+The feed lists only the interviews-only edition. Each Surveillance source's entry sets
+`"parentListed": false`, so the full show's row is published, uploaded and stored but never listed
+(`block: "yes"`), while the condensed row always is; the cut still reads the parent's script, timings
+and mp3. `"condensedTitle"` names the condensed row, with `{day}` filled from the show's own date
+(`Surveillance: TV, Nov 6`), and the scheduled item carries that date as `showDate`. Two operator verbs in
+`surveillance_condensed.py` apply those rules without paid work: `--relist --parent SLUG --source ID`
+(with `--dry` to print only) rewrites the two rows' title and block, and `--submit --parent SLUG
+--source ID` puts a published show's condensed job back on the worker path and prints its job id.
 
 ## Jobs
 

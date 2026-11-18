@@ -1,0 +1,13 @@
+#!/bin/sh
+# One feed's stored episodes and the artefacts each holds, read only (rss-audio/episodes_view.py).
+# Runs from this release with the live B2 listing, on the import path the rss-audio units use.
+# The bucket is deployment config: RSS_AUDIO_EPISODES_BUCKET, else RSS_AUDIO_B2_BUCKET from the env file the
+# rss-audio units load (only that one name is read from it).
+here=$(cd "$(dirname "$0")/.." && pwd -P)
+envfile=${RSS_AUDIO_ENV_FILE:-$HOME/.config/tg-tools/rss-audio.env}
+if [ -z "${RSS_AUDIO_EPISODES_BUCKET:-}${RSS_AUDIO_B2_BUCKET:-}" ] && [ -r "$envfile" ]; then
+  RSS_AUDIO_B2_BUCKET=$(sed -n 's/^RSS_AUDIO_B2_BUCKET=//p' "$envfile" | tail -n 1 | tr -d "\"'")
+  export RSS_AUDIO_B2_BUCKET
+fi
+PYTHONPATH="$here/rss-audio:$here/shared:$here/transcribe-audio:$here" \
+  exec "${TG_TOOLS_PYTHON:-$HOME/.local/lib/tg-tools/runtime/bin/python}" -P "$here/rss-audio/episodes_view.py" "$@"

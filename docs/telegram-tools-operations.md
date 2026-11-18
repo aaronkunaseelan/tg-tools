@@ -61,10 +61,11 @@ python3 scripts/materialize_tg_tools_release.py --repo /tmp/tg-release \
 git worktree remove /tmp/tg-release
 cp systemd/*.service ~/.config/systemd/user/           # only if units changed (not the timers: see below)
 systemctl --user daemon-reload
-systemctl --user restart tg-gateway-rss tg-gateway-ms rss-audio-runtime-worker \
-  rss-audio-transcribe-runtime-worker meeting-summary-runtime-worker \
-  meeting-summary-result-consumer tts-worker tts-result-projector
 ```
+
+`--promote` is the whole release: it refuses while a runtime job is pending, leased or retryable (a restart
+kills it; `--force` overrides), and after the switch restarts every user unit whose process runs another
+release, found from the running processes, so there is no unit list to keep. `--dry-run` shows both.
 
 **Preconditions of a release that changes enrichment or adds a unit.** Each must hold before the
 workers restart on the new code; otherwise every rss-audio and TTS job fails terminally with
@@ -83,7 +84,7 @@ workers restart on the new code; otherwise every rss-audio and TTS job fails ter
    `daemon-reload`): the `cp systemd/*.service` line above does not copy it, and neither the release
    script nor a restart enables it. Enable it as its own, deliberate step, after one real window has
    run by hand in daylight (`systemctl --user start rss-audio-schedule.service`).
-4. `lane-alert@.service` is installed (see rss-audio scheduled sources below).
+4. A failed `rss-audio-schedule.service` is a failed user unit, which the supervisor's watch sees (F-32).
 
 Apply new `tg-gateway/migrations/*.sql` (numbered, each applied once) with
 `psql -d runtime_controller -f` before restarting. Back up the affected schema
@@ -260,7 +261,7 @@ the fail log.
 
 `rss-audio-schedule.service` (timer 01:30 UTC) submits what is due and prints one line per item (see
 `rss-audio/README.md`). It exits nonzero when a source cannot be listed or an item failed, and then
-`OnFailure=lane-alert@%n.service` raises the alert.
+the unit fails, and the supervisor's watch wakes on the failed unit (`unit:rss-audio-schedule.service:failed`).
 
 - **A skipped day wakes the supervisor, who checks it (X-75).** `window_not_show` (the stream carried
   another programme) prints `skipped (window_not_show: <what was heard>)` and the scheduler exits 0;
@@ -270,12 +271,8 @@ the fail log.
 - **One alert per lost item.** A dead item is a failure only on the first run that sees it dead (it
   ended within 36 h); later runs print it as `(reported by an earlier run)` and exit 0. A skipped night
   of the timer (Persistent catches up once) can therefore miss that alert: the line is still printed.
-- **`lane-alert@` is not tg-tools'.** `lane-alert@.service` is installed by the reading lane in
-  `~/.config/systemd/user/` and runs `~/.local/lib/reading/current/bin/alert`, which messages the agent
-  named in `project-folder/reading/supervisor.id`. tg-tools neither ships nor tests that unit
-  (its test only checks the `OnFailure=` text). If the reading lane changes its release layout or gets
-  its own agent id, scheduled-source failures go to the wrong agent or nowhere: change the
-  `OnFailure=` of `rss-audio-schedule.service` in the same step.
+- **No lane alert hook.** Until 8 Nov an `OnFailure=lane-alert@%n.service` messaged a v2 supervisor id;
+  supervisor v3 removed that id and its watch already wakes on any failed user unit, so the hook is gone (F-32).
 
 ## meeting-summary
 

@@ -16,13 +16,33 @@ Lengths (summary, heading) and topic counts are never gated - only reported.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 from .paragraphs import normalize
-from .prompts import MENTION_TYPES, REFERENCED_AS_MAX_CHARS, SUMMARY_TARGET_CHARS
+from .prompts import MAIN_POINTS, MENTION_TYPES, REFERENCED_AS_MAX_CHARS, SUMMARY_TARGET_CHARS
+from .speakers import surname
 
 HEADING_SOFT_CHARS = 80
 _PASSING = "mentioned in passing"
+
+# The lede gate: a section cannot open with a pronoun the reader has no antecedent for.
+LEDE_FIRST_BANNED = frozenset("they it their its he she this that these those".split())
+# The reference gate: these pronouns need a noun in the heading or the lede to resolve against.
+REF_PRONOUNS = frozenset("their its they it".split())
+# Words that talk about the notes' own instructions instead of the content.
+META_WORDS = ("roster", "guest list", "paragraph id", "paragraph range", "instructions")
+# Small on purpose: only the words that carry no subject of their own.
+STOPWORDS = frozenset("""
+    a an the and or but if so than then that this these those there here
+    i you we he she they it its their theirs our ours your yours his her him them us
+    am is are was were be been being have has had do does did done
+    of in on at to for from by with into over under about after before between during
+    will would can could should may might must shall not no yes all any both each few more most
+    other some such only own same very too also just even like much many any every
+    what when where which while who whom whose why how
+    says said say make makes made get gets got go goes went one two three
+""".split())
 
 
 @dataclass
@@ -40,8 +60,13 @@ class GateReport:
                 "notes": self.notes, "stats": self.stats}
 
 
-def validate_topics(stream, analysis) -> GateReport:
-    """Gate pass-1 output: coverage is the whole point."""
+def validate_topics(stream, analysis, *, sections: bool = False) -> GateReport:
+    """Gate pass-1 output: coverage is the whole point.
+
+    ``sections`` is the notes shape that asks each segment for a ``lede`` and the episode for its
+    ``mainPoints`` (X-104): both are then part of the schema, so a payload without them is an answered
+    question that the answer left out, and gets the pass's one repair like any other structural gap.
+    """
     report = GateReport()
     if not isinstance(analysis, dict):
         report.errors.append("pass-1 output is not a JSON object")
@@ -56,6 +81,7 @@ def validate_topics(stream, analysis) -> GateReport:
         report.errors.append("pass-1 returned no topics")
         return report
 
+    points = analysis.get("mainPoints") if sections else None
     ids = stream.ids
     cursor = 0
     for index, topic in enumerate(topics):
@@ -69,6 +95,10 @@ def validate_topics(stream, analysis) -> GateReport:
             report.notes.append(
                 f"topic[{index}] heading is {len(heading)} chars "
                 f"(soft guide {HEADING_SOFT_CHARS})")
+        if sections and not str(topic.get("lede") or "").strip():
+            report.errors.append(
+                f"topic[{index}] has no lede: every segment opens on one sentence that names the "
+                "speaker and its claim")
 
         start = topic.get("startParagraphId")
         end = topic.get("endParagraphId")
@@ -94,16 +124,42 @@ def validate_topics(stream, analysis) -> GateReport:
         report.errors.append(
             f"topic coverage stops after {cursor} of {len(ids)} paragraphs")
 
+    if sections:
+        _main_points(stream, topics, points, report)
+
     report.stats = {
         "topics": len(topics),
         "summaryChars": len(summary),
         "summaryTargetChars": SUMMARY_TARGET_CHARS,
     }
+    if sections:
+        report.stats.update(
+            ledes=sum(1 for topic in topics if str(topic.get("lede") or "").strip()),
+            mainPoints=len(points or []), mainPointsAsked=MAIN_POINTS)
     if len(summary) > SUMMARY_TARGET_CHARS:
         report.notes.append(
             f"summary is {len(summary)} chars against a "
             f"{SUMMARY_TARGET_CHARS}-char target (not enforced)")
     return report
+
+
+def _main_points(stream, topics, points, report: GateReport) -> None:
+    """The episode's ranked points, in the schema: present, three to six, each on a real paragraph."""
+    if not isinstance(points, list) or not points:
+        report.errors.append(f"pass-1 returned no mainPoints: give {MAIN_POINTS} ranked points")
+        return
+    fewest = min(3, len(topics))
+    if not fewest <= len(points) <= 6:
+        report.errors.append(f"{len(points)} mainPoints: give {fewest} to 6")
+    for index, point in enumerate(points):
+        if not isinstance(point, dict):
+            report.errors.append(f"mainPoints[{index}] is not an object")
+            continue
+        if not str(point.get("text") or "").strip():
+            report.errors.append(f"mainPoints[{index}] is empty")
+        paragraph_id = str(point.get("paragraphId") or "")
+        if stream.position(paragraph_id) is None:
+            report.errors.append(f"mainPoints[{index}] cites {paragraph_id!r}, not a transcript paragraph")
 
 
 def _alias_of(kind: str, candidate: str, seen: dict) -> tuple[str, str] | None:
@@ -292,3 +348,121 @@ def validate_mentions(stream, analysis, mentions_payload) -> tuple[dict, GateRep
         "keepRate": round(kept / total, 3) if total else None,
     }
     return {"topics": cleaned}, report
+
+
+# ---------------------------------------------------------------- the notes' own form gates (X-104)
+#
+# These read the returned payload and never ask again: a failing section is the report's, not a third
+# model call. Surveillance runs the same helpers as errors inside its call loop (a block answer is cheap
+# to repair and the show is the owner's notes surface); an ordinary episode, which has one topics call for
+# the whole transcript, logs them.
+
+
+def content_words(text: str) -> set[str]:
+    """The content nouns of a sentence: 4+ letters, lowercased, minus the small stopword set."""
+    return {word for word in re.findall(r"[A-Za-z]{4,}", str(text or "").lower()) if word not in STOPWORDS}
+
+
+def sentences(text: str) -> list[str]:
+    return [sentence.strip() for sentence in re.split(r"(?<=[.!?])\s+", str(text or "").strip()) if sentence.strip()]
+
+
+def lede_problem(lede: str) -> str | None:
+    """Why a section's lede is unusable, or None. The gate and the report read this."""
+    text = " ".join(str(lede or "").split())
+    if not text:
+        return "no lede: open the section with one sentence that names the speaker and its claim"
+    words = text.split()
+    if len(words) < 8:
+        return f"its lede is {len(words)} words: write 12 to 30, and never less than 8"
+    first = re.sub(r"^[^A-Za-z]+", "", words[0]).lower()
+    if first in LEDE_FIRST_BANNED:
+        return f"its lede opens with {words[0]!r}: name the speaker or the subject first, not a pronoun"
+    return None
+
+
+def unknown_refs(heading: str, lede: str, text: str) -> list[str]:
+    """'their vaults'-style fragments in a sentence that share no content noun with heading + lede.
+
+    A possessive or bare pronoun is only readable when the section has already named the thing: the reader
+    needs "central banks" in the heading or the lede before a bullet can say "their vaults". A sentence under
+    five words is skipped, and so is one with no pronoun at all.
+    """
+    known = content_words(f"{heading} {lede}")
+    out = []
+    for sentence in sentences(text):
+        words = sentence.split()
+        if len(words) < 5:
+            continue
+        tokens = [re.sub(r"^[^A-Za-z]+", "", word).lower() for word in words]
+        hit = next((j for j, token in enumerate(tokens) if token in REF_PRONOUNS), None)
+        if hit is None or content_words(sentence) & known:
+            continue
+        follow = re.sub(r"[^A-Za-z]+$", "", words[hit + 1]).lower() if hit + 1 < len(words) else ""
+        out.append(f"{tokens[hit]} {follow}".strip())
+    return out
+
+
+def quote_words(mention: dict) -> object:
+    """The words a quote will have: the section path's count, or the episode path's evidence quote."""
+    words = (mention.get("quote") or {}).get("words")
+    if isinstance(words, int) and not isinstance(words, bool):
+        return words
+    evidence = str(mention.get("evidenceQuote") or "").strip()
+    return len(evidence.split()) if evidence else None
+
+
+def notes_gates(analysis: dict, mentions: dict, *, speakers: list | tuple = (),
+                limit: int = 40) -> GateReport:
+    """The notes' form, over the payload both calls returned: notes only, so it never costs a call.
+
+    What it reports: a section with no lede or one that opens on a pronoun; a lede or reference sentence
+    whose pronoun resolves to nothing the heading or lede names; a quote outside 3-15 words; a sentence
+    about the notes' own instructions; and — when the episode's metadata names a speaker — a section whose
+    lede and first reference never name them. ``limit`` caps the notes kept; the counts are always whole.
+    """
+    report = GateReport()
+    owners = {surname(name) for name in speakers if surname(name)}
+    by_heading = {normalize(topic.get("heading", "")): topic.get("mentions") or []
+                  for topic in (mentions or {}).get("topics") or []}
+    counts = {"sections": 0, "ledesMissing": 0, "referenceErrors": 0, "quotesOutOfRange": 0,
+              "metaWords": 0, "topicsWithoutName": 0}
+    for index, topic in enumerate(analysis.get("topics") or []):
+        counts["sections"] += 1
+        heading = str(topic.get("heading") or "").strip()
+        lede = str(topic.get("lede") or "").strip()
+        found = by_heading.get(normalize(heading), [])
+        label = f"section[{index}] ({heading!r})" if heading else f"section[{index}]"
+        problem = lede_problem(lede)
+        if problem:
+            counts["ledesMissing"] += 1
+            report.notes.append(f"{label}: {problem}")
+        first_reference = str(found[0].get("referencedAs") or "").strip() if found else ""
+        texts = [lede, first_reference] if first_reference else [lede]
+        for text in texts:
+            for fragment in unknown_refs(heading, lede, text):
+                counts["referenceErrors"] += 1
+                report.notes.append(f"{label}: '{fragment}' refers to something the section never names")
+            lowered = text.lower()
+            for word in META_WORDS:
+                if word in lowered:
+                    counts["metaWords"] += 1
+                    report.notes.append(f"{label}: mentions its own instructions ({word!r})")
+        for mention in found:
+            words = quote_words(mention)
+            name = str(mention.get("displayText") or "?").strip()
+            if not isinstance(words, int) or isinstance(words, bool) or not 3 <= words <= 15:
+                counts["quotesOutOfRange"] += 1
+                report.notes.append(f"{label}: the quote for {name!r} is {words!r} words, not 3 to 15")
+        if owners:
+            named = f"{lede} {first_reference}"
+            if not any(sur in named for sur in owners):
+                counts["topicsWithoutName"] += 1
+                report.notes.append(
+                    f"{label}: neither its lede nor its first reference names the speaker "
+                    f"({', '.join(sorted(owners))})")
+    report.stats = counts
+    if len(report.notes) > limit:
+        report.stats["notesOmitted"] = len(report.notes) - limit
+        report.notes = report.notes[:limit] + [f"… and {report.stats['notesOmitted']} more"]
+    return report

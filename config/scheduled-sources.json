@@ -9,9 +9,14 @@
       "playlistId": "PLGaYlBJIOoa-qaI1saEniG3cR9V0Mu-PE",
       "titleRegex": "^Bloomberg Surveillance \\d{1,2}/\\d{1,2}/\\d{4}$",
       "title": "Bloomberg Surveillance TV {date}",
+      "condensedTitle": "Surveillance: TV, {day}",
       "lookbackDays": 5,
       "preferredRoute": "oci_mullvad",
-      "segmenter": "surveillance-tv"
+      "parentNotes": false,
+      "parentListed": false,
+      "showMetadata": {
+        "chapters": true
+      }
     },
     {
       "id": "surveillance-radio",
@@ -25,9 +30,17 @@
       "seconds": 10800,
       "expectOpening": "Bloomberg Surveillance",
       "title": "Bloomberg Surveillance Radio {date}",
+      "condensedTitle": "Surveillance: Radio, {day}",
       "lookbackDays": 4,
       "settleMinutes": 15,
-      "segmenter": "surveillance-radio"
+      "parentNotes": false,
+      "parentListed": false,
+      "showMetadata": {
+        "guestList": {
+          "from": "omny",
+          "rssUrl": "https://www.omnycontent.com/d/playlist/e73c998e-6e60-432f-8610-ae210140c5b1/8e704079-ca57-4eac-9741-ae27003e2b7f/9739700c-72c3-4176-ae55-ae27003e2b96/podcast.rss"
+        }
+      }
     }
   ]
 }

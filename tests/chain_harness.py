@@ -282,8 +282,9 @@ def start_stack(*, meeting_schema: bool = False, controller: bool = True) -> Sta
 
 FAKE_MODEL = r'''#!/usr/bin/env python3
 """Stand-in for the `claude` and `pi` CLIs: answers the prompt shapes the lanes
-send (reader write/review/revise, enrichment topics/mentions, the meeting summary
-and the episode title) through the same argv/stdin/stdout contract, and logs every call."""
+send (reader write/review/revise, enrichment topics/mentions, the meeting summary,
+the episode title, the Surveillance structure pass and its section notes) through
+the same argv/stdin/stdout contract, and logs every call."""
 import json, os, re, sys
 argv = sys.argv[1:]
 if argv[:2] == ["auth", "status"]:
@@ -301,6 +302,45 @@ elif "=== RULINGS ===" in prompt:
     step, text = "revise", SCRIPT + "=== RULINGS ===\n1 accepted: hedge restored.\n"
 elif "=== TITLE ===" in prompt:
     step, text = "write", SCRIPT
+elif "timeline of blocks" in prompt:
+    # the structure pass (surveillance_structure): headlines and interviews in turn, full coverage, and a
+    # handoff at each interview's own first paragraph so the cut does not trim its head
+    guests = ["Tom Keene", "Paul Sweeney", "Lisa Abramowicz"]
+    shown = re.findall(r"^(p\d{5}) \[", prompt, re.M)
+    plan, blocks, at, n = [("headlines", 2), ("interview", 6)], [], 0, 0
+    while at < len(shown):
+        kind, size = plan[n % 2]
+        chunk = shown[at:at + size]
+        at, n = at + len(chunk), n + 1
+        if kind == "interview" and len(chunk) < 4:
+            kind, chunk = "headlines", chunk
+        block = {"startParagraphId": chunk[0], "endParagraphId": chunk[-1], "type": kind,
+                 "title": "Block %d" % n, "guest": None, "affiliation": None, "topic": None,
+                 "skip": kind != "interview",
+                 "skip_reason": None if kind == "interview" else "a straight read", "confidence": 0.9}
+        if kind == "interview":
+            block.update(guest=guests[n % len(guests)], affiliation="Bloomberg",
+                         topic="the labour market and the yield curve", handoffParagraphId=chunk[0])
+        blocks.append(block)
+    step, text = "structure", json.dumps({"blocks": blocks})
+elif "WHAT THIS PART IS ABOUT" in prompt:
+    # the section notes (surveillance_notes): k sections over the part's paragraphs, one gated bullet each
+    k = int(re.search(r"Write (\d+) sections", prompt).group(1))
+    who = re.search(r"The speakers? (?:is|are) (.+?)\.\n", prompt).group(1)
+    person, surname = who.split(" of ")[0], who.split(" of ")[0].split()[-1]
+    bounds = [ids[i * len(ids) // k:(i + 1) * len(ids) // k] for i in range(k)]
+    sections = [{"heading": "Yields and the dollar %d" % n,
+                 "lede": person + " says the guests weighed the yield curve, the dollar and the labour "
+                         "market in turn.",
+                 "startParagraphId": chunk[0], "endParagraphId": chunk[-1],
+                 "bullets": [{"text": surname + " says the panel sees a slower year ahead.",
+                              "paragraphIds": [chunk[0]]}], "mentions": []}
+                for n, chunk in enumerate(bounds, 1) if chunk]
+    step, text = "sections", json.dumps({"sections": sections})
+elif "You rank the notes of one broadcast episode" in prompt:
+    points = [{"text": "Point %d on the dollar and the curve." % n, "bullet": index}
+              for n, index in enumerate([int(i) for i in re.findall(r"^\[(\d+)\] ", prompt, re.M)][:4])]
+    step, text = "rank", json.dumps({"summary": "A show about yields and the dollar.", "mainPoints": points})
 elif "Summarize this meeting transcript chunk" in prompt:
     step, text = "meeting_chunk", json.dumps(MEETING_CHUNK)
 elif "Produce one final meeting summary" in prompt:
@@ -311,8 +351,21 @@ elif '"mentions"' in prompt:
     heads = re.findall(r'^- "(.*)" covers ', prompt, re.M)
     step, text = "mentions", json.dumps({"topics": [{"heading": h, "mentions": []} for h in heads]})
 elif "startParagraphId" in prompt:
-    step, text = "topics", json.dumps({"summary": "A chain-test source about one measured finding.",
-        "topics": [{"heading": "The finding", "startParagraphId": ids[0], "endParagraphId": ids[-1]}]})
+    # the topics pass: two segments over the shown paragraphs, each with the lede and the ranked points an
+    # rss episode's notes ask for (X-104). The surname "Doe" is what a known speaker's name expands.
+    half = max(1, len(ids) // 2)
+    chunks = [chunk for chunk in (ids[:half], ids[half:]) if chunk]
+    headings = ["The finding", "The uncertainty"][:len(chunks)]
+    step, text = "topics", json.dumps({
+        "summary": "A chain-test source about one measured finding.",
+        "mainPoints": [{"text": "Doe says heating the bottle released millions of particles.",
+                        "paragraphId": ids[0]},
+                       {"text": "Doe says the exposure estimate remains uncertain.", "paragraphId": ids[-1]}],
+        "topics": [{"heading": heading,
+                    "lede": "Doe says the study measured what heating the bottle released, and the number "
+                            "is far larger than the earlier estimate.",
+                    "startParagraphId": chunk[0], "endParagraphId": chunk[-1]}
+                   for heading, chunk in zip(headings, chunks)]})
 else:
     step, text = "unknown", "unrecognised prompt"
 with open(LOG, "a") as log:

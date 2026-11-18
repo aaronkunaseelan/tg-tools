@@ -15,9 +15,10 @@ from .pipeline import (EnrichmentError, EnrichmentResult, PreparedScript, enrich
                        enrich_script, ensure_script)
 from .naming import (EpisodeNames, EpisodeNamingMetadata, build_episode_names,
                      names_from_prefix)
-from .render import build_feed_description, build_manifest, render_notes_markdown
+from .render import build_feed_description, build_manifest, render_episode_sections, render_notes_markdown
+from .speakers import person_name, speaker_entry, speaker_fact, surname
 from .stt import DEFAULT_STT_MODEL, TranscriptionError, transcribe_audio
-from .validate import GateReport, validate_mentions, validate_topics
+from .validate import GateReport, notes_gates, validate_mentions, validate_topics
 
 __all__ = [
     "AudioSttSource",
@@ -46,10 +47,16 @@ __all__ = [
     "enrich_script",
     "ensure_script",
     "normalize",
+    "notes_gates",
+    "person_name",
+    "render_episode_sections",
     "render_notes_markdown",
     "run_mentions",
     "run_topics",
     "single_segment",
+    "speaker_entry",
+    "speaker_fact",
+    "surname",
     "transcribe_audio",
     "validate_mentions",
     "validate_topics",

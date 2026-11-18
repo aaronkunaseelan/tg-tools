@@ -6,7 +6,6 @@
 | a retry                   | v2                 | the same version again (the row is still on v1)                  |
 | at v3                     | v2                 | terminal: superseded                                             |
 | speech-to-text fails      |                    | retryable stt error, nothing uploaded or PUT                     |
-| unknown segmenter         |                    | the worker's input error before any read                         |
 | no stored mp3             |                    | terminal; a failed read of it is retryable                       |
 plan(): reads only; the version is fixed at submit; the key is (slug, version); dry run submits nothing;
 --apply prints the controller's action and the job's status (an existing dead job: the key is spent).
@@ -83,7 +82,7 @@ def test_v1_when_the_episode_has_no_script(store, tmp_path):
 
 def test_v2_beside_v1_and_the_notes_request_carries_it(store, tmp_path):
     store.episode = episode(f"{SLUG}.script.md", f"{SLUG}.notes.md")
-    result = store.run(2, tmp_path, segmenter=None, publishedAt="2026-11-03T12:00:00Z", dateBasis="scheduled_window")
+    result = store.run(2, tmp_path, publishedAt="2026-11-03T12:00:00Z", dateBasis="scheduled_window")
     assert store.uploaded == [f"surveillance/episodes/{SLUG}.v2.script.md",
                               f"surveillance/episodes/{SLUG}.v2.segments.json"]
     assert {k: result.notes[k] for k in ("inputKind", "version", "scriptSha256", "dateBasis", "slug")} == {
@@ -118,15 +117,6 @@ def test_speech_to_text_failing_is_retryable_and_changes_nothing(store, tmp_path
         store.run(1, tmp_path)
     assert error.value.stage == "stt" and error.value.retryable is True
     assert store.uploaded == [] and store.api == []
-
-
-def test_an_unknown_segmenter_is_refused_before_any_read(store, tmp_path):
-    import asyncio
-    import runtime_worker
-    job = rebuild.rebuild_input(store.episode, "surveillance", version=1, segmenter="no-such")
-    with pytest.raises(pipeline.PipelineError) as error:
-        asyncio.run(runtime_worker.execute_runtime_job(settings(), None, job, tmp_path))
-    assert error.value.stage == "input" and store.downloads == []
 
 
 def test_a_failed_read_of_the_mp3_is_retryable(store, tmp_path, monkeypatch):

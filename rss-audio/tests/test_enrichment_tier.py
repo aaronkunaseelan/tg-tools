@@ -189,6 +189,14 @@ def test_publish_is_speech_to_text_first(work, timed, uploaded):
     assert payload["speech_text_url"].endswith(".script.md")
     assert "md_url" not in payload and "manifest_url" not in payload and result.notes_url is None
     assert (result.segments_url is not None) == bool(timed)
+    # the full show's own notes job is off unless its source's entry asks for it (parentNotes, X-104 A-24)
+    assert result.notes is None and result.condensed is not None
+
+
+def test_the_parent_notes_switch_hands_the_notes_job_on(work, monkeypatch):
+    import surveillance
+    monkeypatch.setattr(surveillance, "parent_notes", lambda input_json: True)
+    result = work.run(make_settings(), "surveillance")
     assert {k: result.notes[k] for k in ("inputKind", "feed", "slug", "version", "scriptSha256", "sttEngine")} == {
         "inputKind": "notes", "feed": "surveillance", "slug": result.slug, "version": 1, "scriptSha256": "a" * 64,
         "sttEngine": "parakeet-ultra@fluidaudio-0.18.0"}

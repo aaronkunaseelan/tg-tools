@@ -1,6 +1,6 @@
 """Rebuild an episode's transcript and notes from its stored mp3, by slug, in any feed (X-76 step 4).
 
-    rebuild.py SLUG --feed F [--segmenter NAME] [--context JSON] [--producer-ref REF] [--apply]
+    rebuild.py SLUG --feed F [--producer-ref REF] [--apply]
 
 Dry run by default: it prints the plan and submits nothing. ``--apply`` submits one rebuild job.
 
@@ -16,7 +16,6 @@ retry rebuilds the same version.
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from pathlib import Path
 from typing import Any, Mapping
@@ -38,16 +37,10 @@ def next_version(episode: Mapping[str, Any]) -> int:
     return (document_version(str(episode["slug"]), url) or 1) + 1 if url else 1
 
 
-def rebuild_input(episode: Mapping[str, Any], feed: str, *, version: int, segmenter: str | None = None,
-                  segment_context: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    payload = {"kind": "rss", "inputKind": INPUT_KIND, "feed": feed, "slug": episode["slug"], "version": version,
-               "title": episode.get("title") or episode["slug"], "publishedAt": episode.get("pub_date"),
-               "delivery": "none"}
-    if segmenter:
-        payload["segmenter"] = segmenter
-    if segment_context:
-        payload["segmentContext"] = dict(segment_context)
-    return payload
+def rebuild_input(episode: Mapping[str, Any], feed: str, *, version: int) -> dict[str, Any]:
+    return {"kind": "rss", "inputKind": INPUT_KIND, "feed": feed, "slug": episode["slug"], "version": version,
+            "title": episode.get("title") or episode["slug"], "publishedAt": episode.get("pub_date"),
+            "delivery": "none"}
 
 
 def rebuild_job_payload(rebuild: Mapping[str, Any], *, producer_ref: str | None = None) -> dict[str, Any]:
@@ -117,14 +110,13 @@ def submit_line(payload: Mapping[str, Any], submitted: Mapping[str, Any]) -> str
             f"job {job.get('jobId')} {job.get('status')}")
 
 
-def plan(settings: Settings, slug: str, feed: str, *, segmenter: str | None = None,
-         segment_context: Mapping[str, Any] | None = None, producer_ref: str | None = None) -> tuple[dict, list[str]]:
+def plan(settings: Settings, slug: str, feed: str, *, producer_ref: str | None = None) -> tuple[dict, list[str]]:
     """(the submit payload, the plan's lines). Reads the episode; writes nothing."""
     episode = _get_episode_by_slug(settings, slug, feed)
     if episode is None:
         raise PipelineError("rebuild", f"no episode {slug} in feed {feed}", retryable=False)
     version = next_version(episode)
-    rebuild = rebuild_input(episode, feed, version=version, segmenter=segmenter, segment_context=segment_context)
+    rebuild = rebuild_input(episode, feed, version=version)
     names = names_from_prefix(slug, version)
     current = episode.get("speech_text_url")
     lines = [f"rebuild {slug} in {feed}: v{version}",
@@ -132,7 +124,6 @@ def plan(settings: Settings, slug: str, feed: str, *, segmenter: str | None = No
              f"notes {'yes' if episode.get('md_url') else 'none'}",
              f"  stt from   {slug}.mp3 (stored; no refetch)",
              f"  writes     {names.script_name}, {names.segments_name}, then {names.notes_name}, {names.manifest_name}",
-             f"  segmenter  {segmenter or 'single'}" + (f" {json.dumps(dict(segment_context))}" if segment_context else ""),
              "  after      older versions' documents deleted" if version > 1 else "  after      nothing deleted"]
     return rebuild_job_payload(rebuild, producer_ref=producer_ref), lines
 
@@ -141,13 +132,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("slug")
     parser.add_argument("--feed", required=True)
-    parser.add_argument("--segmenter")
-    parser.add_argument("--context", type=json.loads, help="segment context, a JSON object")
     parser.add_argument("--producer-ref")
     parser.add_argument("--apply", action="store_true", help="submit the job (default: print the plan)")
     args = parser.parse_args(argv)
     import config
-    import surveillance
     from runtime_client import RuntimeClient
     try:
         settings = config.worker_settings()[0]
@@ -155,9 +143,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"rebuild: {config.WORKER_UNIT} settings unreadable ({type(exc).__name__})", file=sys.stderr)
         return 1
     try:
-        surveillance.named_segmenter(args.segmenter)
-        payload, lines = plan(settings, args.slug, args.feed, segmenter=args.segmenter,
-                              segment_context=args.context, producer_ref=args.producer_ref)
+        payload, lines = plan(settings, args.slug, args.feed, producer_ref=args.producer_ref)
     except PipelineError as exc:
         print(f"rebuild: {exc}", file=sys.stderr)
         return 1

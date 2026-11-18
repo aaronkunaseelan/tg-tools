@@ -7,17 +7,22 @@
 | 34, batch 2 stays invalid      | the pass fails naming "batch 2/2 (topics 18-34)"; no notes.md is written |
 | retry after that failure       | batch 1 comes from its checkpoint: one new call, for batch 2             |
 | a new script                   | every mentions-batch-*.json checkpoint is cleared                        |
+| 34                             | gates.json beside the job holds the batches  ; one INFO line   |
+|                                | per batch, and one naming the batch that fails                           |
+| 34, a later stage raises       | the report file is written with what ran, then the failure is raised     |
 """
 import json
+import logging
 import re
 from types import SimpleNamespace
 
 import pytest
 
-from episode_enrichment import prompts
+from episode_enrichment import pipeline, prompts
 from episode_enrichment.luna import MENTIONS_BATCH_TOPICS, mention_batches
 from episode_enrichment.paragraphs import build_stream
-from episode_enrichment.pipeline import NOTES_FILE, EnrichmentError, _invalidate_dependents, enrich_script, ensure_script
+from episode_enrichment.pipeline import (NOTES_FILE, REPORT_FILE, EnrichmentError, _invalidate_dependents,
+                                          enrich_script, ensure_script)
 
 FROZEN_RE = re.compile(r'^- "(.+)" covers (p\d{5})\.\.(p\d{5})$', re.M)
 
@@ -110,10 +115,12 @@ def test_above_the_limit_batches_join_in_order_under_one_report(tmp_path):
     assert result.mention_count == 34 and len(list(tmp_path.glob("mentions-batch-*.json"))) == 2
 
 
-def test_a_failing_batch_fails_by_name_and_a_retry_reuses_the_rest(tmp_path):
+def test_a_failing_batch_fails_by_name_and_a_retry_reuses_the_rest(tmp_path, caplog):
     calls = []
-    with pytest.raises(EnrichmentError) as error:
+    with caplog.at_level(logging.ERROR, logger="episode_enrichment.pipeline"), pytest.raises(EnrichmentError) as error:
         run(tmp_path, 34, calls, drop_on="p00018")
+    assert [r.getMessage() for r in caplog.records
+            if r.getMessage().startswith("mentions batch 2/2 (topics 18-34) failed")]
     assert error.value.stage == "mentions:mentions"
     assert "batch 2/2 (topics 18-34)" in str(error.value) and "17 frozen, 16 returned" in str(error.value)
     assert [c.session for c in mention_calls(calls)] == [
@@ -132,3 +139,38 @@ def test_a_new_script_clears_the_batch_checkpoints(tmp_path):
     assert list(tmp_path.glob("mentions-batch-*.json"))
     _invalidate_dependents(tmp_path)
     assert not list(tmp_path.glob("mentions-*.json")) and not list(tmp_path.glob("topics-*.json"))
+
+
+def test_reports_file_written_with_batches(tmp_path):
+    result = run(tmp_path, 34, [])
+    written = json.loads((tmp_path / REPORT_FILE).read_text(encoding="utf-8"))
+    assert written == result.reports
+    assert written["script"]["ok"] is True
+    batches = written["mentions"]["batches"]
+    assert [b["batch"] for b in batches] == ["batch 1/2 (topics 1-17)", "batch 2/2 (topics 18-34)"]
+    assert [b["topics"] for b in batches] == [17, 17]
+    assert written["mentions"]["stats"]["mentionsKept"] == 34
+
+
+def test_batch_lines_logged(tmp_path, caplog):
+    with caplog.at_level(logging.INFO, logger="episode_enrichment.pipeline"):
+        run(tmp_path, 34, [])
+    lines = [r.getMessage() for r in caplog.records if r.name == "episode_enrichment.pipeline"]
+    batch_lines = [line for line in lines if line.startswith("mentions batch ")]
+    assert len(batch_lines) == 2
+    assert batch_lines[0].startswith("mentions batch 1/2 (topics 1-17): 17 mentions, ")
+    assert batch_lines[1].startswith("mentions batch 2/2 (topics 18-34): 17 mentions, ")
+    assert all(line.endswith(" s") for line in batch_lines)
+
+
+def test_reports_file_written_on_later_failure(tmp_path, monkeypatch):
+    def boom(**kwargs):
+        raise RuntimeError("the notes renderer failed")
+
+    monkeypatch.setattr(pipeline.render, "render_notes_markdown", boom)
+    with pytest.raises(RuntimeError, match="the notes renderer failed"):
+        run(tmp_path, 34, [])
+    written = json.loads((tmp_path / REPORT_FILE).read_text(encoding="utf-8"))
+    assert [b["batch"] for b in written["mentions"]["batches"]] == [
+        "batch 1/2 (topics 1-17)", "batch 2/2 (topics 18-34)"]
+    assert not (tmp_path / NOTES_FILE).exists()

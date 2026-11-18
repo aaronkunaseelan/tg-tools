@@ -8,9 +8,11 @@
 | reply not JSON / not an object         | SummaryError model_schema_invalid -> retryable job               |
 | empty transcript                       | SummaryError input_empty -> terminal job                         |
 | no `meetings` entry in the tier file    | EnrichmentConfigError -> terminal job, before any audio work      |
+| summary fails after transcription      | job completes: transcript kept, summaryStatus failed + reason      |
 """
 import json
 import os
+from pathlib import Path
 from types import SimpleNamespace as NS
 
 import pytest
@@ -125,3 +127,33 @@ def test_a_missing_meetings_tier_fails_the_job_before_the_audio(tmp_path, enrich
     assert (error.value.error_class, classify_worker_error(error.value)[:2]) == (
         "enrichment_config", ("terminal_error", "enrichment_config"))
     assert "meetings" in str(error.value)
+
+
+def test_summary_failure_keeps_transcript_note(tmp_path, monkeypatch, enrichment_tiers):
+    """The transcript is already paid for: a failed summary completes the job with it, never a retry."""
+    import pipeline
+
+    deepseek_meetings(enrichment_tiers)
+    fake_pi(tmp_path, monkeypatch, exit_code=3, stderr="pi: provider error: quota")
+    source = tmp_path / "input.ogg"
+    source.write_bytes(b"x")
+    monkeypatch.setattr(pipeline, "prepare_audio",
+                        lambda path, work_dir, settings: NS(duration_seconds=12.5, chunk_paths=[path]))
+    monkeypatch.setattr(pipeline, "transcribe_chunks", lambda *, settings, chunk_paths: NS(
+        chunks=[NS(chunk_index=0, name="chunk-001.wav", text="Ana moves the launch to November.",
+                   language="en", elapsed_seconds=1.0)],
+        provider="azure", model="asr-model"))
+
+    result = execute_pipeline(NS(summary_timeout_sec=30), {"inputJson": {
+        "sourceKind": "telegram_audio", "sourceKey": "k",
+        "localWorkDir": str(tmp_path / "work"), "localSourcePath": str(source)}})
+    payload = result.to_result_json()
+
+    assert payload["summaryStatus"] == "failed"
+    assert payload["summaryPath"] is None
+    error = json.loads(Path(payload["summaryErrorPath"]).read_text(encoding="utf-8"))
+    assert error["errorClass"] == "model_transient" and "quota" in error["error"]
+    assert Path(payload["transcriptPath"]).read_text(encoding="utf-8").strip() == "Ana moves the launch to November."
+    assert json.loads(Path(payload["chunksPath"]).read_text(encoding="utf-8"))[0]["text"]
+    assert payload["summaryModel"] == "opencode-go-min/deepseek-v4.1-flash"
+    assert payload["audioDurationSeconds"] == 12.5

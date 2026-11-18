@@ -112,27 +112,34 @@ def _run_pass(runner, prompt: str, *, stage: str, timeout_s: int,
     return cleaned, repaired_report, repair.text
 
 
-def run_topics(stream, *, runner) -> tuple[dict, GateReport, str]:
-    """Pass 1: summary and topic spans."""
+def run_topics(stream, *, runner, sections: bool = False, speaker=None,
+               source_description=None) -> tuple[dict, GateReport, str]:
+    """Pass 1: summary and topic spans; ``sections`` adds each lede and the episode's main points.
+
+    ``source_description`` is the publisher's own text, cleaned by the caller (prompts.clean_source_description):
+    it reaches the prompt for spellings and framing only, never as grounding.
+    """
     def gate(payload):
-        report = validate_topics(stream, payload)
+        report = validate_topics(stream, payload, sections=sections)
         return payload, report
 
     return _run_pass(
-        runner, prompts.topics_prompt(stream),
+        runner, prompts.topics_prompt(stream, sections=sections, speaker=speaker,
+                                     source_description=source_description),
         stage="topics", timeout_s=TOPICS_TIMEOUT_S,
         session_name="transcript-topics", gate=gate,
     )
 
 
-def run_mentions(stream, analysis, *, runner, source_kind="audio") -> tuple[dict, GateReport, str]:
+def run_mentions(stream, analysis, *, runner, source_kind="audio",
+                 source_description=None) -> tuple[dict, GateReport, str]:
     """Pass 2: evidence-bound references inside frozen topic spans."""
     def gate(payload):
         return validate_mentions(stream, analysis, payload)
 
-    prompt = (prompts.reader_mentions_prompt(stream, analysis["topics"])
+    prompt = (prompts.reader_mentions_prompt(stream, analysis["topics"], source_description=source_description)
               if source_kind == "script"
-              else prompts.mentions_prompt(stream, analysis["topics"]))
+              else prompts.mentions_prompt(stream, analysis["topics"], source_description=source_description))
     return _run_pass(
         runner, prompt,
         stage="mentions", timeout_s=MENTIONS_TIMEOUT_S,

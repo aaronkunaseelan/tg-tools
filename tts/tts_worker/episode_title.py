@@ -5,16 +5,22 @@ back to raw source metadata or the first line of the markdown, which produced
 feed items like "---", "Process note. I converted the source ..." and
 "<page> - Wikipedia". A faithful read now names its episode with one contained
 harness turn on the tier the enrichment tier file gives the ``titles`` pipeline
-(``pi_harness``; role ``episode_title``, X-104.3). A failed call or an unusable
-reply raises ``TitleError`` with a named ``error_class``: the job fails and
-retries, it never publishes under a quiet heuristic.
+(``pi_harness``; role ``episode_title``, X-104.3).
+
+A title is never worth the episode: a failed call or an unusable reply raises
+``TitleError`` with a named ``error_class``, and ``resolve_title`` publishes
+under the deterministic ``heuristic_title`` instead, recording the class as a
+title fallback the job result carries (C4 of the 7af619b..aa52235 review).
 """
 from __future__ import annotations
 
 import json
+import logging
 import re
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 MAX_TITLE_CHARS = 120
 TITLE_ROLE = "episode_title"
@@ -72,6 +78,40 @@ def clean_title(raw: Any) -> str:
     return text[:MAX_TITLE_CHARS].rstrip()
 
 
+def heuristic_title(source_md: Path, meta: dict[str, Any]) -> str:
+    """The deterministic title this module produced before X-104.3: metadata, then headings, then the first
+    usable line. It never fails and never returns empty."""
+    title = clean_title(meta.get("title"))
+    if title:
+        return title
+    lines = source_md.read_text(encoding="utf-8").splitlines()
+    if lines and lines[0].strip() == "---":
+        for line in lines[1:]:
+            if line.strip() == "---":
+                break
+            key, separator, value = line.partition(":")
+            if separator and key.strip().lower() == "title":
+                title = clean_title(value)
+                if title:
+                    return title
+    # Prefer authored headings over arbitrary OCR/layout lines.
+    for line in lines:
+        stripped = line.strip()
+        if not stripped.startswith("#"):
+            continue
+        title = clean_title(stripped.lstrip("#"))
+        if title:
+            return title
+    for line in lines:
+        stripped = line.strip()
+        if stripped in {"---", "..."} or stripped.startswith("{{"):
+            continue
+        title = clean_title(stripped)
+        if title:
+            return title
+    return "TTS episode"
+
+
 def llm_title(source_text: str, hint: str, *, runner) -> str:
     """One harness call names the episode; failures raise ``TitleError``."""
     prompt = f"TITLE HINT (may be junk): {hint}\n\nSOURCE TEXT:\n{source_text[:_EXCERPT_CHARS]}"
@@ -82,10 +122,24 @@ def llm_title(source_text: str, hint: str, *, runner) -> str:
     return parse_title_reply(result.text)
 
 
-def resolve_title(source_md: Path, meta: dict[str, Any], *, runner, title_hint: Any = None) -> str:
-    """An explicit title hint wins; otherwise one model call on ``runner`` names the episode."""
+def resolve_title(source_md: Path, meta: dict[str, Any], *, runner, title_hint: Any = None,
+                  notes: list[str] | None = None) -> str:
+    """An explicit title hint wins; otherwise one model call on ``runner`` names the episode.
+
+    A failed or unusable reply is not fatal: the deterministic title covers it, and ``notes`` (when
+    given) receives one ``titleFallback: <error_class>`` line for the job result. Faithful reads are
+    admitted with one attempt, so a title failure that reached the job would lose the episode.
+    """
     explicit = clean_title(title_hint)
     if explicit:
         return explicit
-    hint = str(meta.get("title") or "").strip()
-    return llm_title(source_md.read_text(encoding="utf-8"), hint, runner=runner)
+    fallback = heuristic_title(source_md, meta)
+    hint = str(meta.get("title") or "").strip() or fallback
+    try:
+        return llm_title(source_md.read_text(encoding="utf-8"), hint, runner=runner)
+    except TitleError as exc:
+        logger.warning("episode title call failed (%s): %s; publishing as %r",
+                       exc.error_class, exc, fallback)
+        if notes is not None:
+            notes.append("titleFallback: %s (%s)" % (exc.error_class, fallback))
+        return fallback

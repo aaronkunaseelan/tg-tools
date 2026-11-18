@@ -9,7 +9,10 @@ and the episode row resolve to the uploaded bucket bytes.
 Case table
 | case             | input                      | proves                                                    |
 | audio upload     | 6 s mp3 in the rss topic   | staged sha, STT transcript as script, manifest names the  |
-|                  |                            | published script sha, reply links the mp3                 |
+|                  |                            | published script sha, reply links the mp3, the notes are  |
+|                  |                            | sections with clocks and gates, exactly two model calls    |
+| a speaker named  | the same, titled for a     | the speaker the metadata names reaches the prompt and the  |
+|                  | person ("Jane Doe")        | renderer writes the full name once, the surname after      |
 | rebuild to v2    | the same, then a rebuild   | STT from the stored mp3; .v2. documents live; v1 documents |
 |                  | job by slug                | deleted, mp3 kept; still one Telegram message              |
 """
@@ -27,8 +30,8 @@ from chain_harness import (CHAT_ID, FakeTelegram, azure_stt, build_gateway, deli
 pytestmark = pytest.mark.chain
 RSS_THREAD = 9
 DOCUMENTS = ("script.md", "segments.json", "notes.md", "manifest.json", "page.html")   # Azure chunk timings give segments
-TRANSCRIPT = ("Researchers heated water in polypropylene bottles and counted the particles released.\n\n"
-              "The count reached sixteen million particles per litre at seventy degrees.")
+TRANSCRIPT = ("Jane Doe's lab heated water in polypropylene bottles and counted the particles released.\n\n"
+              "The count reached sixteen million particles per litre at seventy degrees, Doe said.")
 
 
 @pytest.fixture
@@ -126,13 +129,42 @@ def test_audio_upload_publishes_episode_and_replies(stack, monkeypatch):
     notes = _exact_get(stack, episode["md_url"]).decode()
     script = _exact_get(stack, episode["speech_text_url"])
     assert "The finding" in notes and episode["mp3_url"] in notes
+    # an episode's notes are the section shape: an opening lede per section under its clock, and the
+    # episode's ranked points above them (X-104 upstream), all inside the same two model calls
+    assert "## Main points" in notes and "### 0:00 · The finding" in notes
+    assert "Doe says the study measured what heating the bottle released" in notes
     assert b"sixteen million particles per litre" in script
     manifest = json.loads(_exact_get(stack, episode["manifest_url"]))
     assert hashlib.sha256(script).hexdigest() in json.dumps(manifest)
-    assert {c["step"] for c in model_calls(stack.root / "models.jsonl")} == {"topics", "mentions"}
+    gates = manifest["gates"]["notes"]
+    assert gates["ok"] and gates["stats"]["sections"] >= 1 and "quotesOutOfRange" in gates["stats"]
+    assert [c["step"] for c in model_calls(stack.root / "models.jsonl")] == ["topics", "mentions"]
+    assert len(model_calls(stack.root / "models.jsonl")) == 2   # the budget: two calls, no repair
     page = _exact_get(stack, episode["page_url"]).decode()   # the notes job's page, linked from the row
     assert episode["page_url"].endswith(".page.html") and "sixteen million particles per litre" in page
     assert page.index('<h2 id="script">') > page.index("<h1>")
+
+
+def test_an_episode_named_for_its_speaker_writes_the_full_name_once(stack, monkeypatch):
+    """The speaker an episode's metadata names: one sentence to the prompt, the full name in code once."""
+    audio = tone_mp3(stack.root / "upload.mp3", seconds=6).read_bytes()
+    event = inbound(thread_id=RSS_THREAD, message_id=303, attachment={
+        "kind": "audio", "file_id": "audio-1", "file_name": "Jane Doe", "mime_type": "audio/mpeg",
+        "file_size": len(audio), "display_name": "Jane Doe"})
+    asyncio.run(_run(stack, monkeypatch, event, audio))
+    [episode] = stack.edge.episodes["audio"]
+    notes = _exact_get(stack, episode["md_url"]).decode()
+    # the title is exactly a person's name, so the notes job's input carries that speaker, and the
+    # renderer writes the full name at its first appearance — the main point above the sections
+    assert notes.startswith("# Jane Doe")            # the row carries the channel prefix; the notes do not
+    body = notes.split("## Main points", 1)[1]
+    assert body.count("Jane Doe") == 1              # once, where the surname first appears
+    assert body.count("Doe says") >= 2             # the ledes keep the surname
+    assert "- 0:00 · Jane Doe says heating the bottle released millions of particles." in notes
+    assert "### 0:00 · The finding\n\nDoe says the study measured" in notes
+    gates = json.loads(_exact_get(stack, episode["manifest_url"]))["gates"]["notes"]
+    assert gates["stats"]["topicsWithoutName"] == 0
+    assert [c["step"] for c in model_calls(stack.root / "models.jsonl")] == ["topics", "mentions"]
 
 
 def test_a_rebuild_replaces_the_documents_with_v2(stack, monkeypatch):

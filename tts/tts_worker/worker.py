@@ -28,7 +28,7 @@ from episode_enrichment import (EpisodeNamingMetadata, PlainScriptSource,
                                 ScriptSource, build_episode_names, enrich,
                                 names_from_prefix)
 
-from .episode_title import TITLE_ROLE, TitleError, resolve_title
+from .episode_title import TITLE_ROLE, resolve_title
 from tts_reader.adapter import compile_explained_artifact_pi
 from tts_reader.errors import ExplainError
 from .config import Settings, load_settings
@@ -337,12 +337,17 @@ def _execute_job_in_root(
                 speech_text = artifact_to_speech_text(artifact)
                 description = str(ex.model_output.get("source_summary") or title)
             else:
+                # A failed title call publishes under the deterministic title and says so here, so
+                # the job result carries the fallback; the episode is never lost to a title.
+                title_notes: list[str] = []
                 title = resolve_title(
                     source_md,
                     meta,
                     title_hint=input_json.get("titleHint"),
                     runner=PiRunner(TITLE_ROLE, cwd=str(work), tier=titles_tier),
+                    notes=title_notes,
                 )
+                hangups = list(hangups) + title_notes
                 cleaned = clean_faithful_markdown(
                     source_md.read_text(encoding="utf-8"), episode_title=title
                 )
@@ -397,8 +402,6 @@ def _execute_job_in_root(
                 names = names_from_prefix(pinned_prefix)
         except ExplainError as exc:
             raise TTSJobError("model", exc.error_class, str(exc)) from exc
-        except TitleError as exc:
-            raise TTSJobError("compile", exc.error_class, str(exc)) from exc
         except TTSJobError:
             raise
         except LeaseLost:

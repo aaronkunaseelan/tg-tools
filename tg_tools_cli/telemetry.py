@@ -116,7 +116,7 @@ def collect(client, workers, bounds, workloads, owners, handoffs=handoff_health,
         health = client.health()
         if health["ok"] is not True:
             raise ValueError("health failed")
-        check("controller", True)
+        check("controller", True, "health ok")
     except Exception:
         health = None
         check("controller", False, "unknown: controller health unavailable or invalid")
@@ -132,7 +132,8 @@ def collect(client, workers, bounds, workloads, owners, handoffs=handoff_health,
         stale = [unit for unit, identity in workers if identity in by_id and by_id[identity]["heartbeatFresh"] is not True]
         check("workers", not missing and not stale,
               "unknown: worker config or heartbeat missing: " + ",".join(missing) if missing else
-              "stale heartbeat: " + ",".join(stale) if stale else "")
+              "stale heartbeat: " + ",".join(stale) if stale else
+              f"{len(workers)} workers, heartbeats fresh")
     except Exception:
         check("workers", False, "unknown: controller worker heartbeats unavailable or invalid")
     try:
@@ -158,19 +159,23 @@ def collect(client, workers, bounds, workloads, owners, handoffs=handoff_health,
                 for status, count in row["jobsByStatus"].items():
                     if not WORD.fullmatch(status):
                         raise ValueError("invalid status")
-                    metric("jobs", count, "count", {"workload": workload, "status": status})
+                    # All of the workload's jobs the controller holds, newest first up to its cap:
+                    # not a time window. A capped reading is unknown (countsComplete false).
+                    metric("jobs", count, "count", {"workload": workload, "status": status, "window": "all"})
             else:
                 unknown.append(workload + ":counts_capped")
         check("stuck_jobs", not bad and not unknown,
               "overdue or lease/runtime bound exceeded: " + ",".join(bad) if bad else
-              "unknown: incomplete job reading: " + ",".join(unknown) if unknown else "")
+              "unknown: incomplete job reading: " + ",".join(unknown) if unknown else
+              f"{len(rows)} workloads within their bounds")
         failures = summary["failures"]
         for failure in failures:
             if not WORD.fullmatch(failure["workloadType"]) or not WORD.fullmatch(failure["errorClass"]):
                 raise ValueError("invalid failure")
         check("recent_failures", not failures and summary["failuresComplete"],
               "unknown: failure window capped" if not summary["failuresComplete"] else
-              "; ".join(f"{r['workloadType']} {r['errorClass']} ({r['kind']})" for r in failures))
+              "; ".join(f"{r['workloadType']} {r['errorClass']} ({r['kind']})" for r in failures) if failures else
+              f"no dead jobs or deliveries in {summary['windowSec'] // 3600}h")
     except Exception:
         # Remove any partial metrics/checks from an invalid payload.
         checks[:] = [c for c in checks if c["name"] not in ("stuck_jobs", "recent_failures")]
@@ -181,7 +186,8 @@ def collect(client, workers, bounds, workloads, owners, handoffs=handoff_health,
         stuck, age = handoffs()
         if age is not None:
             metric("newest_handoff_age", max(0, age), "s")
-        check("handoffs", not stuck, "pending/staged handoff older than 900s" if stuck else "")
+        check("handoffs", not stuck,
+              "pending/staged handoff older than 900s" if stuck else "no pending/staged handoff older than 900s")
     except Exception:
         check("handoffs", False, "unknown: gateway handoff reading unavailable or invalid")
     return {"schema": "telemetry/1", "system": "tg-tools", "at": now,

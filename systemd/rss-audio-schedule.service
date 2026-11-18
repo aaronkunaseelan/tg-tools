@@ -2,7 +2,6 @@
 Description=rss-audio scheduled sources (Surveillance TV and radio): submit what is due, report each item
 After=network-online.target runtime-controller-api.service
 Wants=network-online.target
-OnFailure=lane-alert@%n.service
 
 [Service]
 Type=oneshot

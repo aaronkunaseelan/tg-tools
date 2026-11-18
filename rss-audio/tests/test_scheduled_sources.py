@@ -1,8 +1,7 @@
 """Scheduled sources: expected items, idempotent submission, per-item report and exit status (fakes only).
 
 | case                                  | proves                                                                      |
-| shipped inventory                     | the two Surveillance sources as specified, valid; an unknown segmenter is  |
-|                                       | rejected; each item carries its segmenter (radio: its window's clock)      |
+| shipped inventory                     | the two Surveillance sources as specified, valid                           |
 | playlist                              | title regex, since, lookback; title M/D/YYYY; publishedAt = Atom published |
 | live window                           | weekdays only, 07:00 America/New_York across the 1 Nov DST change, since,   |
 |                                       | lookback, due only 15 min after the window ended                           |
@@ -59,16 +58,19 @@ def test_shipped_inventory_is_the_specified_pair():
     assert (TV["id"], TV["kind"], TV["feed"], TV["since"], TV["playlistId"], TV["preferredRoute"], TV["lookbackDays"]) == (
         "surveillance-tv", "youtube_playlist", "surveillance", "2026-11-03", "PLGaYlBJIOoa-qaI1saEniG3cR9V0Mu-PE", "oci_mullvad", 5)
     assert TV["titleRegex"] == r"^Bloomberg Surveillance \d{1,2}/\d{1,2}/\d{4}$" and TV["title"] == "Bloomberg Surveillance TV {date}"
+    assert (TV["condensedTitle"], TV["parentListed"]) == ("Surveillance: TV, {day}", False)
     assert (RADIO["id"], RADIO["kind"], RADIO["feed"], RADIO["since"], RADIO["videoId"], RADIO["timezone"], RADIO["start"],
             RADIO["seconds"], RADIO["expectOpening"], RADIO["lookbackDays"], RADIO["settleMinutes"]) == (
         "surveillance-radio", "youtube_live_window", "surveillance", "2026-11-03", "f39oHo6vFLg", "America/New_York", "07:00",
         10800, "Bloomberg Surveillance", 4, 15)
     assert RADIO["weekdays"] == [1, 2, 3, 4, 5] and RADIO["title"] == "Bloomberg Surveillance Radio {date}"
+    assert (RADIO["condensedTitle"], RADIO["parentListed"]) == ("Surveillance: Radio, {day}", False)
 
 
 @pytest.mark.parametrize("change", [{"kind": "rss"}, {"feed": "nope"}, {"since": "soon"}, {"title": "no date"}, {"id": "Bad Id"},
                                     {"titleRegex": "("}, {"preferredRoute": "mac"}, {"lookbackDays": -1},
-                                    {"segmenter": "surveillance-podcast"}])
+                                    {"parentNotes": "no"}, {"parentListed": "no"},
+                                    {"condensedTitle": "Surveillance: TV"}, {"condensedTitle": 7}])
 def test_inventory_validation(tmp_path, change):
     path = tmp_path / "s.json"
     path.write_text(json.dumps({"version": 1, "sources": [{**TV, **change}]}))
@@ -84,8 +86,8 @@ def test_playlist_items_filter_by_regex_since_and_lookback():
     assert item.input_json == {
         "kind": "rss", "sourceKey": "surveillance-tv:vid1103", "inputKind": "url", "feed": "surveillance",
         "title": "Bloomberg Surveillance TV 11/3/2026", "publishedAt": "2026-11-03T16:45:00Z", "delivery": "none",
-        "sourceUrl": "https://www.youtube.com/watch?v=vid1103", "preferredRoute": "oci_mullvad",
-        "segmenter": "surveillance-tv"}
+        "showDate": "2026-11-03",
+        "sourceUrl": "https://www.youtube.com/watch?v=vid1103", "preferredRoute": "oci_mullvad"}
     earlier = {**TV, "since": "2026-10-01"}
     assert keys(expected_items(earlier, utc("2026-11-04T01:30:00Z"), lambda p: FEED)) == [
         "surveillance-tv:vid1030", "surveillance-tv:vid1102", "surveillance-tv:vid1103"]     # 10/20 is 15 days back
@@ -110,8 +112,7 @@ def test_radio_windows_follow_new_york_across_the_dst_change():
     assert item.input_json["liveWindow"] == {"videoId": "f39oHo6vFLg", "start": "2026-11-03T12:00:00Z", "seconds": 10800,
                                              "expectOpening": "Bloomberg Surveillance"}
     assert item.input_json["publishedAt"] == "2026-11-03T12:00:00Z" and item.input_json["delivery"] == "none"
-    assert item.input_json["segmenter"] == "surveillance-radio"   # hour labels on the window's New York clock
-    assert item.input_json["segmentContext"] == {"start": "2026-11-03T12:00:00Z", "timezone": "America/New_York"}
+    assert item.input_json["showDate"] == "2026-11-03"       # the air day, the same date the title spells
     assert "preferredRoute" not in item.input_json and "sourceUrl" not in item.input_json
 
 

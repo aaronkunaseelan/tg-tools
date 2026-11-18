@@ -73,10 +73,10 @@ def test_unit_entrypoint_imports(unit):
 
 
 def test_schedule_unit_and_timer():
-    """The nightly scheduler: oneshot like the worker (same env files), alerting on failure, in quiet time."""
+    """The nightly scheduler: oneshot like the worker (same env files), a failure is a failed unit the supervisor watch sees, in quiet time."""
     service, timer = directives(REPO / "systemd/rss-audio-schedule.service"), directives(REPO / "systemd/rss-audio-schedule.timer")
     worker = directives(REPO / "systemd/rss-audio-runtime-worker.service")
-    assert service["Type"] == ["oneshot"] and service["OnFailure"] == ["lane-alert@%n.service"]
+    assert service["Type"] == ["oneshot"] and "OnFailure" not in service
     assert service["EnvironmentFile"] == worker["EnvironmentFile"] and pythonpath(service) == pythonpath(worker)
     assert service["ExecStart"] == [PYTHON + " scheduled_sources.py"]
     assert timer["OnCalendar"] == ["*-*-* 01:30:00 UTC"] and timer["RandomizedDelaySec"] == ["10min"]

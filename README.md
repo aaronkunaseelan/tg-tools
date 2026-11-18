@@ -11,6 +11,7 @@ Telegram tools for turning links, documents and recordings into podcast episodes
 - **Meeting notes:** audio becomes a Markdown preview with editable date, title and attendees. An Accept button commits the reviewed version; stale buttons cannot accept a newer preview.
 - **Visible execution:** configured RSS/TTS jobs can show stage, elapsed time, measured counts, checkpoint reuse and contact health in Telegram. Progress is not a fabricated percentage or ETA; terminal results and provider receipts remain authoritative.
 - **Podcast delivery:** episodes have stable identities and retained media/artifacts, served through RSS feeds and an HTTP edge with HEAD and byte-range support.
+- **Stored episodes:** `bin/rss-audio-episodes FEED` (`--date`, `--limit`, `--json`) lists what one feed holds, episode by episode: the artefacts present by kind with the newest version of each, whether it is the full show or a condensed edition of one, and the clock base a quote is timed in; read only, and no URL is printed.
 
 Example episode pages (show notes and manifest as published; audio omitted):
 [a Telegram-uploaded talk](https://github.com/aaronkunaseelan/_assets/tree/main/rss-episodes/undated-mp3-telegram-dde7ab17210a),

@@ -58,6 +58,39 @@ def test_real_output_contract_and_semantic_limits():
     assert {m['name'] for m in value['metrics']} == {'jobs', 'newest_job_age', 'newest_handoff_age'}
 
 
+def test_green_checks_carry_reasons():
+    value = run()
+    assert value['state'] == 'green'
+    for c in value['checks']:
+        assert c['ok'] is True, c['name']
+        assert c['reason'].strip(), c['name']
+        assert len(c['reason']) <= 160
+    assert check(value, 'controller')['reason'] == 'health ok'
+    assert check(value, 'workers')['reason'] == '1 workers, heartbeats fresh'
+    assert check(value, 'stuck_jobs')['reason'] == '1 workloads within their bounds'
+    assert check(value, 'recent_failures')['reason'] == 'no dead jobs or deliveries in 6h'
+    assert check(value, 'handoffs')['reason'] == 'no pending/staged handoff older than 900s'
+
+
+def test_job_counts_are_labelled_all_time():
+    value = run()
+    jobs = [m for m in value['metrics'] if m['name'] == 'jobs']
+    assert jobs
+    for m in jobs:
+        assert m['labels']['window'] == 'all'
+        assert set(m['labels']) == {'workload', 'status', 'window'}
+        assert m['unit'] == 'count'
+    # The window label is a word like every other label key and value.
+    assert all(re.fullmatch(r'[A-Za-z0-9_.:-]{1,80}', key) and re.fullmatch(r'[A-Za-z0-9_.:-]{1,80}', v)
+               for m in jobs for key, v in m['labels'].items())
+    # A capped count reading is still unknown, never labelled as a window.
+    data = summary()
+    data['workloads'][0]['countsComplete'] = False
+    capped = run(client(data))
+    assert not [m for m in capped['metrics'] if m['name'] == 'jobs']
+    assert check(capped, 'stuck_jobs')['reason'].startswith('unknown:')
+
+
 def test_controller_unreachable_red_unknown_no_exception_details():
     def unavailable(**kwargs):
         raise ConnectionError('PRIVATE_SECRET')

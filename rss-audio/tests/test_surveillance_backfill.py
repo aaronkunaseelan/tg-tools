@@ -2,13 +2,13 @@
 
 | case               | proves                                                                          |
 | dry run            | 20 lines, nothing submitted; rebuild versions from each row (none -> v1,        |
-|                    | script -> v2); radio carries its window's New York context, TV none             |
-| captures           | 10/30 and 11/2 become local-file publishes with the timer's title, publishedAt,  |
-|                    | segmenter and context, keyed <item>:local, priority below the scheduled ones     |
+|                    | script -> v2)                                                                   |
+| captures           | 10/30 and 11/2 become local-file publishes with the timer's title and           |
+|                    | publishedAt, keyed <item>:local, priority below the scheduled ones                |
 | a missing piece    | no row, or no capture: that item says why, the rest still submit, exit 1         |
 | apply              | every payload submitted once per run, keys idempotent                            |
 | TV days            | 14 shows 10/14-11/2 as the nightly's own items: key surveillance-tv:<video>,     |
-|                    | timer title, feed publishedAt, segmenter surveillance-tv, priority 10            |
+|                    | timer title, feed publishedAt, priority 10                                      |
 | --only             | a key, a day, a day range, a source-scoped range; a typo is an error, exit 1     |
 | pages              | rows with notes and no page_url get a page job (no model call) at their notes'   |
 |                    | version, keyed per episode slug;                                                 |
@@ -53,10 +53,8 @@ def test_the_dry_run_plans_six_items_and_submits_nothing(tmp_path):
     assert lines[0] == "pages    waiting: the episode API has no page_url column yet"   # these rows have none
     plan = {key: payload for key, _, payload, _ in backfill.plan(SOURCES, EPISODES, captures(tmp_path / "again"))}
     radio = plan["surveillance-radio:2026-11-03:rebuild"]["inputJson"]
-    assert radio["version"] == 1 and radio["segmenter"] == "surveillance-radio"
-    assert radio["segmentContext"] == {"start": "2026-11-03T12:00:00Z", "timezone": "America/New_York"}
-    tv = plan["surveillance-tv:2026-11-03:rebuild"]["inputJson"]
-    assert tv["version"] == 1 and tv["segmenter"] == "surveillance-tv" and "segmentContext" not in tv
+    assert radio["version"] == 1 and "segmenter" not in radio and "segmentContext" not in radio
+    assert plan["surveillance-tv:2026-11-03:rebuild"]["inputJson"]["version"] == 1
     assert plan["surveillance-radio:2026-10-28:rebuild"]["inputJson"]["version"] == 2
     assert plan["surveillance-radio:2026-10-29:rebuild"]["producerRef"] == "surveillance-radio:2026-10-29:rebuild"
     assert all(p["priority"] == 10 for p in plan.values() if p is not None)
@@ -68,7 +66,6 @@ def test_captures_publish_like_the_timer_would_have(tmp_path):
     job = local["inputJson"]
     assert local["idempotencyKey"] == "surveillance-radio:2026-10-30:local" and local["priority"] == 10
     assert job["title"] == "Bloomberg Surveillance Radio 10/30/2026" and job["publishedAt"] == "2026-10-30T11:00:00Z"
-    assert job["segmentContext"] == {"start": "2026-10-30T11:00:00Z", "timezone": "America/New_York"}   # EDT
     assert job["localSourcePath"] == str(tmp_path / "2026-10-30" / "radio-2026-10-30.mp3")
     assert job["inputKind"] == "local_file" and "liveWindow" not in job and job["delivery"] == "none"
     assert plan["surveillance-radio:2026-11-02:local"]["inputJson"]["publishedAt"] == "2026-11-02T12:00:00Z"   # EST
@@ -125,8 +122,8 @@ def test_the_tv_days_are_the_nightly_items(tmp_path):
     assert job["inputJson"] == {
         "kind": "rss", "sourceKey": "surveillance-tv:9bCiqNAyJT8", "inputKind": "url", "feed": "surveillance",
         "title": "Bloomberg Surveillance TV 10/14/2026", "publishedAt": "2026-10-14T16:02:33Z", "delivery": "none",
-        "segmenter": "surveillance-tv", "sourceUrl": "https://www.youtube.com/watch?v=9bCiqNAyJT8",
-        "preferredRoute": "oci_mullvad"}
+        "showDate": "2026-10-14",
+        "sourceUrl": "https://www.youtube.com/watch?v=9bCiqNAyJT8", "preferredRoute": "oci_mullvad"}
     # the nightly's own payload for the same entry: one definition, so the keys can never drift apart
     entry = sched.Entry("9bCiqNAyJT8", "Bloomberg Surveillance 10/14/2026", sched.datetime(2026, 10, 14, 16, 2, 33,
                                                                                            tzinfo=sched.UTC))

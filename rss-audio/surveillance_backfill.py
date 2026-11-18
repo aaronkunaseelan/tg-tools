@@ -5,16 +5,16 @@
 A selector is an item key, or ``[SOURCE:]FROM[..TO]`` (air days, inclusive), to pace the run, e.g.
 ``--only surveillance-tv:2026-10-14..2026-10-16``.
 
-* **Rebuild** (``rebuild.py``: speech-to-text from the stored mp3 into a new version, then hour-split
-  notes): radio and TV of 3 Nov, radio of 28 and 29 Oct (published with the dictation-vocab damage).
+* **Rebuild** (``rebuild.py``: speech-to-text from the stored mp3 into a new version): radio and TV of
+  3 Nov, radio of 28 and 29 Oct (published with the dictation-vocab damage).
 * **Publish from a capture**: radio of 30 Oct and 2 Nov. Their window jobs were cancelled; the windows
   were captured with ``live_window`` into ``/var/tmp/sv-capture/<day>/radio-<day>.mp3``. Each becomes an
-  ordinary local-file publish with the timer's own title, ``publishedAt``, segmenter and window context
+  ordinary local-file publish with the timer's own title and ``publishedAt``
   (``scheduled_sources.window_item``), keyed ``<item key>:local``.
 * **TV days before the timer's ``since``**: 14 shows, 14 Oct to 2 Nov, pinned here (the playlist's Atom
   feed lists only its newest 15 entries, so they fall out of it day by day). Each is the nightly's own
-  item (``scheduled_sources.playlist_item``): keyed ``surveillance-tv:<video id>``, the timer's title,
-  ``publishedAt`` (the feed's published time) and segmenter.
+  item (``scheduled_sources.playlist_item``): keyed ``surveillance-tv:<video id>``, the timer's title and
+  ``publishedAt`` (the feed's published time).
 * **Pages** (``notes_job.run_page``, no model call): every Surveillance episode that has notes and no
   ``page_url`` gets its page from its stored notes and script, keyed per episode,
   ``surveillance-page:<slug>``. An
@@ -86,15 +86,12 @@ def _rebuild(source: Mapping[str, Any], day: date, episodes: list[dict]) -> tupl
     rows = [row for row in episodes if row.get("title") == title]
     if len(rows) != 1:
         raise ValueError(f"{len(rows)} episodes titled {title!r} in {FEED}")
-    context = (sched.window_item(source, day).input_json.get("segmentContext")
-               if source["kind"] == "youtube_live_window" else None)
     episode = rows[0]
     version = rebuild.next_version(episode)
-    job = rebuild.rebuild_input(episode, FEED, version=version, segmenter=source.get("segmenter"),
-                                segment_context=context)
+    job = rebuild.rebuild_input(episode, FEED, version=version)
     line = (f"rebuild  {title}: {episode['slug']} v{version} "
             f"(now script {'v' + str(version - 1) if episode.get('speech_text_url') else 'none'}, "
-            f"notes {'yes' if episode.get('md_url') else 'none'}), {source.get('segmenter') or 'single'}")
+            f"notes {'yes' if episode.get('md_url') else 'none'})")
     return line, rebuild.rebuild_job_payload(job, producer_ref=f"{source['id']}:{day.isoformat()}:rebuild")
 
 
@@ -106,8 +103,7 @@ def _local(source: Mapping[str, Any], day: date, capture: Path) -> tuple[str, di
     job = {k: v for k, v in item.input_json.items() if k != "liveWindow"}
     job.update(inputKind="local_file", sourceKey=f"{item.key}:local", localSourcePath=str(path))
     local = sched.Item(item.source_id, f"{item.key}:local", item.title, job)
-    line = (f"publish  {item.title}: {path} ({path.stat().st_size // 1_000_000} MB), "
-            f"{job.get('segmenter') or 'single'}, window {job.get('segmentContext', {}).get('start')}")
+    line = f"publish  {item.title}: {path} ({path.stat().st_size // 1_000_000} MB), local capture"
     return line, sched.job_payload(local, priority=rebuild.PRIORITY)
 
 
@@ -132,7 +128,7 @@ def _tv(source: Mapping[str, Any], video_id: str, day: date, published: str) -> 
     entry = sched.Entry(video_id=video_id, title=f"Bloomberg Surveillance {sched._short_date(day)}",
                         published=datetime.fromisoformat(published.replace("Z", "+00:00")))
     item = sched.playlist_item(source, entry)
-    line = f"publish  {item.title}: {item.input_json['sourceUrl']}, {item.input_json.get('segmenter') or 'single'}"
+    line = f"publish  {item.title}: {item.input_json['sourceUrl']}"
     return line, sched.job_payload(item, priority=rebuild.PRIORITY)
 
 

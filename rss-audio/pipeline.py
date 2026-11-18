@@ -25,6 +25,7 @@ from tg_tools_common.rclone_upload import immutable_copy_argv
 from episode_enrichment import (EpisodeNames, EpisodeNamingMetadata,
                                 build_episode_names, names_from_prefix)
 from episode_enrichment.naming import document_version
+from episode_enrichment.speakers import person_name
 from exit_rotation import ExitRotator
 from source_audio import (
     SourceAudioError,
@@ -228,6 +229,10 @@ class JobOptions:
     delivery: str = "telegram"
     # Model tier of this job's enrichment, resolved once at job start (enrichment_preflight).
     enrichment_tier: str | None = None
+    # The episode row's `block`. "yes" hides the row from the feed (rss-edge lists `block != 'yes'`); the
+    # Surveillance pipeline sets it from its source's `parentListed` switch (surveillance.parent_block), and
+    # every other job is listed.
+    parent_block: str = "no"
 
 
 def job_options(input_json: dict) -> JobOptions:
@@ -280,9 +285,9 @@ def _utc_iso(value) -> str:
 
 
 def apply_options(metadata: "EpisodeMetadata", options: JobOptions) -> "EpisodeMetadata":
-    """Feed, title and date the job asked for. A given title is the whole episode title, so the
+    """Feed, title, date and listing the job asked for. A given title is the whole episode title, so the
     source's channel, creators and series (which would prefix it and the slug) are dropped."""
-    changes: dict = {"feed": options.feed}
+    changes: dict = {"feed": options.feed, "block": options.parent_block}
     if options.title:
         changes.update(title=options.title, channel="", creators=(), series="")
     if options.published_at:
@@ -311,6 +316,8 @@ class EpisodeMetadata:
     feed: str = "audio"
     # Feed ordering time the job supplied; None = ingestion time.
     pub_date: str | None = None
+    # The row's `block`: "yes" keeps it out of the feed (`JobOptions.parent_block`).
+    block: str = "no"
 
 
 @dataclass(frozen=True)
@@ -610,6 +617,7 @@ class RuntimeExecutionResult:
     segments_url: str | None = None
     page_url: str | None = None
     notes: dict | None = None   # the notes job to submit (notes_input), when there is a script
+    condensed: dict | None = None   # the condensed edition's job (surveillance_condensed.parent_job_input)
 
 
 def execution_result(published, source_url: str | None, feed: str = "audio") -> RuntimeExecutionResult:
@@ -628,6 +636,7 @@ def execution_result(published, source_url: str | None, feed: str = "audio") -> 
         segments_url=getattr(published, "segments_url", None),
         page_url=getattr(published, "page_url", None),
         notes=getattr(published, "notes", None),
+        condensed=getattr(published, "condensed", None),
     )
 
 
@@ -853,6 +862,16 @@ def build_public_manifest_url(settings: Settings, names: EpisodeNames | str, fee
     return f"{_public_bases(settings, feed)[1]}/{name}"
 
 
+def build_public_object_url(settings: Settings, feed: str, name: str) -> str:
+    """One stored object's public URL, named as the object is (``<prefix>.v<n>.plan.json``, ``.mp3``).
+
+    The condensed edition names its own artefacts (``surveillance_condensed``), so it cannot go through the
+    ``EpisodeNames`` builders; the roots are the same two the rest of the feed's URLs come from (D7).
+    """
+    audio_base, document_base = _public_bases(settings, feed)
+    return f"{audio_base if name.endswith('.mp3') else document_base}/{name}"
+
+
 def _transcribe(settings: Settings, mp3_path: Path, work_dir: Path | None, tier: str | None):
     """The episode's script and timed transcript (a PreparedScript), or None for audio only.
 
@@ -877,21 +896,39 @@ def _transcribe(settings: Settings, mp3_path: Path, work_dir: Path | None, tier:
 
 def notes_input(*, feed: str, slug: str, version: int, script_sha256: str | None, title: str,
                 published_at: str | None, date_basis: str, duration_seconds: int | float | None,
-                source_url: str | None, stt_engine: str | None, segmenter: str | None = None,
-                segment_context: dict | None = None) -> dict:
+                source_url: str | None, stt_engine: str | None, speaker: dict | None = None,
+                source_description: str | None = None) -> dict:
     """The notes job's input (notes_job.py). Everything its manifest needs travels with it.
 
     The original's link is ``originalUrl``: a ``sourceUrl`` would make the worker fetch it as a source.
+    ``speaker`` is the one person this episode's metadata names (``episode_speaker``), never a guess: the
+    notes prompt gets it as one sentence and the renderer writes their full name at its first appearance.
+    ``sourceDescription`` is the publisher's own description of the episode, carried only so the notes model
+    can spell names the way it does (A-17); it is never rendered and never stored beyond this input.
     """
-    payload = {"kind": "rss", "inputKind": "notes", "feed": feed, "slug": slug, "version": version,
-               "scriptSha256": script_sha256, "title": title, "publishedAt": published_at,
-               "dateBasis": date_basis, "durationSeconds": duration_seconds, "originalUrl": source_url,
-               "sttEngine": stt_engine, "delivery": "none"}
-    if segmenter:
-        payload["segmenter"] = segmenter
-    if segment_context:
-        payload["segmentContext"] = dict(segment_context)
-    return payload
+    return {"kind": "rss", "inputKind": "notes", "feed": feed, "slug": slug, "version": version,
+            "scriptSha256": script_sha256, "title": title, "publishedAt": published_at,
+            "dateBasis": date_basis, "durationSeconds": duration_seconds, "originalUrl": source_url,
+            "sttEngine": stt_engine, "delivery": "none", **({"speaker": speaker} if speaker else {}),
+            **({"sourceDescription": source_description} if source_description else {})}
+
+
+def episode_speaker(metadata: EpisodeMetadata) -> dict | None:
+    """The one speaker this episode's metadata names, if it names one (X-104).
+
+    ``{"name": ...}`` when the title is exactly a person's name ("Jane Doe"), else when a creator is one
+    and is neither the channel nor the series (a person's YouTube channel, not a show's). Nothing else: a
+    wrong speaker in the prompt is worse than none, because the model would name it (``speakers.py``).
+    """
+    title = person_name(metadata.title)
+    if title:
+        return {"name": title}
+    shows = {str(metadata.channel or "").strip().lower(), str(metadata.series or "").strip().lower()}
+    for creator in metadata.creators or ():
+        name = person_name(creator)
+        if name and name.lower() not in shows:
+            return {"name": name}
+    return None
 
 
 def _notes_for(metadata: EpisodeMetadata, slug: str, version: int, script_sha256: str | None,
@@ -899,7 +936,8 @@ def _notes_for(metadata: EpisodeMetadata, slug: str, version: int, script_sha256
     return notes_input(feed=metadata.feed, slug=slug, version=version, script_sha256=script_sha256,
                        title=metadata.title, published_at=metadata.source_published_at,
                        date_basis=metadata.date_basis, duration_seconds=metadata.duration_seconds or None,
-                       source_url=metadata.source_url, stt_engine=stt_engine)
+                       source_url=metadata.source_url, stt_engine=stt_engine,
+                       speaker=episode_speaker(metadata), source_description=metadata.description)
 
 
 def _finalize_publish(
@@ -1102,7 +1140,7 @@ def _create_episode(
         "duration": _format_duration(metadata.duration_seconds),
         "explicit": "no",
         "keywords": "auto,rss-audio-bot",
-        "block": "no",
+        "block": metadata.block or "no",
     }
     if notes_url:
         payload["md_url"] = notes_url

@@ -3,9 +3,9 @@
 | runner reply / state            | outcome                                                       |
 | {"title": "..."} (fenced, quoted) | that title, cleaned                                          |
 | job carries a titleHint          | no model call at all                                          |
-| run failed (timeout, non-zero)   | TitleError error_class model_transient -> retryable job        |
-| reply not JSON, empty or markup title | TitleError error_class model_schema_invalid -> retryable job |
-| source with a heading, no reply  | the error, never the heading (no heuristic fallback)           |
+| run failed (timeout, non-zero)   | the deterministic title, note titleFallback: model_transient   |
+| reply not JSON, empty or markup title | the deterministic title, note titleFallback: model_schema_invalid |
+| source with a heading, no reply  | the heading, never an empty title                              |
 """
 import json
 
@@ -60,22 +60,36 @@ def test_an_explicit_hint_never_reaches_a_model(tmp_path):
     assert runner.calls == []
 
 
-def test_a_failed_call_is_a_named_job_error_not_a_heuristic(tmp_path):
+def test_title_failure_falls_back_to_deterministic_title(tmp_path):
+    """A faithful read is admitted with one attempt: a failed title call still names the episode."""
     runner = Runner(ok=False, error="step timed out after 300s (process group terminated)")
+    notes: list[str] = []
+    title = resolve_title(source(tmp_path, "# Heading\n\nbody text"), {}, runner=runner, notes=notes)
+    assert title == "Heading"
+    assert notes == ["titleFallback: model_transient (Heading)"]
+    assert len(runner.calls) == 1
+
+
+def test_a_failed_call_is_still_a_named_class(tmp_path):
     with pytest.raises(TitleError) as error:
-        resolve_title(source(tmp_path), {}, runner=runner)
+        episode_title.llm_title("text", "hint", runner=Runner(ok=False))
     assert error.value.error_class == "model_transient"
-    assert (error.value.error_class in str(error.value)) is False
     assert classify_outcome(error.value.error_class)[0] == "retryable_error"
 
 
 @pytest.mark.parametrize("reply", ["not json at all", '{"title": ""}', '{"title": "<b>markup</b>"}',
                                    '{"other": "no title"}', "[]"])
-def test_an_unusable_reply_is_a_named_job_error(tmp_path, reply):
-    with pytest.raises(TitleError) as error:
-        resolve_title(source(tmp_path), {}, runner=Runner(reply))
-    assert error.value.error_class == "model_schema_invalid"
-    assert classify_outcome(error.value.error_class)[0] == "retryable_error"
+def test_an_unusable_reply_falls_back_to_the_deterministic_title(tmp_path, reply):
+    notes: list[str] = []
+    assert resolve_title(source(tmp_path), {}, runner=Runner(reply), notes=notes) == "A page"
+    assert notes == ["titleFallback: model_schema_invalid (A page)"]
+
+
+def test_a_source_with_no_usable_line_still_names_the_episode(tmp_path):
+    notes: list[str] = []
+    assert resolve_title(source(tmp_path, "---\n...\n<b>x</b>"), {}, runner=Runner(ok=False),
+                         notes=notes) == "TTS episode"
+    assert notes == ["titleFallback: model_transient (TTS episode)"]
 
 
 def test_the_titles_tier_names_the_role_at_its_effort(tmp_path, enrichment_tiers):

@@ -8,7 +8,8 @@ A segmenter is ``(stream, timed, context) -> list[Segment]``:
 
 It returns contiguous segments covering every paragraph once, in order. Topics and mentions then
 run per segment. The default, ``single_segment``, is one segment: today's single pass, byte for byte.
-Show-specific segmenters (Surveillance's seams) live with their feed, not here.
+A show-specific segmenter lives with its own feed, not here. Surveillance's hour-seam one left with X-104;
+it now runs section notes per structure block (``rss-audio/surveillance_notes.py``).
 """
 from __future__ import annotations
 

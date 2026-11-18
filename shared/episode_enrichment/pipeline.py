@@ -15,10 +15,12 @@ from . import render, timing as timing_mod
 from .luna import (EnrichmentModelError, MENTIONS_ROLE, TOPICS_ROLE, mention_batches, run_mentions,
                    run_topics)
 from .paragraphs import ParagraphStream, build_stream, stream_from_json
+from .prompts import clean_source_description
 from .segments import Segment, check_segments, single_segment, substream
 from .source import AudioSttSource, TranscriptSource
+from .speakers import speaker_entry, speaker_intervals
 from .stt import DEFAULT_STT_MODEL, TranscriptionError
-from .validate import validate_topics
+from .validate import notes_gates, validate_topics
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +38,11 @@ MENTIONS_FILE = "mentions.json"
 NOTES_FILE = "notes.md"
 MANIFEST_FILE = "manifest.json"
 REPORT_FILE = "gates.json"
+# The notes document a caller asks for. "sections" is an rss episode's notes (X-104); "topics" is the
+# summary + spans + references document the reader pipelines (TTS, transcribe-audio) read.
+NOTES_SHAPE_TOPICS = "topics"
+NOTES_SHAPE_SECTIONS = "sections"
+NOTES_SHAPES = (NOTES_SHAPE_TOPICS, NOTES_SHAPE_SECTIONS)
 _DEPENDENT_CHECKPOINTS = (PARAGRAPHS_FILE, ANALYSIS_FILE, MENTIONS_FILE,
                           NOTES_FILE, MANIFEST_FILE, REPORT_FILE)
 
@@ -83,6 +90,21 @@ def _atomic_write(path: Path, text: str) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, path)
+
+
+def _write_reports(work: Path, reports: dict) -> None:
+    """The run's reports beside the job (gates.json, the one reports file): every stage's counts and notes, the
+    mention batches included; a failed run writes what it has (F-56)."""
+    _atomic_write(work / REPORT_FILE, json.dumps(reports, ensure_ascii=False, indent=1))
+
+
+def _record_reports(reports: dict, parts: list, segmentwise: bool) -> None:
+    """The topics and mentions reports the run holds so far, into ``reports``."""
+    if segmentwise:
+        reports["segments"] = [{"label": seg.label, "topics": topics, "mentions": mentions}
+                               for seg, _, _, topics, mentions in parts]
+    else:
+        reports["topics"], reports["mentions"] = parts[0][3], parts[0][4]
 
 
 def _read_json(path: Path):
@@ -215,9 +237,10 @@ def _stage_stream(work_dir: Path, script: PreparedScript) -> ParagraphStream:
 
 @tracked_stage("topic_analysis", lambda r: {"topics": len(r[0].get("topics") or [])})
 def _stage_topics(path: Path, stream: ParagraphStream, runner_factory,
-                  source: TranscriptSource, preknown_topics=None) -> tuple[dict, dict]:
+                  source: TranscriptSource, preknown_topics=None, *, sections: bool = False,
+                  speaker=None, source_description: str | None = None) -> tuple[dict, dict]:
     cached = _read_json(path) if path.exists() else None
-    if cached and cached.get("topics") and validate_topics(stream, cached).ok:
+    if cached and cached.get("topics") and validate_topics(stream, cached, sections=sections).ok:
         current_progress().emit("topic_checkpoint", "reused", reason="checkpoint_reused")
         logger.info("reusing checkpointed topic analysis (%d topics)", len(cached["topics"]))
         return cached, {"cached": True, "ok": True}
@@ -237,7 +260,9 @@ def _stage_topics(path: Path, stream: ParagraphStream, runner_factory,
 
     started = time.monotonic()
     try:
-        analysis, report, _raw = run_topics(stream, runner=runner_factory(TOPICS_ROLE))
+        analysis, report, _raw = run_topics(stream, runner=runner_factory(TOPICS_ROLE),
+                                            sections=sections, speaker=speaker,
+                                            source_description=source_description)
     except EnrichmentModelError as exc:
         raise EnrichmentError(f"topics:{exc.stage}", str(exc)) from exc
     payload = report.to_json()
@@ -248,7 +273,8 @@ def _stage_topics(path: Path, stream: ParagraphStream, runner_factory,
 
 @tracked_stage("reference_extraction", lambda r: {"references": sum(len(t.get("mentions") or []) for t in r[0].get("topics") or [])})
 def _stage_mentions(path: Path, stream: ParagraphStream, analysis: dict,
-                    runner_factory, source_kind="audio") -> tuple[dict, dict]:
+                    runner_factory, source_kind="audio", *,
+                    source_description: str | None = None) -> tuple[dict, dict]:
     cached = _read_json(path) if path.exists() else None
     if cached and isinstance(cached.get("topics"), list):
         current_progress().emit("reference_checkpoint", "reused", reason="checkpoint_reused")
@@ -257,12 +283,13 @@ def _stage_mentions(path: Path, stream: ParagraphStream, analysis: dict,
     started = time.monotonic()
     batches = mention_batches(analysis["topics"])
     if len(batches) > 1:
-        mentions, payload = _batched_mentions(path, stream, batches, runner_factory, source_kind)
+        mentions, payload = _batched_mentions(path, stream, batches, runner_factory, source_kind,
+                                              source_description=source_description)
     else:
         try:
             mentions, report, _raw = run_mentions(
                 stream, analysis, runner=runner_factory(MENTIONS_ROLE),
-                source_kind=source_kind)
+                source_kind=source_kind, source_description=source_description)
         except EnrichmentModelError as exc:
             raise EnrichmentError(f"mentions:{exc.stage}", str(exc)) from exc
         payload = report.to_json()
@@ -272,7 +299,8 @@ def _stage_mentions(path: Path, stream: ParagraphStream, analysis: dict,
 
 
 def _batched_mentions(path: Path, stream: ParagraphStream, batches: list[list],
-                      runner_factory, source_kind: str) -> tuple[dict, dict]:
+                      runner_factory, source_kind: str, *,
+                      source_description: str | None = None) -> tuple[dict, dict]:
     """Pass 2 one batch of consecutive topics at a time (luna.mention_batches), each on only its topics'
     paragraphs, through the same prompt and gate; joined in order under one report. Each batch is cached
     by its paragraphs and topics (``mentions-batch-*.json``), so a retry reuses every finished batch.
@@ -291,11 +319,15 @@ def _batched_mentions(path: Path, stream: ParagraphStream, batches: list[list],
             started = time.monotonic()
             try:
                 mentions, gate, _raw = run_mentions(part, {"topics": batch}, runner=runner_factory(MENTIONS_ROLE),
-                                                    source_kind=source_kind)
+                                                    source_kind=source_kind,
+                                                    source_description=source_description)
             except EnrichmentModelError as exc:
+                logger.error("mentions %s failed: %s", name, exc)
                 raise EnrichmentError(f"mentions:{exc.stage}", f"{name}: {exc}") from exc
             report = {**gate.to_json(), "durationSeconds": round(time.monotonic() - started, 1)}
             _atomic_write(cache, json.dumps({**mentions, "report": report}, ensure_ascii=False, indent=1))
+        kept = sum(len(topic.get("mentions") or []) for topic in mentions["topics"])
+        logger.info("mentions %s: %d mentions, %s s", name, kept, report.get("durationSeconds"))
         topics.extend(mentions["topics"])
         notes.extend(f"{name}: {note}" for note in report.get("notes") or [])
         parts.append({"batch": name, "topics": len(batch), "stats": report.get("stats") or {},
@@ -334,6 +366,28 @@ def _assemble(parts) -> tuple[dict, dict]:
     return {"summary": summary, "topics": topics}, {"topics": mentions}
 
 
+def _clock_lookup(script: PreparedScript, stream: ParagraphStream):
+    """(at, texts): a paragraph's clock from the stored timings, and its text for the quotes.
+
+    ``at`` is None without timings (a reader script, or timings that do not belong to this script): then
+    the notes carry no clock at all, never a guessed one.
+    """
+    texts = {paragraph.id: paragraph.text for paragraph in stream.paragraphs}
+    if not script.timed_transcript:
+        return None, texts
+    try:
+        starts = {str(item["id"]): float(item["start"])
+                  for item in json.loads(script.timed_transcript).get("paragraphs") or []}
+    except (ValueError, AttributeError, KeyError, TypeError):
+        logger.warning("the timed transcript is unreadable; the notes carry no clocks")
+        return None, texts
+    if not all(paragraph_id in starts for paragraph_id in texts):
+        logger.warning("the timed transcript is not this script's; the notes carry no clocks")
+        return None, texts
+    from tg_tools_common.clocks import clock
+    return (lambda paragraph_id: clock(starts[str(paragraph_id)])), texts
+
+
 def default_runner_factory(work_dir: Path, tier: str | None):
     """Runners for the two transcript roles on ``tier`` (from ``pi_harness.enrichment_tier``).
 
@@ -356,73 +410,114 @@ def enrich_script(
     stt_model: str = DEFAULT_STT_MODEL, topics: list | None = None,
     runner_factory=None, tier: str | None = None, segments_url: str | None = None,
     segmenter=None, segment_context: dict | None = None,
+    notes_shape: str = NOTES_SHAPE_TOPICS, speaker=None, source_description: str | None = None,
 ) -> EnrichmentResult:
     """Enrich ``script``. ``segmenter`` (episode_enrichment.segments) splits it into parts that are
-    enriched one at a time; the default is one segment, today's single pass."""
+    enriched one at a time; the default is one segment, today's single pass.
+
+    ``notes_shape`` picks the notes document, never the calls: both shapes make the same two calls.
+    ``"topics"`` is the summary + spans + references document the reader pipelines write; ``"sections"``
+    is an rss episode's notes (X-104: a lede per section, the episode's main points, code-written clocks,
+    quotes and names, and the form gates in the report). ``speaker`` is who the episode's metadata names,
+    if anybody: one name or ``{"name", "firm"}``, passed to the prompt as one sentence.
+    ``source_description`` is the publisher's own description of the episode: it reaches both prompts only as
+    spellings and framing, never as grounding. It is cleaned once here, only its character count is reported,
+    and the text itself never reaches the report or the manifest.
+    """
+    if notes_shape not in NOTES_SHAPES:
+        raise ValueError(f"unknown notes shape {notes_shape!r}: one of {', '.join(NOTES_SHAPES)}")
+    sections_notes = notes_shape == NOTES_SHAPE_SECTIONS
+    cleaned_description = clean_source_description(source_description)
     work = Path(work_dir)
     work.mkdir(parents=True, exist_ok=True)
     runner_factory = runner_factory or default_runner_factory(work, tier)
     reports: dict[str, Any] = {"script": {
         "ok": True, "sha256": script.sha256,
-        "origin": getattr(script.source, "content_origin", "unknown")}}
+        "origin": getattr(script.source, "content_origin", "unknown")},
+        "sourceDescription": {"chars": len(cleaned_description) if cleaned_description else 0}}
     stream = _stage_stream(work, script)
     source_kind = getattr(script.source, "kind", "audio")
     segments = _segments(stream, script, segmenter, segment_context, topics)
+    if sections_notes and len(segments) > 1:
+        raise EnrichmentError("notes", "the sections notes are one document over the whole episode; "
+                              "a segmenter cannot split it")
     parts = []
-    for segment in segments:
-        part = substream(stream, segment) if len(segments) > 1 else stream
-        # Each call is cached by the text it ran on, so a retry reuses every finished segment.
-        key = part.stream_sha256[:12]
-        where = f"{segment.label}: " if segment.label else ""
-        try:
-            seg_analysis, topic_report = _stage_topics(
-                work / f"topics-{key}.json", part, runner_factory, script.source, topics)
-            seg_mentions, mention_report = _stage_mentions(
-                work / f"mentions-{key}.json", part, seg_analysis, runner_factory, source_kind)
-        except EnrichmentError as exc:
-            raise EnrichmentError(exc.stage, where + str(exc)) from exc
-        parts.append((segment, seg_analysis, seg_mentions, topic_report, mention_report))
-    analysis, mentions = _assemble(parts)
-    if len(parts) == 1:
-        reports["topics"], reports["mentions"] = parts[0][3], parts[0][4]
-    else:
-        reports["segments"] = [{"label": seg.label, "topics": t, "mentions": m} for seg, _, _, t, m in parts]
-    _atomic_write(work / ANALYSIS_FILE, json.dumps(analysis, ensure_ascii=False, indent=1))
-    _atomic_write(work / MENTIONS_FILE, json.dumps(mentions, ensure_ascii=False, indent=1))
+    try:
+        for segment in segments:
+            part = substream(stream, segment) if len(segments) > 1 else stream
+            # Each call is cached by the text it ran on, so a retry reuses every finished segment.
+            key = part.stream_sha256[:12]
+            where = f"{segment.label}: " if segment.label else ""
+            try:
+                seg_analysis, topic_report = _stage_topics(
+                    work / f"topics-{key}.json", part, runner_factory, script.source, topics,
+                    sections=sections_notes, speaker=speaker, source_description=cleaned_description)
+                seg_mentions, mention_report = _stage_mentions(
+                    work / f"mentions-{key}.json", part, seg_analysis, runner_factory, source_kind,
+                    source_description=cleaned_description)
+            except EnrichmentError as exc:
+                raise EnrichmentError(exc.stage, where + str(exc)) from exc
+            parts.append((segment, seg_analysis, seg_mentions, topic_report, mention_report))
+            _record_reports(reports, parts, len(segments) > 1)
+        analysis, mentions = _assemble(parts)
+        _atomic_write(work / ANALYSIS_FILE, json.dumps(analysis, ensure_ascii=False, indent=1))
+        _atomic_write(work / MENTIONS_FILE, json.dumps(mentions, ensure_ascii=False, indent=1))
 
-    script_markdown = render.render_script_markdown(script.text)
-    if _sha256(script_markdown) != script.sha256:
-        raise EnrichmentError("script", "script renderer changed canonical bytes")
-    notes_markdown = render.render_notes_markdown(
-        stream=stream, analysis=analysis, mentions=mentions, title=title,
-        published=published, duration_seconds=duration_seconds, mp3_url=mp3_url,
-        script_url=script_url, source_url=source_url, source_kind=source_kind,
-        sections=[(seg.label, a, m) for seg, a, m, _, _ in parts] if len(parts) > 1 else None)
-    description = render.build_feed_description(
-        analysis=analysis, published=published, duration_seconds=duration_seconds,
-        mp3_url=mp3_url, notes_url=notes_url, script_url=script_url,
-        source_url=source_url, source_kind=source_kind)
-    manifest = render.build_manifest(
-        stream=stream, analysis=analysis, mentions=mentions, reports=reports,
-        title=title, slug=slug, published=published, date_basis=date_basis,
-        duration_seconds=duration_seconds, mp3_url=mp3_url,
-        notes_url=notes_url, script_url=script_url, source_url=source_url,
-        stt_model=(script.stt_engine or stt_model) if source_kind == "audio" else None,
-        roles={"topics": TOPICS_ROLE, "mentions": MENTIONS_ROLE},
-        source_kind=source_kind,
-        content_origin=getattr(script.source, "content_origin", "unknown"),
-        topic_origin=getattr(script.source, "topic_origin", "luna_topics"),
-        summary_origin=getattr(script.source, "summary_origin", "luna_summary"),
-        script_sha256=script.sha256,
-        timing=script.timing,
-        segments_url=segments_url if script.timed_transcript else None,
-        segments=[segment.to_json() for segment in segments],
-        feed_description=description,
-    )
-    _atomic_write(work / SCRIPT_FILE, script_markdown)
-    _atomic_write(work / NOTES_FILE, notes_markdown)
-    _atomic_write(work / MANIFEST_FILE, manifest)
-    _atomic_write(work / REPORT_FILE, json.dumps(reports, ensure_ascii=False, indent=1))
+        at, texts = _clock_lookup(script, stream)
+        script_markdown = render.render_script_markdown(script.text)
+        if _sha256(script_markdown) != script.sha256:
+            raise EnrichmentError("script", "script renderer changed canonical bytes")
+        if sections_notes:
+            # The form gates read the payload both calls returned: a failing section is the report's, and
+            # costs no call (X-104). Nothing here can change the answer, only say what is wrong with it.
+            names, _firms = speaker_entry(speaker)
+            gate = notes_gates(analysis, mentions, speakers=names)
+            reports["notes"] = gate.to_json()
+            if gate.notes:
+                logger.warning("the notes fail %d form checks: %s", len(gate.notes), "; ".join(gate.notes[:5]))
+            notes_markdown = render.render_episode_sections(
+                title=title, summary=str(analysis.get("summary") or ""),
+                main_points=analysis.get("mainPoints") or [], topics=analysis.get("topics") or [],
+                references=mentions.get("topics") or [],
+                speakers=speaker_intervals(speaker, stream.first_id(), stream.last_id()),
+                at=at, texts=texts, published=published, duration_seconds=duration_seconds,
+                mp3_url=mp3_url, script_url=script_url, source_url=source_url, source_kind=source_kind)
+        else:
+            notes_markdown = render.render_notes_markdown(
+                stream=stream, analysis=analysis, mentions=mentions, title=title,
+                published=published, duration_seconds=duration_seconds, mp3_url=mp3_url,
+                script_url=script_url, source_url=source_url, source_kind=source_kind,
+                sections=[(seg.label, a, m) for seg, a, m, _, _ in parts] if len(parts) > 1 else None)
+        description = render.build_feed_description(
+            analysis=analysis, published=published, duration_seconds=duration_seconds,
+            mp3_url=mp3_url, notes_url=notes_url, script_url=script_url,
+            source_url=source_url, source_kind=source_kind)
+        manifest = render.build_manifest(
+            stream=stream, analysis=analysis, mentions=mentions, reports=reports,
+            title=title, slug=slug, published=published, date_basis=date_basis,
+            duration_seconds=duration_seconds, mp3_url=mp3_url,
+            notes_url=notes_url, script_url=script_url, source_url=source_url,
+            stt_model=(script.stt_engine or stt_model) if source_kind == "audio" else None,
+            roles={"topics": TOPICS_ROLE, "mentions": MENTIONS_ROLE},
+            source_kind=source_kind,
+            content_origin=getattr(script.source, "content_origin", "unknown"),
+            topic_origin=getattr(script.source, "topic_origin", "luna_topics"),
+            summary_origin=getattr(script.source, "summary_origin", "luna_summary"),
+            script_sha256=script.sha256,
+            timing=script.timing,
+            segments_url=segments_url if script.timed_transcript else None,
+            segments=[segment.to_json() for segment in segments],
+            feed_description=description,
+        )
+        _atomic_write(work / SCRIPT_FILE, script_markdown)
+        _atomic_write(work / NOTES_FILE, notes_markdown)
+        _atomic_write(work / MANIFEST_FILE, manifest)
+        _atomic_write(work / REPORT_FILE, json.dumps(reports, ensure_ascii=False, indent=1))
+    except BaseException:
+        # A stage that fails after the mentions ran still leaves what the run reported, then re-raises.
+        if parts:
+            _write_reports(work, reports)
+        raise
     return EnrichmentResult(
         script_markdown=script_markdown, notes_markdown=notes_markdown,
         manifest=manifest, description=description, stream=stream,
@@ -439,6 +534,7 @@ def enrich(
     stt_model: str = DEFAULT_STT_MODEL, jobs: int = 4, topics: list | None = None, runner_factory=None,
     tier: str | None = None, segments_url: str | None = None,
     segmenter=None, segment_context: dict | None = None,
+    notes_shape: str = NOTES_SHAPE_TOPICS, speaker=None, source_description: str | None = None,
 ) -> EnrichmentResult:
     """Ensure a script, then enrich exactly that script."""
     if runner_factory is None and not tier:
@@ -453,4 +549,5 @@ def enrich(
         duration_seconds=duration_seconds, mp3_url=mp3_url,
         notes_url=notes_url, script_url=script_url, source_url=source_url,
         stt_model=stt_model, topics=topics, runner_factory=runner_factory, tier=tier,
-        segments_url=segments_url, segmenter=segmenter, segment_context=segment_context)
+        segments_url=segments_url, segmenter=segmenter, segment_context=segment_context,
+        notes_shape=notes_shape, speaker=speaker, source_description=source_description)

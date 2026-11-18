@@ -59,18 +59,17 @@ async def execute_runtime_job(
     work_dir: Path | None = None,
 ) -> RuntimeExecutionResult:
     """A publish runs its feed's pipeline (``episodes.run``, ``surveillance.run``); a notes, page or rebuild job
-    is a later step both share. The configuration and a named segmenter are checked before any paid step."""
+    is a later step both share. The configuration is checked before any paid step."""
     options = job_options(input_json)
     options = replace(options, enrichment_tier=enrichment_preflight(settings, options.feed))
     kind = input_json.get("inputKind")
     if kind not in (notes_job.INPUT_KIND, notes_job.PAGE_KIND, rebuild.INPUT_KIND):
         pipeline = surveillance if PIPELINES[options.feed] == "surveillance" else episodes
         return await pipeline.run(settings, bot, input_json, options, work_dir)
-    segmenter = surveillance.named_segmenter(input_json.get("segmenter"))
     work = work_dir or job_work_dir(settings.work_dir, kind)
     if kind == notes_job.INPUT_KIND:
         published = await asyncio.to_thread(
-            notes_job.run_notes, settings, input_json, work, options.enrichment_tier, segmenter=segmenter)
+            notes_job.run_notes, settings, input_json, work, options.enrichment_tier)
     elif kind == notes_job.PAGE_KIND:
         published = await asyncio.to_thread(notes_job.run_page, settings, input_json, work)
     else:
@@ -148,7 +147,10 @@ async def _process_claim_inner(
             result = await execute_runtime_job(settings, bot, input_json, work_dir)
             notes_job_id = None
             if result.notes is not None:
-                notes_job_id = await asyncio.to_thread(_submit_notes, client, job, input_json, result.notes)
+                notes_job_id = await asyncio.to_thread(_submit_notes, client, job, result.notes)
+            condensed_job_id = None
+            if result.condensed is not None:
+                condensed_job_id = await asyncio.to_thread(_submit_condensed, client, job, result.condensed)
         except PipelineError as exc:
             current_progress().check()
             outcome = "retryable_error" if is_retryable(
@@ -201,6 +203,7 @@ async def _process_claim_inner(
                     "segmentsUrl": result.segments_url,
                     "pageUrl": result.page_url,
                     "notesJobId": notes_job_id,
+                    "condensedJobId": condensed_job_id,
                     "artifactIds": artifacts,
                 },
             },
@@ -224,19 +227,31 @@ async def _process_claim_inner(
         raise
 
 
-def _submit_notes(client, job: dict[str, Any], input_json: dict[str, Any], notes: dict[str, Any]) -> str:
-    """Submit the episode's notes job (notes_job.py); the job's own segmenter and context ride along.
+def _submit_notes(client, job: dict[str, Any], notes: dict[str, Any]) -> str:
+    """Submit the episode's notes job (notes_job.py).
 
     A failure is retryable: the retry reads the published episode back and submits the same key again.
     """
     request = dict(notes)
-    for key in ("segmenter", "segmentContext"):
-        if input_json.get(key):
-            request[key] = input_json[key]
     try:
         submitted = client.submit_job(notes_job.notes_job_payload(job, request))
     except Exception as exc:
         raise PipelineError("notes_submit", f"could not submit the notes job: {exc}", retryable=True) from exc
+    return str(((submitted or {}).get("job") or {}).get("jobId") or "")
+
+
+def _submit_condensed(client, job: dict[str, Any], condensed: dict[str, Any]) -> str:
+    """Submit the published show's condensed-edition job (surveillance_condensed.py).
+
+    A failure is retryable, like the notes submit: the retry reads the published episode back and submits the
+    same key again (the key is the parent and its version).
+    """
+    import surveillance_condensed
+    try:
+        submitted = client.submit_job(surveillance_condensed.condensed_job_payload(job, condensed))
+    except Exception as exc:
+        raise PipelineError("condensed_submit", f"could not submit the condensed job: {exc}",
+                            retryable=True) from exc
     return str(((submitted or {}).get("job") or {}).get("jobId") or "")
 
 

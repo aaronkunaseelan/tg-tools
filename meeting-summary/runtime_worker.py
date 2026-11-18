@@ -62,8 +62,9 @@ def classify_worker_error(exc: Exception) -> tuple[str, str, str]:
         # The enrichment tier file (or a roles file) is missing or wrong: nothing a retry fixes.
         return ("terminal_error", exc.error_class, text)
     if isinstance(exc, SummaryError):
-        # The model call or its reply failed: a named class the runtime retries, bounded by attempts;
-        # an empty transcript is the input's fault and fails at once.
+        # A summary failure after transcription is recorded in the result by pipeline.execute_pipeline
+        # (summaryStatus failed, transcript kept), so nothing reaches here for it. This is the safety
+        # net for one that still escapes; an empty transcript is the input's fault and fails at once.
         return ("terminal_error" if exc.error_class == "input_empty" else "retryable_error",
                 exc.error_class, text)
     if isinstance(exc, PipelineError):

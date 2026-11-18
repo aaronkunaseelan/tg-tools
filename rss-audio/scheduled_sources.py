@@ -18,6 +18,12 @@ metadata read per new show for its published time (an item with a job keeps its 
 same items, keyed on the video; the run prints a line when yt-dlp listed them, and names both errors if both fail.
 
 A live-stream window is Surveillance radio: its own fields and the days it is due are ``surveillance.py``'s.
+
+Two switches in a source's own entry belong to the pipeline, not the schedule: ``"parentNotes": true`` asks for
+the full show's own notes job, which is off unless it says so (``surveillance.parent_notes``, owner ask A-24),
+and ``"parentListed": false`` publishes the full show's row hidden from the feed (``surveillance.parent_block``;
+the condensed edition still reads it). ``"condensedTitle"`` is the edition's title, with ``{day}`` filled from
+the same show date the ``title`` template's ``{date}`` is filled with (``surveillance_condensed``).
 """
 from __future__ import annotations
 
@@ -38,7 +44,7 @@ from tg_tools_common.runtime_contract import SKIPPED_ERROR_CLASS, source_receipt
 
 from config import load_settings
 import surveillance
-from pipeline import FEEDS, PipelineError
+from pipeline import FEEDS
 from runtime_client import RuntimeClient
 from source_audio import SourceRoute
 
@@ -127,14 +133,17 @@ def _validate_source(source: Any) -> None:
         raise InventoryError(f"{name}: {exc}") from exc
     if "{date}" not in source["title"]:
         raise InventoryError(f"{name}: title must contain {{date}}")
-    if "segmenter" in source:   # the notes job splits the episode with it
-        try:
-            surveillance.named_segmenter(source["segmenter"])
-        except PipelineError as exc:
-            raise InventoryError(f"{name}: {exc}") from None
     lookback = source["lookbackDays"]
     if isinstance(lookback, bool) or not isinstance(lookback, int) or lookback < 0:
         raise InventoryError(f"{name}: lookbackDays must be a non-negative integer")
+    if "parentNotes" in source and not isinstance(source["parentNotes"], bool):
+        raise InventoryError(f"{name}: parentNotes must be true or false, not {source['parentNotes']!r}")
+    if "parentListed" in source and not isinstance(source["parentListed"], bool):
+        raise InventoryError(f"{name}: parentListed must be true or false, not {source['parentListed']!r}")
+    if "condensedTitle" in source and not (isinstance(source["condensedTitle"], str)
+                                           and "{day}" in source["condensedTitle"]):
+        raise InventoryError(f"{name}: condensedTitle must be a string containing {{day}}, "
+                             f"not {source['condensedTitle']!r}")
 
 
 # -- expected items ----------------------------------------------------------------------------
@@ -168,11 +177,14 @@ def _iso_z(moment: datetime) -> str:
     return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _base_input(source: Mapping[str, Any], key: str, input_kind: str, title: str, published_at: datetime) -> dict[str, Any]:
+def _base_input(source: Mapping[str, Any], key: str, input_kind: str, title: str, published_at: datetime,
+                show_date: date | None = None) -> dict[str, Any]:
+    """The item's job input. ``showDate`` is the day the show was published for, the same date the source's
+    ``title`` template fills: the condensed edition's own title is built from it (``condensedTitle``)."""
     job = {"kind": "rss", "sourceKey": key, "inputKind": input_kind, "feed": source["feed"], "title": title,
            "publishedAt": _iso_z(published_at), "delivery": "none"}
-    if source.get("segmenter"):
-        job["segmenter"] = source["segmenter"]
+    if show_date is not None:
+        job["showDate"] = show_date.isoformat()
     return job
 
 
@@ -298,10 +310,11 @@ def jobs_published(client, source_id: str) -> Callable[[str], datetime | None]:
 def playlist_item(source: Mapping[str, Any], entry: Entry) -> Item:
     """The item of one ``youtube_playlist`` entry: keyed on its video, titled by the date in its title."""
     shown = _DATE_TEXT.search(entry.title)
-    if shown is None:
+    day = _title_day(entry.title)
+    if shown is None or day is None:
         raise InventoryError(f"{source['id']}: no date in matching title {entry.title!r}")
     key, title = f"{source['id']}:{entry.video_id}", source["title"].replace("{date}", shown.group(0))
-    job = _base_input(source, key, "url", title, entry.published)
+    job = _base_input(source, key, "url", title, entry.published, day)
     job.update(sourceUrl=f"https://www.youtube.com/watch?v={entry.video_id}", preferredRoute=source["preferredRoute"])
     return Item(source["id"], key, title, job)
 
@@ -309,7 +322,7 @@ def playlist_item(source: Mapping[str, Any], entry: Entry) -> Item:
 def window_item(source: Mapping[str, Any], day: date) -> Item:
     """The item of one air day of a ``youtube_live_window`` source, due or not."""
     key, title = f"{source['id']}:{day.isoformat()}", source["title"].replace("{date}", _short_date(day))
-    job = _base_input(source, key, "live_window", title, surveillance.window_start(source, day))
+    job = _base_input(source, key, "live_window", title, surveillance.window_start(source, day), day)
     job.update(surveillance.window_fields(source, job["publishedAt"]))
     return Item(source["id"], key, title, job)
 

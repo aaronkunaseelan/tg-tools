@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Create immutable, content-checked releases from a local Git commit."""
+"""Create immutable, content-checked releases from a local Git commit.
+
+With ``--promote`` the script is the whole release: the guard first, then the runtime controller's jobs
+checked so the restart kills nothing, then the ``current`` switch, then every running user unit whose
+process runs from another release restarted and confirmed on the new one. Nothing here is a unit list:
+the units to restart come from the processes that are running.
+"""
 
 import argparse
 import hashlib
@@ -17,6 +23,15 @@ from pathlib import Path
 
 
 _HEX40 = re.compile(r"^[0-9a-fA-F]{40}$")
+
+# What a restart would kill: a job the controller could hand out or one a worker holds right now.
+IN_FLIGHT = ("pending", "leased", "retryable")
+# The read-only client the rss-audio units use (bin/rss-audio-jobs -> rss-audio/jobs_view.py), and procfs.
+# Both are overridable so a test never reads the live controller or the live pid table.
+JOBS_VIEW = os.environ.get("TG_TOOLS_JOBS_VIEW") or "bin/rss-audio-jobs"
+PROC = os.environ.get("TG_TOOLS_PROC") or "/proc"
+KIND_KEY = re.compile(r"^rss-audio:([a-z_]+):(.+)$")
+KIND_WORKLOAD = {"transcribe_audio": "transcribe", "rss_publish": "publish"}
 
 
 class MaterializeError(Exception):
@@ -230,6 +245,170 @@ def _promote(current_link, destination):
             os.unlink(temporary)
 
 
+def _job_kind(job):
+    """A job's kind, named as rss-audio/jobs_view.py names it: the key carries it, else the workload."""
+    match = KIND_KEY.match(job.get("idempotencyKey") or "")
+    if match:
+        return match.group(1)
+    return KIND_WORKLOAD.get(job.get("workloadType"), str(job.get("workloadType") or "?"))
+
+
+def _first_line(text):
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return lines[0] if lines else ""
+
+
+def in_flight_jobs(repo):
+    """The controller's pending, leased and retryable jobs, through the client tg-tools already uses.
+
+    A failed read raises: unknown is not idle.
+    """
+    view = JOBS_VIEW if os.path.isabs(JOBS_VIEW) else os.path.join(os.fspath(repo), JOBS_VIEW)
+    try:
+        result = subprocess.run(
+            [view, "--json", "--status", ",".join(IN_FLIGHT), "--limit", "500"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+    except OSError as error:
+        raise MaterializeError("runtime jobs unreadable: " + str(error))
+    if result.returncode:
+        # jobs_view prints ``unknown: <reason>`` and exits 1; that reason is the refusal's reason.
+        detail = _first_line(result.stdout) or _first_line(result.stderr) or "exit " + str(result.returncode)
+        raise MaterializeError("runtime jobs unreadable: " + detail)
+    try:
+        jobs = json.loads(result.stdout)["jobs"]
+    except (ValueError, KeyError, TypeError):
+        raise MaterializeError("runtime jobs unreadable: the client printed no jobs")
+    return [job for job in jobs if isinstance(job, dict)]
+
+
+def check_jobs(repo, force, out):
+    """Print the jobs check. Return None when a restart is safe (or forced), else the refusal's exit code."""
+    try:
+        jobs = in_flight_jobs(repo)
+    except MaterializeError as error:
+        print("materialize_tg_tools_release: " + str(error), file=out)
+        if force:
+            print("materialize_tg_tools_release: --force: promoting although the controller cannot be read"
+                  " (unknown is not idle)", file=out)
+            return None
+        return 1
+    if not jobs:
+        print("runtime jobs: none pending, leased or retryable", file=out)
+        return None
+    print("runtime jobs in flight, which a restart would kill: " + str(len(jobs)), file=out)
+    for job in jobs:
+        print("  {}  {}  {}".format(job.get("jobId"), _job_kind(job), job.get("status")), file=out)
+    if force:
+        print("materialize_tg_tools_release: --force: promoting with jobs in flight", file=out)
+        return None
+    print("materialize_tg_tools_release: refusing to promote: --force restarts anyway", file=out)
+    return 4
+
+
+def running_units():
+    """Every running user service's MainPID, from one systemctl call."""
+    result = subprocess.run(
+        ["systemctl", "--user", "show", "--type=service", "--state=running", "-p", "Id", "-p", "MainPID"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if result.returncode:
+        raise MaterializeError("systemctl --user show failed: "
+                               + (_first_line(result.stderr) or "exit " + str(result.returncode)))
+    units = {}
+    for block in result.stdout.split("\n\n"):
+        fields = dict(line.split("=", 1) for line in block.splitlines() if "=" in line)
+        if "Id" in fields:
+            try:
+                units[fields["Id"]] = int(fields.get("MainPID") or 0)
+            except ValueError:
+                units[fields["Id"]] = 0
+    return units
+
+
+def _process_paths(pid):
+    """The working directory and executable of a process, as far as they can be read."""
+    paths = []
+    for name in ("cwd", "exe"):
+        try:
+            paths.append(os.readlink(os.path.join(PROC, str(pid), name)).removesuffix(" (deleted)"))
+        except OSError:
+            continue
+    return paths
+
+
+def _release_component(path, releases_root):
+    """The release a path lies in under the releases root, else None."""
+    if path == releases_root:
+        return ""
+    prefix = releases_root + os.sep
+    for candidate in (path, os.path.realpath(path)):
+        if candidate.startswith(prefix):
+            return candidate[len(prefix):].split(os.sep)[0]
+    return None
+
+
+def stale_units(commit, releases_root):
+    """Every running user service whose process runs from this releases root at another release."""
+    root = os.path.realpath(os.fspath(releases_root))
+    stale = []
+    for unit, pid in sorted(running_units().items()):
+        if not pid:                      # oneshot units, and a unit between restarts
+            continue
+        old = None
+        for path in _process_paths(pid):
+            component = _release_component(path, root)
+            if component and component != commit:
+                old = component
+                break
+        if old:
+            stale.append((unit, old))
+    return stale
+
+
+def restart_stale_units(commit, releases_root):
+    """Restart, in one call, every unit still on an older release, and confirm each now runs this one."""
+    stale = stale_units(commit, releases_root)
+    if not stale:
+        return []
+    result = subprocess.run(
+        ["systemctl", "--user", "restart"] + [unit for unit, _ in stale],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    root = os.path.realpath(os.fspath(releases_root))
+    after = running_units()
+    restarted = []
+    failed = []
+    for unit, old in stale:
+        pid = after.get(unit) or 0
+        running = {_release_component(path, root) for path in _process_paths(pid)} if pid else set()
+        if commit in running:
+            print("restarted {} {} -> {}".format(unit, old[:7], commit[:7]), file=sys.stderr)
+            restarted.append(unit)
+        else:
+            failed.append(unit)
+    if failed:
+        raise MaterializeError(
+            "restart did not move {} to {}".format(", ".join(failed), commit[:7])
+            + (" (systemctl --user restart exited " + str(result.returncode) + ")" if result.returncode else "")
+        )
+    if result.returncode:
+        raise MaterializeError("systemctl --user restart exited " + str(result.returncode))
+    return restarted
+
+
 def _clean_repository(repo):
     root_output = _git(repo, ["rev-parse", "--show-toplevel"])
     root_text = root_output.decode(sys.getfilesystemencoding(), "surrogateescape").rstrip("\n")
@@ -327,21 +506,44 @@ def main(argv=None):
     parser.add_argument("--commit", required=True)
     parser.add_argument("--releases-root", required=True)
     parser.add_argument("--current-link")
-    parser.add_argument("--promote", action="store_true")
+    parser.add_argument("--promote", action="store_true",
+                        help="switch current to this release and restart every unit running another one")
+    parser.add_argument("--force", action="store_true",
+                        help="promote although runtime jobs are in flight or the controller cannot be read")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="print the jobs check and the units a promote would restart; change nothing")
     arguments = parser.parse_args(argv)
-    if arguments.promote:
-        code = subprocess.run(["release-guard", "tg-tools", arguments.commit]).returncode
-        if code:
-            return code
     try:
+        if arguments.dry_run:
+            return _dry_run(arguments)
+        if arguments.promote:
+            code = subprocess.run(["release-guard", "tg-tools", arguments.commit]).returncode
+            if code:
+                return code
+            refusal = check_jobs(arguments.repo, arguments.force, sys.stderr)
+            if refusal is not None:
+                return refusal
         receipt = materialize(arguments.repo, arguments.commit,
                               arguments.releases_root, arguments.promote,
                               arguments.current_link)
+        receipt["restarted"] = (restart_stale_units(receipt["commit"], arguments.releases_root)
+                                if arguments.promote else [])
     except (MaterializeError, OSError, subprocess.SubprocessError) as error:
         print("materialize_tg_tools_release: " + str(error), file=sys.stderr)
         return 1
     print(json.dumps(receipt, sort_keys=True, separators=(",", ":")))
     return 0
+
+
+def _dry_run(arguments):
+    """The jobs check and the units a promote would restart, with nothing changed."""
+    refusal = check_jobs(arguments.repo, arguments.force, sys.stdout)
+    stale = stale_units(arguments.commit, arguments.releases_root)
+    for unit, old in stale:
+        print("would restart {} {} -> {}".format(unit, old[:7], arguments.commit[:7]))
+    if not stale:
+        print("would restart: no running unit runs from another release")
+    return refusal or 0
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,7 @@ class ExecutionResult:
     transcript_path: str
     chunks_path: str
     summary_path: str | None
+    summary_error_path: str | None
     audio_duration_seconds: float
     chunk_count: int
     transcribe_provider: str
@@ -46,6 +48,7 @@ class ExecutionResult:
             "transcriptPath": self.transcript_path,
             "chunksPath": self.chunks_path,
             "summaryPath": self.summary_path,
+            "summaryErrorPath": self.summary_error_path,
             "audioDurationSeconds": self.audio_duration_seconds,
             "chunkCount": self.chunk_count,
             "transcribeProvider": self.transcribe_provider,
@@ -103,18 +106,40 @@ def execute_pipeline(settings: Settings, runtime_job: dict[str, Any]) -> Executi
     chunks_path.write_text(json.dumps(transcript_chunk_rows, indent=2) + "\n", encoding="utf-8")
 
     summary_path: Path = summary_dir / "final_summary.json"
+    summary_error_path: Path | None = None
+    summary_status = "ok"
 
     runner = PiRunner(SUMMARY_ROLE, cwd=str(summary_dir), tier=summary_tier)
-    chunk_summaries, summary_payload = summarize_transcript_chunks(
-        settings=settings,
-        chunk_texts=[item.text for item in chunk_transcripts if item.text.strip()],
-        runner=runner,
-    )
-    (summary_dir / "chunk_summaries.json").write_text(
-        json.dumps(chunk_summaries, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    summary_path.write_text(json.dumps(summary_payload, indent=2) + "\n", encoding="utf-8")
+    try:
+        chunk_summaries, summary_payload = summarize_transcript_chunks(
+            settings=settings,
+            chunk_texts=[item.text for item in chunk_transcripts if item.text.strip()],
+            runner=runner,
+        )
+        (summary_dir / "chunk_summaries.json").write_text(
+            json.dumps(chunk_summaries, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        summary_path.write_text(json.dumps(summary_payload, indent=2) + "\n", encoding="utf-8")
+    except SummaryError as exc:
+        # The transcript is paid for and stays the note: a summary failure is recorded in the
+        # result (summaryStatus failed plus the reason) instead of a retryable job error that
+        # would run speech-to-text over every chunk again.
+        summary_status = "failed"
+        summary_error_path = summary_dir / "error.json"
+        summary_error_path.write_text(
+            json.dumps(
+                {
+                    "error": str(exc),
+                    "errorType": type(exc).__name__,
+                    "errorClass": exc.error_class,
+                    "createdAt": datetime.now(UTC).isoformat(),
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
 
     return ExecutionResult(
         source_kind=source_kind,
@@ -123,12 +148,13 @@ def execute_pipeline(settings: Settings, runtime_job: dict[str, Any]) -> Executi
         local_source_path=str(local_source_path),
         transcript_path=str(transcript_path),
         chunks_path=str(chunks_path),
-        summary_path=str(summary_path),
+        summary_path=str(summary_path) if summary_status == "ok" else None,
+        summary_error_path=str(summary_error_path) if summary_error_path else None,
         audio_duration_seconds=prepared.duration_seconds,
         chunk_count=len(transcript_chunk_rows),
         transcribe_provider=transcription.provider,
         transcribe_model=transcription.model,
-        summary_status="ok",
+        summary_status=summary_status,
         summary_model=f"{runner.provider}/{runner.model}",
     )
 
