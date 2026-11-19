@@ -235,3 +235,51 @@ def test_a_firm_named_against_itself_is_written_once():
     notes = "### 0:00 · The AI trade\n\nJulian Emmanuel of Evercore says A.\n\n- Evercore of Evercore is the buyer.\n"
     held = SN.firm_once(notes, {"Julian Emmanuel": "Evercore"})
     assert "Evercore of Evercore" not in held and "Julian Emmanuel of Evercore says A." in held
+
+
+# ---------------------------------------------------------------- a stray citation is dropped, not fatal
+
+def test_a_citation_outside_its_section_is_dropped_after_the_repair():
+    """Radio Nov 18 (af13dc03): a bullet citing a paragraph past its section's end killed the whole job."""
+    stream, part = _stream(), _part()
+    payload = answer(endParagraphId="p00002",
+                     bullets=[{"text": BULLET, "paragraphIds": ["p00001", "p00003"]},
+                              {"text": "Kabra says the vaults are in London.", "paragraphIds": ["p00003"]}],
+                     mentions=[_mention(paragraphId="p00003"), _mention(paragraphId="p00002")])
+    payload["sections"].append({"heading": "Reserves", "lede": LEDE, "startParagraphId": "p00003",
+                                "endParagraphId": "p00003",
+                                "bullets": [{"text": BULLET, "paragraphIds": ["p00003"]}], "mentions": []})
+    gate = SN.section_gate(stream, _part(k=2))
+    assert any("p00003 is outside the section" in error for error in gate(payload))
+    assert SN.refs_held(stream, part, payload) == 3
+    first = payload["sections"][0]
+    assert first["bullets"] == [{"text": BULLET, "paragraphIds": ["p00001"]}]
+    assert [m["paragraphId"] for m in first["mentions"]] == ["p00002"]
+    assert gate(payload) == []
+    assert payload["sections"][1]["bullets"][0]["paragraphIds"] == ["p00003"]   # in its own span: untouched
+
+
+def test_a_section_whose_span_is_wrong_is_left_for_the_gate():
+    payload = answer(endParagraphId="p00099", bullets=[{"text": BULLET, "paragraphIds": ["p00098"]}])
+    assert SN.refs_held(_stream(), _part(), payload) == 0
+    assert payload["sections"][0]["bullets"][0]["paragraphIds"] == ["p00098"]
+
+
+def test_a_run_whose_repair_still_cites_outside_a_section_finishes(tmp_path):
+    stream, starts, parts = _show()
+    good, calls = _section_runner()
+
+    def run(prompt, **kw):
+        got = good(prompt, **kw)
+        if "WHAT THIS PART IS ABOUT" not in prompt:
+            return got
+        data = json.loads(got.text)
+        last = data["sections"][-1]["endParagraphId"]
+        data["sections"][0]["bullets"].append({"text": "Kabra says gold bars are scarce.", "paragraphIds": [last]})
+        return SimpleNamespace(ok=True, text=json.dumps(data), error=None)
+
+    result = SN.run(stream=stream, parts=parts, starts=starts, title="T", work=tmp_path / "w",
+                    runner_factory=lambda role: SimpleNamespace(run=run))
+    assert calls.count("i01-repair") == 1 and calls.count("rank") == 1
+    assert [r.get("refsDropped") for r in result.report["runs"]] == [1, 1]
+    assert len(SN.parse(result.notes)[0]) == sum(part.k for part in parts)

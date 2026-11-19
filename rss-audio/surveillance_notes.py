@@ -329,6 +329,44 @@ def form_counts(sections: Sequence[Mapping[str, Any]]) -> tuple[int, int]:
     return missing, refs
 
 
+def refs_held(stream: ParagraphStream, part: Part, payload: Mapping[str, Any]) -> int:
+    """Keep each citation inside its own section, after the repair; returns how many were dropped.
+
+    A bullet's paragraphIds and a mention's paragraphId point into the transcript; one that falls outside
+    the section's own span is a slip the code can see and undo without another call (19 Nov, Radio Nov 18
+    notes af13dc03: section 2 bullet 1 cited p00095 of p00090..p00100 after its repair). The id is dropped;
+    a bullet left with none is dropped, and a mention outside is dropped. A section whose span is itself
+    wrong is left as it is, so the gate still names that.
+    """
+    dropped = 0
+    for section in dicts(payload.get("sections")):
+        a = stream.position(str(section.get("startParagraphId")))
+        b = stream.position(str(section.get("endParagraphId")))
+        if a is None or b is None or not part.lo <= a <= b <= part.hi:
+            continue
+
+        def inside(pid) -> bool:
+            pos = stream.position(str(pid))
+            return pos is not None and a <= pos <= b
+
+        bullets = []
+        for bullet in dicts(section.get("bullets")):
+            pids = list(bullet.get("paragraphIds") or [])
+            kept = [pid for pid in pids if inside(pid)]
+            dropped += len(pids) - len(kept)
+            if pids and not kept:
+                continue
+            bullets.append({**bullet, "paragraphIds": kept} if len(kept) != len(pids) else bullet)
+        if "bullets" in section:
+            section["bullets"] = bullets
+        if "mentions" in section:
+            mentions = dicts(section.get("mentions"))
+            kept_mentions = [m for m in mentions if inside(m.get("paragraphId"))]
+            dropped += len(mentions) - len(kept_mentions)
+            section["mentions"] = kept_mentions
+    return dropped
+
+
 def section_gate(stream: ParagraphStream, part: Part):
     """The block's own checks: coverage, count, own-span references, the surname, quote sizes, no meta words."""
     lo, hi, k = part.lo, part.hi, part.k
@@ -572,6 +610,9 @@ def run(*, stream: ParagraphStream, parts: Sequence[Part], starts: Sequence[floa
                       "guests": list(part.guests), "k": part.k,
                       "block": {"title": part.title, "topic": part.topic}}
         payload = call(runner_factory(SECTION_ROLE), prompt, gate, f"i{number:02d}", rlog, work)
+        held = refs_held(stream, part, payload) if gate(payload) else 0   # a stray citation is dropped, not fatal
+        if held:
+            rlog["refsDropped"] = held
         left = gate(payload)      # after the repair: a part that still fails would fail the edition's checks
         if left:
             raise SectionsError("sections", f"part {part.first}..{part.last} still fails the section gate "
