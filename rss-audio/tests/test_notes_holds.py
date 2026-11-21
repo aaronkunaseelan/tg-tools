@@ -11,6 +11,10 @@
 | a repair that still fails the gate  | run() raises before the ranking call is paid for             |
 | "the guest" in a mention or a rank  | check 5's rule reaches the mention line and the summary       |
 | a firm named against itself         | firm_once writes it once, so check 6's other clause holds     |
+| naming in the lede, not the bullet  | the gate holds check 4's rule: a section whose lede names the |
+|                                     | owner passes both, one that names it nowhere fails both       |
+| a bullet with "their hands"         | bullets_held drops it after the repair and the run finishes;  |
+|                                     | a section left with only that bullet is left for the gate     |
 
 `checks()` is unchanged: these hold the same rules earlier, in the gate that sees the model's answer.
 """
@@ -91,9 +95,10 @@ CASES = {
                      lambda: answer(lede="They say central banks are buying gold bars at a record pace."),
                      "its lede opens with 'They'"),
     "naming": (lambda: SN.section_gate(_stream(), _part()),
-               lambda: answer(bullets=[{"text": "Gold is bid at a record pace by central banks.",
+               lambda: answer(lede="Central banks are buying gold bars at a record pace.",
+                              bullets=[{"text": "Gold is bid at a record pace by central banks.",
                                         "paragraphIds": ["p00001"]}]),
-               "first bullet must start with the speaker's surname"),
+               "name the speaker (Kabra) in the lede or the first bullet"),
     "meta": (lambda: SN.section_gate(_stream(), _part()),
              lambda: answer(bullets=[{"text": "Kabra says the roster is short this month, and the bars go to "
                                                "their vaults.",
@@ -283,3 +288,83 @@ def test_a_run_whose_repair_still_cites_outside_a_section_finishes(tmp_path):
     assert calls.count("i01-repair") == 1 and calls.count("rank") == 1
     assert [r.get("refsDropped") for r in result.report["runs"]] == [1, 1]
     assert len(SN.parse(result.notes)[0]) == sum(part.k for part in parts)
+
+
+# ---------------------------------------------------------------- naming is check 4's rule, in the gate too
+
+NAMED_LEDE = "Kabra says central banks are buying gold bars at a record pace."
+UNNAMED_LEDE = "Central banks are buying gold bars at a record pace."
+SUBJECT_BULLET = "Voters see only a higher utility bill from the buying."
+
+
+def _naming_payload(lede, bullet=SUBJECT_BULLET):
+    return answer(lede=lede, bullets=[{"text": bullet, "paragraphIds": ["p00001"]}])
+
+
+def _naming_check(lede, bullet=SUBJECT_BULLET):
+    """Check 4 over one rendered section: its verdict on the same two inputs the gate is given."""
+    notes = f"### 0:00 · Gold demand\n\n{lede}\n\n- {bullet}\n"
+    checks = {check.name: check for check in SN.checks(
+        notes=notes, report={"counts": {"topics": 1}}, stream=_stream(),
+        starts=[0.0, 20.0, 40.0], parts=[_part()])}
+    return checks["naming"]
+
+
+def test_the_gate_names_the_speaker_by_the_rule_check_4_judges():
+    """Radio Nov 20 (e394e4af): the section's lede named Wolf and its first bullet opened on the subject.
+
+    Check 4 accepts that section; the gate demanded the surname at the *start* of the first bullet, so the
+    part failed after its one repair and the edition died. One predicate now, the check's.
+    """
+    gate = SN.section_gate(_stream(), _part())
+    named = _naming_payload(NAMED_LEDE)
+    unnamed = _naming_payload(UNNAMED_LEDE)
+    assert gate(named) == []          # the lede names the owner: the first bullet may open on the subject
+    errors = gate(unnamed)            # neither names the owner: fatally unmet, as before
+    assert any("name the speaker (Kabra) in the lede or the first bullet" in error for error in errors), errors
+    for lede in (NAMED_LEDE, UNNAMED_LEDE):
+        assert (gate(_naming_payload(lede)) == []) == _naming_check(lede).ok   # the gate and check 4 agree
+
+
+# ---------------------------------------------------------------- a bullet's own slip is dropped, not fatal
+
+# nothing in the lede or the heading names hands, reserves or figures, so the pronoun resolves to nothing
+SLIP = "Their hands are all over the reserve figures before the vote."
+
+
+def test_a_bullet_with_an_unattached_reference_is_dropped_after_the_repair():
+    """TV Nov 20 (60024008): section 1's later bullet said 'their hands' and nothing named hands."""
+    stream, part = _stream(), _part()
+    payload = answer(bullets=[{"text": BULLET, "paragraphIds": ["p00001"]},
+                              {"text": SLIP, "paragraphIds": ["p00002"]}])
+    gate = SN.section_gate(stream, part)
+    assert any("'their hands' refers to something the section never names" in error for error in gate(payload))
+    assert SN.bullets_held(stream, part, payload) == 1
+    assert [bullet["text"] for bullet in payload["sections"][0]["bullets"]] == [BULLET]   # the rest kept
+    assert gate(payload) == []
+
+    only = answer(bullets=[{"text": SLIP, "paragraphIds": ["p00002"]}])
+    assert SN.bullets_held(stream, part, only) == 0     # the section keeps its last bullet for the gate
+    assert [bullet["text"] for bullet in only["sections"][0]["bullets"]] == [SLIP]
+    assert any("'their hands'" in error for error in gate(only))
+
+
+def test_a_run_whose_repair_leaves_a_bullet_slip_finishes(tmp_path):
+    stream, starts, parts = _show()
+    good, calls = _section_runner(points=[0, 1, 2, 3])
+
+    def run(prompt, **kw):
+        got = good(prompt, **kw)
+        if "WHAT THIS PART IS ABOUT" not in prompt:
+            return got
+        data = json.loads(got.text)          # the answer and its repair both carry the slip
+        data["sections"][0]["bullets"].append(
+            {"text": SLIP, "paragraphIds": [data["sections"][0]["startParagraphId"]]})
+        return SimpleNamespace(ok=True, text=json.dumps(data), error=None)
+
+    result = SN.run(stream=stream, parts=parts, starts=starts, title="T", work=tmp_path / "w",
+                    runner_factory=lambda role: SimpleNamespace(run=run))
+    assert calls.count("i01-repair") == 1 and calls.count("rank") == 1
+    assert [r.get("bulletsDropped") for r in result.report["runs"]] == [1, 1]
+    checks = SN.checks(notes=result.notes, report=result.report, stream=stream, starts=starts, parts=parts)
+    assert [(check.name, check.reason) for check in checks if not check.ok] == []

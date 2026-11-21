@@ -273,7 +273,8 @@ def part_speaker_fact(part: "Part") -> str:
 
 
 def name_rule(part: Part) -> str:
-    """The speaker-names block, in this part's own surname: the rule every section's first bullet is gated on."""
+    """The speaker-names block, in this part's own surname: the prompt still asks for the surname at the
+    start of the first bullet, and the gate holds check 4's rule on the lede or the first bullet."""
     owners = sorted(part.owners)
     if not owners:
         return ""
@@ -315,6 +316,20 @@ def lede_fault(lede: str) -> tuple[str, str, str] | None:
         return ("pronoun", first,
                 f"its lede opens with {words[0]!r}: name the speaker or the subject first, not a pronoun")
     return None
+
+
+def names_owner(lede: str, first_bullet: str, surnames: Sequence[str]) -> bool:
+    """Check 4's naming rule in one place: one of the owner's surnames, word-bounded, in the lede or the
+    first bullet.
+
+    ``lede`` is the section's first prose line as :func:`checks` takes it (the gate passes the payload's
+    lede) and ``surnames`` are the owning guests' surnames. The section gate holds this rule while the call
+    is still in reach and check 4 judges the edition by it, so the two cannot drift: the gate that asked for
+    the surname at the *start* of the first bullet was stricter than the check it held, and killed sections
+    check 4 accepts (Radio Nov 20, notes e394e4af).
+    """
+    said = f"{lede or ''} {first_bullet or ''}"
+    return any(re.search(r"\b" + re.escape(sur) + r"\b", said, re.I) for sur in surnames)
 
 
 def form_counts(sections: Sequence[Mapping[str, Any]]) -> tuple[int, int]:
@@ -364,6 +379,39 @@ def refs_held(stream: ParagraphStream, part: Part, payload: Mapping[str, Any]) -
             kept_mentions = [m for m in mentions if inside(m.get("paragraphId"))]
             dropped += len(mentions) - len(kept_mentions)
             section["mentions"] = kept_mentions
+    return dropped
+
+
+def bullets_held(stream: ParagraphStream, part: Part, payload: Mapping[str, Any]) -> int:
+    """Drop a bullet whose text slips a rule the code can see, after the repair; returns how many went.
+
+    Two slips live in a bullet's own words and nothing later in the run can undo them: a pronoun whose noun
+    the heading and lede never name ("their hands", TV Nov 20 notes 60024008), and "the guest" / "the
+    speaker" in a part that has a guest's name. A bullet that says either is dropped while the section keeps
+    at least one bullet and still names its owner afterwards; a section left with none, or with no owner
+    named by its lede or its new first bullet, is left as it is, so the gate still names it. Heading and
+    lede faults are never dropped or edited here.
+    """
+    dropped = 0
+    for section in dicts(payload.get("sections")):
+        bullets = dicts(section.get("bullets"))
+        head = str(section.get("heading") or "").strip()
+        lede = str(section.get("lede") or "").strip()
+
+        def slips(bullet) -> bool:
+            text = str(bullet.get("text") or "").strip()
+            if unknown_refs(head, lede, text):
+                return True
+            return any(count_phrase(text, anon) for anon in ANON) if part.owners else False
+
+        kept = [bullet for bullet in bullets if not slips(bullet)]
+        if len(kept) == len(bullets) or not kept:
+            continue
+        if part.owners and not names_owner(lede, str(kept[0].get("text") or "").strip(), sorted(part.owners)):
+            continue
+        if "bullets" in section:
+            section["bullets"] = kept
+        dropped += len(bullets) - len(kept)
     return dropped
 
 
@@ -417,11 +465,10 @@ def section_gate(stream: ParagraphStream, part: Part):
                     pos = stream.position(str(pid))
                     if pos is None or not a <= pos <= b:
                         errors.append(f"{who} bullet {j}: paragraph {pid} is outside the section")
-            if bullets and owners:
-                text = str(bullets[0].get("text") or "").lstrip()
-                if not any(text.startswith(sur + " ") for sur in owners):
-                    errors.append(f"{who}: its first bullet must start with the speaker's surname "
-                                  f"({', '.join(sorted(owners))}), the surname only")
+            opening = str(bullets[0].get("text") or "").strip() if bullets else ""
+            if owners and not names_owner(lede, opening, sorted(owners)):
+                errors.append(f"{who}: name the speaker ({', '.join(sorted(owners))}) in the lede or the "
+                              f"first bullet")
             for text in [head, lede] + [str(b.get("text") or "").strip() for b in bullets]:
                 for fragment in unknown_refs(head, lede, text):
                     errors.append(f"section {i}: '{fragment}' refers to something the section never names")
@@ -613,6 +660,9 @@ def run(*, stream: ParagraphStream, parts: Sequence[Part], starts: Sequence[floa
         held = refs_held(stream, part, payload) if gate(payload) else 0   # a stray citation is dropped, not fatal
         if held:
             rlog["refsDropped"] = held
+        slipped = bullets_held(stream, part, payload) if gate(payload) else 0   # so is a bullet's own slip
+        if slipped:
+            rlog["bulletsDropped"] = slipped
         left = gate(payload)      # after the repair: a part that still fails would fail the edition's checks
         if left:
             raise SectionsError("sections", f"part {part.first}..{part.last} still fails the section gate "
@@ -914,16 +964,17 @@ def checks(*, notes: str, report: Mapping[str, Any] | None, stream: ParagraphStr
         add("lede", True, f"{len(sections)} sections open on 8+ words, no pronoun: "
                           f"{prose} prose, {len(sections) - prose} opening-bullet")
 
-    # 4 naming: the section's first words carry the surname of a guest who owns those paragraphs.
+    # 4 naming: the section's lede or its first bullet carries the surname of a guest who owns those
+    # paragraphs (``names_owner``: the rule the section gate holds while the call is still in reach).
     unnamed, unowned = [], 0
     for section, pos in zip(sections, placed):
         owner = owners[pos] if pos < len(owners) else []
         if not owner:
             unowned += 1
             continue
-        said = " ".join([section["lead"][0] if section["lead"] else ""] +
-                        (section["bullets"][:1] if section["bullets"] else []))
-        if not any(re.search(r"\b" + re.escape(surname(name)) + r"\b", said, re.I) for name in owner):
+        if not names_owner(section["lead"][0] if section["lead"] else "",
+                           section["bullets"][0] if section["bullets"] else "",
+                           [surname(name) for name in owner]):
             unnamed.append(f"{section['heading']} (want {'/'.join(surname(n) for n in owner)})")
     if not sections:
         add("naming", False, "no sections")
