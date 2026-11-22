@@ -204,6 +204,23 @@ def test_the_worker_runs_a_notes_input_as_a_notes_job(monkeypatch, tmp_path):
     assert seen == [(SLUG, "sonnet")] and result.notes_url == "https://x/n.md"
 
 
+def test_a_notes_job_with_a_bare_extractor_date_runs(monkeypatch, tmp_path):
+    # notes 21cb2f8e (21 Nov) died 'input: publishedAt must carry a UTC offset, got '2026-11-19'': a URL
+    # publish passes yt-dlp's upload_date, a bare date, as provenance; it is not a publish option.
+    import asyncio
+    import runtime_worker
+    seen = []
+    monkeypatch.setattr(notes_job, "run_notes", lambda s, notes, work_dir, tier: seen.append(notes["publishedAt"])
+                        or pipeline.PublishResult(slug=SLUG, title="Call", public_url="https://x/a.mp3",
+                                                  file_size_bytes=1, notes_url="https://x/n.md"))
+    notes = notes_job.notes_input(feed="audio", slug=SLUG, version=1, script_sha256=SHA, title="Call",
+                                  published_at="2026-11-19", date_basis="extractor_upload_date",
+                                  duration_seconds=3715, source_url=None, stt_engine=None)
+    asyncio.run(runtime_worker.execute_runtime_job(settings(), None, notes, tmp_path))
+    assert seen == ["2026-11-19"]
+    with pytest.raises(pipeline.PipelineError, match="UTC offset"):   # a publish job still needs one
+        pipeline.job_options({"publishedAt": "2026-11-19"})
+
 def test_the_publish_job_submits_its_notes_job():
     import runtime_worker
     notes = notes_job.notes_input(feed="surveillance", slug=SLUG, version=1, script_sha256=SHA, title="T",

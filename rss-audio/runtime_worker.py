@@ -59,11 +59,13 @@ async def execute_runtime_job(
     work_dir: Path | None = None,
 ) -> RuntimeExecutionResult:
     """A publish runs its feed's pipeline (``episodes.run``, ``surveillance.run``); a notes, page or rebuild job
-    is a later step both share. The configuration is checked before any paid step."""
-    options = job_options(input_json)
-    options = replace(options, enrichment_tier=enrichment_preflight(settings, options.feed))
+    is a later step both share. The configuration is checked before any paid step. A later step's
+    ``publishedAt`` is the episode's date as stored (a bare extractor date is fine), not a publish option."""
     kind = input_json.get("inputKind")
-    if kind not in (notes_job.INPUT_KIND, notes_job.PAGE_KIND, rebuild.INPUT_KIND):
+    later = kind in (notes_job.INPUT_KIND, notes_job.PAGE_KIND, rebuild.INPUT_KIND)
+    options = job_options({k: v for k, v in input_json.items() if k != "publishedAt"} if later else input_json)
+    options = replace(options, enrichment_tier=enrichment_preflight(settings, options.feed))
+    if not later:
         pipeline = surveillance if PIPELINES[options.feed] == "surveillance" else episodes
         return await pipeline.run(settings, bot, input_json, options, work_dir)
     work = work_dir or job_work_dir(settings.work_dir, kind)
