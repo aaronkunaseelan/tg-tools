@@ -114,6 +114,8 @@ and a separate SSH/browser-cookie host. Meeting summaries and episode titles use
 5. Apply required gateway migrations before restart. Install the supplied
    `systemd/*.service` user units and their expected environment files, reload
    systemd and start the configured gateways, workers and result projectors.
+   `systemctl --user start rss-audio-notes-resubmit@JOBID:rN` re-submits a dead notes job on the
+   current release; check it with `rss-audio-jobs`.
    The [operations guide](docs/telegram-tools-operations.md) gives the exact unit
    and file mapping, migration order and rollback steps.
 

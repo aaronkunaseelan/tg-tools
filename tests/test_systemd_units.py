@@ -38,9 +38,9 @@ def pythonpath(d: dict[str, list[str]]) -> str:
 
 def test_units_shipped():
     assert [unit.stem for unit in UNITS] == [
-        "meeting-summary-result-consumer", "meeting-summary-runtime-worker", "rss-audio-runtime-worker",
-        "rss-audio-schedule", "rss-audio-transcribe-runtime-worker", "tg-gateway-ms", "tg-gateway-rss", "tg-tools-telemetry", "tts-result-projector",
-        "tts-worker"]
+        "meeting-summary-result-consumer", "meeting-summary-runtime-worker", "rss-audio-notes-resubmit@",
+        "rss-audio-runtime-worker", "rss-audio-schedule", "rss-audio-transcribe-runtime-worker", "tg-gateway-ms",
+        "tg-gateway-rss", "tg-tools-telemetry", "tts-result-projector", "tts-worker"]
 
 
 @pytest.mark.parametrize("unit", UNITS, ids=lambda u: u.stem)
