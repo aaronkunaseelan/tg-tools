@@ -40,6 +40,11 @@ Usage:
 --model accepts a deployment name or an alias that resolves to the configured
 mini or full deployment: mini, full, gpt-4o-mini-transcribe, gpt-4o-transcribe.
 It applies to Azure, so with a self-hosted endpoint it picks the fallback.
+
+Exit codes:
+    0  a transcript
+    1  an engine's request or response failed
+    3  no speech: every engine answered, and every answer was empty text
 """
 
 from __future__ import annotations
@@ -151,6 +156,10 @@ ACCEPTED_INPUT = {
 }
 
 DEFAULT_JOBS = 3
+# A recording that holds no speech is not a failed run: every engine answered and
+# every answer was empty text. It exits 3 so a caller can tell it from exit 1,
+# which a real engine error keeps (a failed request or an unreadable response).
+NO_SPEECH_EXIT = 3
 MIN_PARAGRAPH_CHARS = 160
 TARGET_PARAGRAPH_CHARS = 420
 MAX_PARAGRAPH_CHARS = 700
@@ -605,7 +614,10 @@ def transcribe_all(
     jobs: int = DEFAULT_JOBS,
     on_progress=None,
 ) -> str | None:
-    """Transcribe all chunks and concatenate in source order."""
+    """Transcribe all chunks and concatenate in source order.
+
+    None when a chunk's request failed; "" when every chunk answered with no text.
+    """
     parts = transcribe_chunk_texts(config, access_token, chunks, model, jobs=jobs, on_progress=on_progress)
     return None if parts is None else "\n\n".join(part for part in parts if part)
 
@@ -842,9 +854,12 @@ def main():
                 log.info("Selected default Azure transcription deployment: %s", resolved_model)
             transcript = transcribe_all(config, access_token, chunks, resolved_model, jobs=args.jobs)
             engine_provider, engine_model = "azure", resolved_model
-        if not transcript:
+        if transcript is None:
             log.error("Transcription failed")
             sys.exit(1)
+        if not transcript.strip():
+            log.warning("No speech")
+            sys.exit(NO_SPEECH_EXIT)
 
         log.info(f"Total transcript: {len(transcript)} chars")
         if args.engine_file:

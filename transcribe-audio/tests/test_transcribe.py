@@ -10,10 +10,12 @@ format_transcript: spacing before punctuation fixed, long text split into paragr
 self-hosted: no URL -> None | whole file posted with model + bearer + verbose_json -> (text, model@engine, timings)
              | a server that sends no words/segments -> timings {"words": None, "segments": None}
              | HTTP 500, unreachable, over the size cap -> None (the caller falls back to Azure)
+main: both engines answer 200 with no text -> "No speech", exit 3 (a real engine error is exit 1)
 """
 import http.server
 import importlib.util
 import json
+import logging
 import threading
 import sys
 from pathlib import Path
@@ -104,3 +106,56 @@ def test_self_hosted(monkeypatch, tmp_path):
     assert transcribe.transcribe_self_hosted(config, str(audio)) is None  # server gone
     monkeypatch.setattr(transcribe, "SELF_HOSTED_MAX_BYTES", 1)
     assert transcribe.transcribe_self_hosted(config, str(audio)) is None
+
+
+class SilentEngines(http.server.BaseHTTPRequestHandler):
+    """Both engines answer 200 with no text: an audio file that holds no speech."""
+    posted: list = []
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers["Content-Length"]))
+        SilentEngines.posted.append(self.path)
+        reply = {"access_token": "tok"} if self.path.endswith("/oauth2/v2.0/token") else {"text": ""}
+        data = json.dumps(reply).encode()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, *args):
+        pass
+
+
+def test_no_speech_exits_3(monkeypatch, tmp_path, caplog):
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), SilentEngines)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    for key, value in {
+        transcribe.TRANSCRIBE_AUDIO_SELF_HOSTED_URL_ENV: f"{base}/v1",   # engine 1: answers no text
+        "AZURE_OPENAI_TRANSCRIPTION_ENDPOINT": base,                      # engine 2 (the fallback)
+        "AZURE_OPENAI_TRANSCRIPTION_MINI_DEPLOYMENT": "transcribe-mini",
+        "AZURE_OPENAI_TRANSCRIPTION_FULL_DEPLOYMENT": "transcribe-full",
+        "AZURE_OPENAI_TRANSCRIPTION_TENANT_ID": "t",
+        "AZURE_OPENAI_TRANSCRIPTION_CLIENT_ID": "c",
+        "AZURE_OPENAI_TRANSCRIPTION_CLIENT_SECRET": "s",
+        "AZURE_AUTHORITY_HOST": base,                                     # the token, from the same server
+    }.items():
+        monkeypatch.setenv(key, value)
+    audio = tmp_path / "silence.ogg"
+    audio.write_bytes(b"\x00\xffsilence")
+    # ffmpeg/ffprobe and the URL helper are not what this asserts: only the engines answer.
+    monkeypatch.setattr(transcribe, "ensure_dependencies", lambda: None)
+    monkeypatch.setattr(transcribe, "resolve_source_to_path", lambda source, tmpdir: str(audio))
+    monkeypatch.setattr(transcribe, "prepare_chunks", lambda path, tmpdir: [str(audio)])
+    monkeypatch.setattr(sys, "argv", ["transcribe-audio", str(audio)])
+    SilentEngines.posted = []
+    try:
+        with caplog.at_level(logging.INFO), pytest.raises(SystemExit) as exit_message:
+            transcribe.main()
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert exit_message.value.code == 3
+    assert "/v1/audio/transcriptions" in SilentEngines.posted                        # both engines answered
+    assert any(path.startswith("/openai/deployments/") for path in SilentEngines.posted)
+    assert "No speech" in caplog.messages
