@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+"""Release rss-feeds from an archived tree of an exact commit.
+
+    bin/deploy [--dry-run] <sha>
+
+`<sha>` must be on the checked-out line (`git merge-base --is-ancestor <sha> HEAD`). The
+commit is exported with `git archive` into a fresh private temporary directory, which is
+removed on exit, and `worker-deps.py --project <that directory>` runs `deploy` (or `build`
+for `--dry-run`: no auth, the token is not read). Uncommitted files are never shipped.
+
+The Cloudflare token is read here, from
+`~/.config/agent-secrets/credentials.env` (KEY=VALUE lines; only `CLOUDFLARE_API_TOKEN` is
+taken) and this script never prints a value: a missing key or file is reported by name.
+Worker secrets are passed by path (`--secrets-file ~/.config/rss-feeds/secrets.env`); this
+script does not read them. The child gets PATH, HOME and the token, and nothing else. Exit
+status is wrangler's.
+
+Test-only overrides: RSS_EDGE_CREDENTIALS and RSS_EDGE_SECRETS point the two paths
+elsewhere. Nothing else uses them.
+"""
+
+import io
+import os
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+
+TOKEN_KEY = 'CLOUDFLARE_API_TOKEN'
+
+CREDENTIALS = (os.environ.get('RSS_EDGE_CREDENTIALS')
+               or os.path.expanduser('~/.config/agent-secrets/credentials.env'))
+SECRETS = (os.environ.get('RSS_EDGE_SECRETS')
+           or os.path.expanduser('~/.config/rss-feeds/secrets.env'))
+WORKER_DEPS = os.path.expanduser('~/workbench/scripts/worker-deps.py')
+REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+
+USAGE = 'usage: bin/deploy [--dry-run] <sha>'
+
+
+def fail(code, message):
+    print(f'bin/deploy: {message}', file=sys.stderr)
+    raise SystemExit(code)
+
+
+def git(*args):
+    try:
+        return subprocess.run(['git', '-C', REPO, *args], capture_output=True, text=True)
+    except OSError as error:
+        fail(1, f'cannot run git ({error.strerror})')
+
+
+def resolve(sha):
+    """Full commit id for `sha`, refused unless it is an ancestor of HEAD (exit 2)."""
+    resolved = git('rev-parse', '--verify', '--quiet', f'{sha}^{{commit}}')
+    if resolved.returncode != 0:
+        fail(2, f'{sha}: not a commit in {REPO}')
+    full = resolved.stdout.strip()
+
+    ancestor = git('merge-base', '--is-ancestor', full, 'HEAD')
+    if ancestor.returncode != 0:
+        detail = (ancestor.stderr.strip().splitlines() or ['not an ancestor of HEAD'])[-1]
+        fail(2, f'{sha}: {detail} (must be on the checked-out line)')
+    return full
+
+
+def read_token():
+    """CLOUDFLARE_API_TOKEN from the credentials file. Names the key or file, never a value."""
+    try:
+        with open(CREDENTIALS, encoding='utf-8') as handle:
+            lines = handle.read().splitlines()
+    except OSError as error:
+        fail(1, f'cannot read {CREDENTIALS} ({error.strerror})')
+
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith('#') or '=' not in line:
+            continue
+        name, _, value = line.partition('=')
+        name = name.strip()
+        if name.startswith('export '):
+            name = name[len('export '):].strip()
+        if name != TOKEN_KEY:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in '"\'':
+            value = value[1:-1]
+        if value:
+            return value
+        break
+    fail(1, f'{TOKEN_KEY} is not set in {CREDENTIALS}')
+
+
+def export_tree(sha, dest):
+    """`git archive <sha>` extracted into `dest`; nothing outside the commit is shipped."""
+    archived = subprocess.run(['git', '-C', REPO, 'archive', '--format=tar', sha],
+                              capture_output=True)
+    if archived.returncode != 0:
+        fail(1, f'git archive {sha} failed: '
+                f'{archived.stderr.decode(errors="replace").strip()}')
+    with tarfile.open(fileobj=io.BytesIO(archived.stdout)) as tar:
+        try:
+            tar.extractall(dest, filter='data')
+        except TypeError:  # Python without extraction filters
+            tar.extractall(dest)
+
+
+def parse(argv):
+    if '--help' in argv or '-h' in argv:
+        print(USAGE)
+        raise SystemExit(0)
+    dry_run = '--dry-run' in argv
+    positional = [arg for arg in argv if arg != '--dry-run']
+    if len(positional) != 1 or positional[0].startswith('-'):
+        print(USAGE, file=sys.stderr)
+        raise SystemExit(2)
+    return dry_run, positional[0]
+
+
+def main(argv):
+    dry_run, sha = parse(argv)
+    full = resolve(sha)
+    mode = 'build' if dry_run else 'deploy'
+
+    env = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'),
+           'HOME': os.environ.get('HOME', os.path.expanduser('~'))}
+    if not dry_run:
+        env[TOKEN_KEY] = read_token()
+        if not os.path.isfile(SECRETS):
+            fail(1, f'{SECRETS} is missing')
+    if not os.path.isfile(WORKER_DEPS):
+        fail(1, f'{WORKER_DEPS} is missing')
+
+    tree = tempfile.mkdtemp(prefix='rss-edge-deploy-')
+    try:
+        export_tree(full, tree)
+        command = [sys.executable, WORKER_DEPS, '--project', tree, mode]
+        if not dry_run:
+            command += ['--secrets-file', SECRETS]
+        print(f'bin/deploy: {mode} of {full}', file=sys.stderr)
+        return subprocess.run(command, cwd=tree, env=env).returncode
+    finally:
+        shutil.rmtree(tree, ignore_errors=True)
+
+
+if __name__ == '__main__':
+    raise SystemExit(main(sys.argv[1:]))

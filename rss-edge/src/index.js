@@ -791,8 +791,12 @@ function renderAdmin() {
     </main>
 
     <script>
+      // The token lives in this page's memory only. This origin also serves every public feed, reader slug and
+      // B2 passthrough, so a stored copy could be read by any script that ever runs here and would outlive the
+      // tab. Erase what earlier page loads left behind, then ask for the token again on each load.
+      localStorage.removeItem("rss-admin-token");
+
       const state = {
-        token: localStorage.getItem("rss-admin-token") || "",
         episodes: [],
         feeds: [],
         selectedEpisodeId: null,
@@ -807,7 +811,6 @@ function renderAdmin() {
         "feed_feed_url","feed_categories"
       ];
       const el = Object.fromEntries(ids.map((id) => [id, document.getElementById(id)]));
-      el.token.value = state.token;
 
       function setStatus(message, isError = false) {
         el.status.textContent = message;
@@ -819,7 +822,6 @@ function renderAdmin() {
         if (!token) {
           throw new Error("API token is required");
         }
-        localStorage.setItem("rss-admin-token", token);
         return {
           "Authorization": "Bearer " + token,
           "Content-Type": "application/json"
@@ -1037,14 +1039,15 @@ function renderAdmin() {
         }
       });
 
-      if (state.token) {
-        refreshAll();
-      } else {
-        fillEpisode(null);
-      }
+      fillEpisode(null);
     <\/script>
   </body>
-</html>`);
+</html>`, {
+    headers: {
+      "Content-Security-Policy": "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+      "X-Frame-Options": "DENY"
+    }
+  });
 }
 __name(renderAdmin, "renderAdmin");
 

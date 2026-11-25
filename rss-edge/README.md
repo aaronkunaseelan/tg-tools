@@ -26,8 +26,8 @@ versions live in agent-tools-update's `runtimes.toml`. Wrangler is locked exactl
 npm run deps:setup
 npm run check                 # syntax and existing Node tests
 npm test
-npm run build                 # deploy --dry-run; bundles stay host-local
-npm run deploy -- --strict    # only with the existing authenticated environment
+bin/deploy --dry-run <sha>    # the build gate for a release commit; no auth, bundles stay host-local
+bin/deploy <sha>              # release: an archived tree of that commit (see Deploy)
 ```
 
 External setup step: supply the host-owned `worker-deps.py` at `../../scripts/worker-deps.py` before using the npm scripts (it is not bundled here).
@@ -135,6 +135,25 @@ asks for confirmation. Then verify both exist, and only then deploy:
 The migration is not idempotent (`ALTER TABLE ... ADD COLUMN`): if the execute fails after the
 `CREATE TABLE`, check whether `page_url` exists before running it again. Rolling back to the
 previous Worker after 0005 is safe: the old code ignores `feed_items` and `page_url`.
+
+Once the migration is in, the release is `bin/deploy <sha>`: an archived tree of an exact commit,
+deployed by `worker-deps.py`. Nothing but the script names the credential files, so an agent can
+release without seeing or printing the token, and a clean worktree is not needed.
+
+- `<sha>` is resolved to a full commit and refused (exit 2) unless it is on the checked-out line
+  (`git merge-base --is-ancestor <sha> HEAD`). Uncommitted files are never shipped.
+- `git archive <sha>` is extracted into a fresh private temporary directory, which is removed on
+  exit, and `worker-deps.py --project <that directory> deploy --secrets-file
+  ~/.config/rss-feeds/secrets.env` runs there with an environment of `CLOUDFLARE_API_TOKEN`,
+  `PATH` and `HOME` only. The script reads the token itself from
+  `~/.config/agent-secrets/credentials.env` (only `CLOUDFLARE_API_TOKEN`) and never prints a value:
+  a missing key or file is reported by name. Exit status is wrangler's.
+- `bin/deploy --dry-run <sha>` is the same path with `worker-deps.py build`: no auth, so the token
+  is not read, and the bundle stays host-local. Use it to gate a release commit before deploying.
+
+`worker-deps.py` is still the host-owned external step (`../../scripts/worker-deps.py`); the npm
+`build` and `deploy` scripts wrap the same commands for a working-tree bundle or deploy, and only
+the existing authenticated environment may run either.
 
 ## Listener description layout
 
