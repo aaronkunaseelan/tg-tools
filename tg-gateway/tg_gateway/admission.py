@@ -15,6 +15,10 @@ class RouteAdmission:
     job_submit_payload: dict[str, Any]
 
 
+# One message carries at most this many links; each becomes its own episode.
+MAX_LINKS = 10
+
+
 @dataclass(frozen=True, slots=True)
 class AdmissionInput:
     text: str = ""
@@ -24,6 +28,8 @@ class AdmissionInput:
     tts_options: dict[str, Any] | None = None
     transcribe_options: dict[str, Any] | None = None
     scribe: dict[str, Any] | None = None
+    # 1-based position of one link in a multi-link message; None for a single source.
+    part: int | None = None
 
 
 def build_route_admission(
@@ -77,8 +83,9 @@ def _attachment(data: AdmissionInput) -> dict[str, Any]:
     return dict(data.attachment_refs[0]) if data.attachment_refs else {}
 
 
-def _receipt(shape: telegram_routes.TelegramUpdateShape, route: telegram_routes.MatchedRoute, source_json: dict[str, Any]) -> dict[str, Any]:
-    return _source(shape).to_source_receipt_payload(
+def _receipt(shape: telegram_routes.TelegramUpdateShape, route: telegram_routes.MatchedRoute, source_json: dict[str, Any],
+             *, source_key: str | None = None) -> dict[str, Any]:
+    receipt = _source(shape).to_source_receipt_payload(
         producer_system=route.owner_system,
         workload_type=route.workload_type,
         route_id=route.route_id,
@@ -94,6 +101,9 @@ def _receipt(shape: telegram_routes.TelegramUpdateShape, route: telegram_routes.
             **source_json,
         },
     )
+    if source_key is not None:
+        receipt["sourceKey"] = source_key
+    return receipt
 
 
 def _admission(receipt: dict[str, Any], job: dict[str, Any]) -> RouteAdmission:
@@ -154,6 +164,11 @@ def _job_common(shape: telegram_routes.TelegramUpdateShape, data: AdmissionInput
 
 def _build_rss_publish_admission(shape: telegram_routes.TelegramUpdateShape, route: telegram_routes.MatchedRoute, data: AdmissionInput) -> RouteAdmission:
     source_key, att, base, text = _job_common(shape, data)
+    if data.part is not None:
+        # One message, several links: each link is its own source, so its own receipt,
+        # idempotency key and publication effect. messageRef/status stay the message's.
+        source_key = f"{source_key}:u{data.part}"
+        base = {**base, "sourceKey": source_key}
     use_url = base["inputKind"] == "url"
     source_url, _ = _extract_single_url(text) if use_url else (None, text)
     if use_url and source_url is None:
@@ -172,7 +187,8 @@ def _build_rss_publish_admission(shape: telegram_routes.TelegramUpdateShape, rou
         "mimeType": source_attachment.get("mimeType"),
     }
     input_json = {k: v for k, v in input_json.items() if v is not None}
-    receipt = _receipt(shape, route, {"inputKind": base["inputKind"], "jobKind": "rss"})
+    receipt = _receipt(shape, route, {"inputKind": base["inputKind"], "jobKind": "rss"},
+                       source_key=source_key)
     job = RuntimeJobIntent(
         producer_system="rss-audio",
         producer_ref=source_key,
@@ -252,16 +268,30 @@ def _build_x_tts_explain_admission(shape: telegram_routes.TelegramUpdateShape, r
     return _build_tts_like(shape, route, data, explain=True)
 
 
-_SINGLE_URL_RE = re.compile(r"https?://\S+")
+_URL_RUN_RE = re.compile(r"https?://[^\s,<]*")
+_URL_TRAILING = ".,;:!?)]>'\""
+
+
+def extract_urls(text: str) -> list[str]:
+    """Every URL in ``text``, cleaned of trailing punctuation, deduplicated in order.
+
+    Telegram messages carry several links separated by spaces, commas or new
+    lines; a URL run ends at whitespace, a comma or ``<``.
+    """
+    urls: list[str] = []
+    for run in _URL_RUN_RE.findall(text or ""):
+        url = run.rstrip(_URL_TRAILING)
+        if url and url not in urls:
+            urls.append(url)
+    return urls
 
 
 def _extract_single_url(text: str) -> tuple[str | None, str]:
     """Return (URL, surrounding text) when exactly one URL is present."""
-    urls = _SINGLE_URL_RE.findall(text)
+    urls = extract_urls(text)
     if len(urls) != 1:
         return None, text
-    remainder = text.replace(urls[0], "").strip()
-    return urls[0], remainder
+    return urls[0], _URL_RUN_RE.sub("", text).strip()
 
 
 def _build_tts_like(shape: telegram_routes.TelegramUpdateShape, route: telegram_routes.MatchedRoute, data: AdmissionInput, *, explain: bool) -> RouteAdmission:

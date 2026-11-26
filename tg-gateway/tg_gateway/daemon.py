@@ -13,7 +13,7 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +22,7 @@ from tg_tools_common.telegram_manifest import build_registry_from_manifests, man
 from tg_tools_common.telegram_routes import RouteResolution, TelegramRouteRegistry, TelegramUpdateShape, normalize_command
 
 from .access import is_allowed_callback, is_allowed_message
-from .admission import build_route_admission
+from .admission import MAX_LINKS, build_route_admission, extract_urls
 from .bot_api import BotApiClient
 from .delivery import DeliveryDrain, RuntimeDeliveryWorker
 from .identity_adapter import IdentityAdapter, load_identity_adapter
@@ -237,7 +237,11 @@ async def handle_message(runtime: GatewayRuntime, event: Any) -> None:
 
 async def _hand_off(runtime: GatewayRuntime, message: Any, shape: TelegramUpdateShape,
                     resolution: RouteResolution) -> None:
-    """Freeze the admission in a durable handoff, then drain it once inline."""
+    """Freeze the admission in a durable handoff, then drain it once inline.
+
+    An rss publish message may carry several links: each one becomes its own
+    handoff and job (at most ``MAX_LINKS``), all replying to the same message.
+    """
     route = resolution.route
     attachment = None
     if message.attachments:
@@ -249,32 +253,63 @@ async def _hand_off(runtime: GatewayRuntime, message: Any, shape: TelegramUpdate
         admission_input = runtime.adapter.prepare_admission(
             runtime, message, shape=shape, resolution=resolution,
             attachment_refs=(attachment,) if attachment else ())
+        links: list[str] = []
+        if route.route_kind == "rss_publish_route" and attachment is None:
+            links = extract_urls(admission_input.text or shape.text or "")
+        if len(links) > MAX_LINKS:
+            await _reply(runtime, message,
+                         f"At most {MAX_LINKS} links per message; nothing was queued. "
+                         "Send them in smaller messages.")
+            return
+        if len(links) < 2:
+            admissions = [(None, build_route_admission(
+                shape=shape, resolution=resolution, admission_input=admission_input))]
+        else:
+            admissions = [
+                (part, build_route_admission(
+                    shape=shape, resolution=resolution,
+                    admission_input=replace(admission_input, text=url, part=part)))
+                for part, url in enumerate(links, start=1)
+            ]
     except ValueError as exc:
+        # Every admission refusal is visible to the owner, not just a journal traceback.
         await _reply(runtime, message, str(exc))
         return
-    admission = build_route_admission(shape=shape, resolution=resolution, admission_input=admission_input)
-    with_progress = (runtime.progress is not None
-                     and admission.job_submit_payload.get("workloadType") in runtime.settings.progress_workloads)
     update_uid = f"message:{shape.bot_identity}:{message.chat_id}:{message.message_id}"
-    created = await asyncio.to_thread(runtime.source_handoffs.create_handoff, {
-        "update_uid": update_uid,
-        "source_key": admission.source_receipt_payload["sourceKey"],
-        "bot_identity": shape.bot_identity,
-        "route_id": route.route_id,
-        "route_kind": route.route_kind,
-        "rule_version": route.matched_rule_version or "v1",
-        "intent_json": build_intent(source_receipt_payload=admission.source_receipt_payload,
-                                    job_submit_payload=admission.job_submit_payload, attachment=attachment),
-        "progress_target": {"chatId": message.chat_id, "threadId": message.thread_id,
-                            "replyToMessageId": message.message_id} if with_progress else None,
-    })
-    if not created:
-        logger.info("skipping already handed-off update %s", update_uid)
+    with_progress = (runtime.progress is not None
+                     and admissions[0][1].job_submit_payload.get("workloadType")
+                     in runtime.settings.progress_workloads)
+    created = 0
+    submitted = 0
+    for part, admission in admissions:
+        part_uid = update_uid if part is None else f"{update_uid}:u{part}"
+        inserted = await asyncio.to_thread(runtime.source_handoffs.create_handoff, {
+            "update_uid": part_uid,
+            "source_key": admission.source_receipt_payload["sourceKey"],
+            "bot_identity": shape.bot_identity,
+            "route_id": route.route_id,
+            "route_kind": route.route_kind,
+            "rule_version": route.matched_rule_version or "v1",
+            "intent_json": build_intent(source_receipt_payload=admission.source_receipt_payload,
+                                        job_submit_payload=admission.job_submit_payload, attachment=attachment),
+            "progress_target": {"chatId": message.chat_id, "threadId": message.thread_id,
+                                "replyToMessageId": message.message_id} if with_progress else None,
+        })
+        if not inserted:
+            logger.info("skipping already handed-off update %s", part_uid)
+            continue
+        created += 1
+        outcome = await asyncio.to_thread(runtime.handoff_drainer.drain_once, update_uid=part_uid)
+        logger.info("source handoff update=%s drain_outcome=%s", part_uid, outcome)
+        if outcome == "submitted":
+            submitted += 1
+    if with_progress or not created:
         return
-    outcome = await asyncio.to_thread(runtime.handoff_drainer.drain_once, update_uid=update_uid)
-    if not with_progress and outcome == "submitted":
-        await _reply(runtime, message, "Received — queued.")
-    logger.info("source handoff update=%s drain_outcome=%s", update_uid, outcome)
+    if len(admissions) < 2:
+        if submitted:
+            await _reply(runtime, message, "Received — queued.")
+        return
+    await _reply(runtime, message, f"Received — queued {created} links.")
 
 
 async def handle_callback(runtime: GatewayRuntime, event: Any) -> None:
